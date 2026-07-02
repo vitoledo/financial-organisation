@@ -1,0 +1,32 @@
+{
+  "name": "financial-organisation",
+  "version": "1.0.0",
+  "description": "Automated financial spreadsheet — pulls data from Pierre API, stores in SQLite, renders to Google Sheets",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "sync": "ts-node src/index.ts",
+    "sync:full": "ts-node src/index.ts --full",
+    "sync:dry": "ts-node src/index.ts --dry-run",
+    "setup": "ts-node src/index.ts --setup-only"
+  },
+  "keywords": ["finance", "open-finance", "pierre", "google-sheets", "automation"],
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.9.0",
+    "commander": "^13.1.0",
+    "dotenv": "^16.5.0",
+    "googleapis": "^148.0.0",
+    "open": "^10.1.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "ts-node": "^10.9.0"
+  }
+}

@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local data (sensitive)
+data/
+!data/.gitkeep
+
+# Environment variables (sensitive)
+.env
+
+# TypeScript cache
+*.tsbuildinfo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Credentials
+secrets.json
+
+# Exploration files
+exploration/
+
+# Documentation files
+docs/
