@@ -1,5 +1,4 @@
-import { google, sheets_v4 } from 'googleapis';
-import { OAuth2Client } from 'google-auth-library';
+import { google, sheets_v4, Auth } from 'googleapis';
 
 /**
  * Low-level wrapper around the Google Sheets API v4.
@@ -8,7 +7,7 @@ export class SheetsClient {
   private sheets: sheets_v4.Sheets;
   private spreadsheetId: string;
 
-  constructor(auth: OAuth2Client, spreadsheetId: string) {
+  constructor(auth: Auth.OAuth2Client, spreadsheetId: string) {
     this.sheets = google.sheets({ version: 'v4', auth });
     this.spreadsheetId = spreadsheetId;
   }
@@ -25,7 +24,7 @@ export class SheetsClient {
    * Create a brand-new spreadsheet and return its ID.
    */
   static async createSpreadsheet(
-    auth: OAuth2Client,
+    auth: Auth.OAuth2Client,
     title: string,
   ): Promise<string> {
     const sheets = google.sheets({ version: 'v4', auth });

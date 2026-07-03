@@ -1,5 +1,4 @@
-import { google } from 'googleapis';
-import { OAuth2Client, Credentials } from 'google-auth-library';
+import { google, Auth } from 'googleapis';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
@@ -24,7 +23,7 @@ export interface GoogleAuthConfig {
  * - If tokens exist on disk, load and refresh them.
  * - If not, start a local HTTP server and open the browser for consent.
  */
-export async function getAuthClient(config: GoogleAuthConfig): Promise<OAuth2Client> {
+export async function getAuthClient(config: GoogleAuthConfig): Promise<Auth.OAuth2Client> {
   const oauth2Client = new google.auth.OAuth2(
     config.clientId,
     config.clientSecret,
@@ -33,7 +32,7 @@ export async function getAuthClient(config: GoogleAuthConfig): Promise<OAuth2Cli
 
   // Try loading saved tokens
   if (fs.existsSync(config.tokensPath)) {
-    const tokens: Credentials = JSON.parse(
+    const tokens: Auth.Credentials = JSON.parse(
       fs.readFileSync(config.tokensPath, 'utf8'),
     );
     oauth2Client.setCredentials(tokens);
@@ -64,13 +63,13 @@ export async function getAuthClient(config: GoogleAuthConfig): Promise<OAuth2Cli
 // Private helpers
 // ---------------------------------------------------------------------------
 
-function isTokenExpired(tokens: Credentials): boolean {
+function isTokenExpired(tokens: Auth.Credentials): boolean {
   if (!tokens.expiry_date) return true;
   // Refresh 5 minutes before actual expiry
   return Date.now() > tokens.expiry_date - 5 * 60 * 1000;
 }
 
-function saveTokens(tokensPath: string, tokens: Credentials): void {
+function saveTokens(tokensPath: string, tokens: Auth.Credentials): void {
   const dir = path.dirname(tokensPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -83,9 +82,9 @@ function saveTokens(tokensPath: string, tokens: Credentials): void {
  * and waits for the redirect with the authorization code.
  */
 function interactiveConsent(
-  oauth2Client: OAuth2Client,
+  oauth2Client: Auth.OAuth2Client,
   config: GoogleAuthConfig,
-): Promise<Credentials> {
+): Promise<Auth.Credentials> {
   return new Promise((resolve, reject) => {
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: 'offline',

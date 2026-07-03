@@ -1,4 +1,4 @@
-import { OAuth2Client } from 'google-auth-library';
+import { Auth } from 'googleapis';
 import { SheetsClient } from './client';
 import fs from 'fs';
 import path from 'path';
@@ -98,7 +98,7 @@ export interface SetupResult {
  * Saves the spreadsheet ID to disk.
  */
 export async function setupSpreadsheet(
-  auth: OAuth2Client,
+  auth: Auth.OAuth2Client,
   idFilePath: string,
   logger?: { info: (msg: string) => void },
 ): Promise<SetupResult> {
