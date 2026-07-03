@@ -10,7 +10,13 @@
     "sync:dry": "ts-node src/index.ts --dry-run",
     "setup": "ts-node src/index.ts --setup-only"
   },
-  "keywords": ["finance", "open-finance", "pierre", "google-sheets", "automation"],
+  "keywords": [
+    "finance",
+    "open-finance",
+    "pierre",
+    "google-sheets",
+    "automation"
+  ],
   "author": "",
   "license": "UNLICENSED",
   "private": true,
@@ -23,6 +29,7 @@
     "better-sqlite3": "^11.9.0",
     "commander": "^13.1.0",
     "dotenv": "^16.5.0",
+    "google-auth-library": "^10.9.0",
     "googleapis": "^148.0.0",
     "open": "^10.1.0",
     "pino": "^9.6.0",
