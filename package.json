@@ -8,7 +8,12 @@
     "sync": "ts-node src/index.ts",
     "sync:full": "ts-node src/index.ts --full",
     "sync:dry": "ts-node src/index.ts --dry-run",
-    "setup": "ts-node src/index.ts --setup-only"
+    "setup": "ts-node src/index.ts --setup-only",
+    "scheduler": "ts-node src/scheduler.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "finance",
@@ -23,7 +28,9 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
-    "typescript": "^5.8.0"
+    "@vitest/coverage-v8": "^4.1.9",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.9"
   },
   "dependencies": {
     "better-sqlite3": "^11.9.0",

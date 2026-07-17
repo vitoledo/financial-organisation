@@ -12,11 +12,17 @@ export interface GoogleAuthConfig {
   clientId: string;
   clientSecret: string;
   tokensPath: string;
+  /** No browser available (container/server): never wait on interactive consent. */
+  headless?: boolean;
   logger?: {
     info: (msg: string, meta?: Record<string, unknown>) => void;
     warn: (msg: string, meta?: Record<string, unknown>) => void;
   };
 }
+
+const PROVISION_HINT =
+  'Rode `pnpm setup` (ou `docker compose run --rm app sync --setup-only`) em uma máquina ' +
+  'com navegador e copie data/google-tokens.json para o servidor.';
 
 /**
  * Get an authenticated OAuth2 client.
@@ -40,16 +46,30 @@ export async function getAuthClient(config: GoogleAuthConfig): Promise<Auth.OAut
     // Proactively refresh if token is expired or about to expire
     if (isTokenExpired(tokens)) {
       config.logger?.info('Access token expired, refreshing...');
-      const { credentials } = await oauth2Client.refreshAccessToken();
-      oauth2Client.setCredentials(credentials);
-      saveTokens(config.tokensPath, credentials);
-      config.logger?.info('Token refreshed successfully.');
+      try {
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        oauth2Client.setCredentials(credentials);
+        saveTokens(config.tokensPath, credentials, tokens);
+        config.logger?.info('Token refreshed successfully.');
+      } catch (err) {
+        throw new Error(
+          `Falha ao renovar o token do Google (refresh_token revogado ou expirado). ` +
+          `${PROVISION_HINT} Causa: ${(err as Error).message}`,
+        );
+      }
     }
 
     return oauth2Client;
   }
 
-  // No tokens — need interactive consent
+  // No tokens — need interactive consent, which requires a browser.
+  if (config.headless) {
+    throw new Error(
+      `Nenhum token do Google em ${config.tokensPath} e execução sem navegador (headless). ` +
+      PROVISION_HINT,
+    );
+  }
+
   config.logger?.info('No saved tokens found. Starting OAuth2 consent flow...');
   const tokens = await interactiveConsent(oauth2Client, config);
   oauth2Client.setCredentials(tokens);
@@ -69,12 +89,25 @@ function isTokenExpired(tokens: Auth.Credentials): boolean {
   return Date.now() > tokens.expiry_date - 5 * 60 * 1000;
 }
 
-function saveTokens(tokensPath: string, tokens: Auth.Credentials): void {
+/**
+ * Persist tokens. A refresh response omits refresh_token, so the previous one
+ * is carried over — otherwise the next headless run would have nothing to
+ * refresh with and would need a browser again.
+ */
+function saveTokens(
+  tokensPath: string,
+  tokens: Auth.Credentials,
+  previous?: Auth.Credentials,
+): void {
   const dir = path.dirname(tokensPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
+  const merged: Auth.Credentials = {
+    ...tokens,
+    refresh_token: tokens.refresh_token ?? previous?.refresh_token,
+  };
+  fs.writeFileSync(tokensPath, JSON.stringify(merged, null, 2));
 }
 
 /**

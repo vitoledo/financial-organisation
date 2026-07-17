@@ -1,14 +1,22 @@
-import { PierreClient } from '../pierre/client';
+import Database from 'better-sqlite3';
+import { Auth } from 'googleapis';
+import { PierreClient, PierreClientConfig } from '../pierre/client';
 import {
   normalizeTransaction,
   normalizeAccount,
   shouldExcludeAccount,
   NormalizedTransaction,
 } from '../pierre/normalizer';
-import { PierreAccount, PierrePurchase } from '../pierre/types';
+import { PierrePurchasesByCard } from '../pierre/types';
 import { getDatabase, closeDatabase, Repository } from '../storage';
-import { CategoryMapping } from '../storage/repository';
-import { getAuthClient, SheetsClient, setupSpreadsheet, SheetsRenderer } from '../sheets';
+import {
+  getAuthClient,
+  SheetsClient,
+  setupSpreadsheet,
+  SheetsRenderer,
+  GoogleAuthConfig,
+  SetupResult,
+} from '../sheets';
 import { AppConfig } from '../config';
 
 // ---------------------------------------------------------------------------
@@ -23,6 +31,112 @@ export interface SyncOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Injectable dependencies — defaults are the real implementations; tests
+// replace them with fakes to exercise the orchestration against in-memory data.
+// ---------------------------------------------------------------------------
+
+export interface SyncEngineDeps {
+  getAuthClient: (config: GoogleAuthConfig) => Promise<Auth.OAuth2Client>;
+  setupSpreadsheet: (
+    auth: Auth.OAuth2Client,
+    idFilePath: string,
+    logger?: { info: (msg: string) => void },
+  ) => Promise<SetupResult>;
+  createSheetsClient: (auth: Auth.OAuth2Client, spreadsheetId: string) => SheetsClient;
+  createPierreClient: (config: PierreClientConfig) => PierreClient;
+  getDatabase: (dbPath?: string) => Database.Database;
+  closeDatabase: () => void;
+  sleep: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_DEPS: SyncEngineDeps = {
+  getAuthClient,
+  setupSpreadsheet,
+  createSheetsClient: (auth, spreadsheetId) => new SheetsClient(auth, spreadsheetId),
+  createPierreClient: (config) => new PierreClient(config),
+  getDatabase,
+  closeDatabase,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+const PIERRE_SYNC_WAIT_MS = 30_000;
+const INCREMENTAL_OVERLAP_DAYS = 3;
+const FULL_SYNC_MONTHS = 3;
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the transaction fetch window.
+ * - Full sync (or no previous sync): FULL_SYNC_MONTHS back from now.
+ * - Incremental: INCREMENTAL_OVERLAP_DAYS before the last successful sync,
+ *   to catch late-posted updates.
+ */
+export function calculateDateRange(
+  lastSyncCompletedAt: string | null,
+  fullSync: boolean,
+  now: Date = new Date(),
+): { startDate: string; endDate: string } {
+  const endDate = now.toISOString().split('T')[0];
+
+  if (!fullSync && lastSyncCompletedAt) {
+    const start = new Date(lastSyncCompletedAt);
+    start.setDate(start.getDate() - INCREMENTAL_OVERLAP_DAYS);
+    return { startDate: start.toISOString().split('T')[0], endDate };
+  }
+
+  const start = new Date(now);
+  start.setMonth(start.getMonth() - FULL_SYNC_MONTHS);
+  return { startDate: start.toISOString().split('T')[0], endDate };
+}
+
+export interface FlatInstallment {
+  id: string;
+  purchaseDescription: string;
+  installmentNumber: number;
+  totalInstallments: number;
+  amount: number;
+  dueDate: string;
+  isPaid: boolean;
+  isProjected: boolean;
+  accountId: string;
+  accountName: string;
+}
+
+/**
+ * Flatten Pierre's purchases-by-card structure into installment rows.
+ * IDs are deterministic within a snapshot (the installments table is fully
+ * replaced each sync) and unique across cards and repeated purchases.
+ */
+export function flattenInstallments(
+  purchasesByCard: PierrePurchasesByCard[],
+): FlatInstallment[] {
+  const result: FlatInstallment[] = [];
+
+  for (const card of purchasesByCard) {
+    (card.purchases ?? []).forEach((purchase, purchaseIndex) => {
+      for (const inst of purchase.installments ?? []) {
+        result.push({
+          id: `${card.accountId}:${purchaseIndex}:${inst.installmentNumber}/${inst.totalInstallments}`,
+          purchaseDescription: purchase.description,
+          installmentNumber: inst.installmentNumber,
+          totalInstallments: inst.totalInstallments,
+          amount: inst.amount,
+          dueDate: inst.dueDate,
+          isPaid: inst.isPaid,
+          isProjected: inst.isProjected,
+          accountId: card.accountId,
+          accountName: card.accountName,
+        });
+      }
+    });
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Sync engine — orchestrates the entire pipeline
 // ---------------------------------------------------------------------------
 
@@ -33,10 +147,16 @@ export class SyncEngine {
     warn: (msg: string, meta?: Record<string, unknown>) => void;
     error: (msg: string, meta?: Record<string, unknown>) => void;
   };
+  private deps: SyncEngineDeps;
 
-  constructor(config: AppConfig, logger: SyncEngine['logger']) {
+  constructor(
+    config: AppConfig,
+    logger: SyncEngine['logger'],
+    deps: Partial<SyncEngineDeps> = {},
+  ) {
     this.config = config;
     this.logger = logger;
+    this.deps = { ...DEFAULT_DEPS, ...deps };
   }
 
   async run(options: SyncOptions): Promise<void> {
@@ -46,17 +166,21 @@ export class SyncEngine {
     this.logger.info('═══════════════════════════════════════════════');
     this.logger.info(`  Modo: ${options.dryRun ? 'DRY RUN' : options.fullSync ? 'FULL SYNC' : 'INCREMENTAL'}`);
 
+    let repo: Repository | null = null;
+    let syncId: number | null = null;
+
     try {
       // 1. Setup Google Sheets auth + spreadsheet
       this.logger.info('\n[1/8] Autenticando com Google Sheets...');
-      const auth = await getAuthClient({
+      const auth = await this.deps.getAuthClient({
         clientId: this.config.googleClientId,
         clientSecret: this.config.googleClientSecret,
         tokensPath: this.config.tokensPath,
+        headless: this.config.headless,
         logger: this.logger,
       });
 
-      const { spreadsheetId, spreadsheetUrl } = await setupSpreadsheet(
+      const { spreadsheetId, spreadsheetUrl } = await this.deps.setupSpreadsheet(
         auth,
         this.config.spreadsheetIdPath,
         this.logger,
@@ -67,14 +191,16 @@ export class SyncEngine {
         return;
       }
 
-      const sheetsClient = new SheetsClient(auth, spreadsheetId);
+      const sheetsClient = this.deps.createSheetsClient(auth, spreadsheetId);
 
       // 2. Initialize SQLite
       this.logger.info('\n[2/8] Inicializando banco de dados...');
-      const db = getDatabase(this.config.dbPath);
-      const repo = new Repository(db);
+      const db = this.deps.getDatabase(this.config.dbPath);
+      repo = new Repository(db);
 
-      const syncId = options.dryRun ? 0 : repo.startSync();
+      if (!options.dryRun) {
+        syncId = repo.startSync();
+      }
 
       // 3. Read category mappings from Google Sheets
       this.logger.info('\n[3/8] Lendo configurações da planilha...');
@@ -83,8 +209,9 @@ export class SyncEngine {
       this.logger.info(`  ${categoryMappings.size} mapeamentos de categoria carregados.`);
 
       // 4. Trigger Pierre manual-update
-      const pierreClient = new PierreClient({
+      const pierreClient = this.deps.createPierreClient({
         apiKey: this.config.pierreApiKey,
+        baseUrl: this.config.pierreApiUrl,
         logger: this.logger,
       });
 
@@ -93,7 +220,7 @@ export class SyncEngine {
         try {
           await pierreClient.triggerManualUpdate();
           this.logger.info('  Aguardando 30s para o Pierre sincronizar com os bancos...');
-          await this.sleep(30_000);
+          await this.deps.sleep(PIERRE_SYNC_WAIT_MS);
         } catch (err) {
           this.logger.warn('  manual-update falhou (continuando com dados existentes)', {
             error: (err as Error).message,
@@ -111,7 +238,6 @@ export class SyncEngine {
       const relevantAccounts = allAccounts.filter((a) => !shouldExcludeAccount(a));
       this.logger.info(`  ${allAccounts.length} contas encontradas, ${relevantAccounts.length} relevantes.`);
 
-      // Upsert accounts
       if (!options.dryRun) {
         for (const account of relevantAccounts) {
           repo.upsertAccount(normalizeAccount(account));
@@ -120,7 +246,11 @@ export class SyncEngine {
 
       // 6. Fetch transactions
       this.logger.info('\n[6/8] Buscando transações...');
-      const { startDate, endDate } = this.calculateDateRange(repo, options.fullSync);
+      const lastSync = options.dryRun ? repo.getLastSuccessfulSync() : this.lastSyncBefore(repo, syncId);
+      const { startDate, endDate } = calculateDateRange(
+        lastSync?.completed_at ?? null,
+        options.fullSync,
+      );
       this.logger.info(`  Período: ${startDate} → ${endDate}`);
 
       const txResponse = await pierreClient.getTransactions(startDate, endDate);
@@ -131,11 +261,9 @@ export class SyncEngine {
       const relevantAccountIds = new Set(relevantAccounts.map((a) => a.id));
       const filteredTx = rawTransactions.filter((tx) => relevantAccountIds.has(tx.account_id));
 
-      // Normalize
       const normalizedTx: NormalizedTransaction[] = filteredTx.map(normalizeTransaction);
       this.logger.info(`  ${normalizedTx.length} transações após filtros.`);
 
-      // Upsert to SQLite
       let stats = { added: 0, updated: 0, unchanged: 0 };
       if (!options.dryRun) {
         stats = repo.upsertTransactions(normalizedTx, categoryMappings);
@@ -148,10 +276,10 @@ export class SyncEngine {
       this.logger.info('\n[7/8] Buscando parcelas...');
       try {
         const installmentsResponse = await pierreClient.getInstallments();
-        const purchases = installmentsResponse.data?.purchases ?? installmentsResponse.purchases ?? [];
+        const purchasesByCard = installmentsResponse.data?.purchasesByCard ?? [];
+        const installments = flattenInstallments(purchasesByCard);
 
-        if (purchases.length > 0 && !options.dryRun) {
-          const installments = this.flattenInstallments(purchases, relevantAccounts);
+        if (installments.length > 0 && !options.dryRun) {
           repo.replaceInstallments(installments);
           this.logger.info(`  ${installments.length} parcelas processadas.`);
         } else {
@@ -168,8 +296,9 @@ export class SyncEngine {
         this.logger.info('\n[8/8] Atualizando planilha...');
         await renderer.renderAll();
 
-        // Complete sync log
-        repo.completeSync(syncId, stats);
+        if (syncId !== null) {
+          repo.completeSync(syncId, stats);
+        }
       } else {
         this.logger.info('\n[8/8] [DRY RUN] Planilha não atualizada.');
       }
@@ -184,22 +313,21 @@ export class SyncEngine {
 
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      this.logger.error(`Sincronização falhou: ${error.message}`);
+      this.logger.error(`Sincronização falhou: ${error.message}`, { stack: error.stack });
 
-      // Try to log the failure in SQLite
-      try {
-        const db = getDatabase(this.config.dbPath);
-        const repo = new Repository(db);
-        const lastSync = repo.getLastSuccessfulSync();
-        // We can't easily get the syncId here, so just log the error
-        this.logger.error('Stack trace:', { error: error.stack });
-      } catch {
-        // Ignore errors in error handling
+      if (repo !== null && syncId !== null) {
+        try {
+          repo.failSync(syncId, error.message);
+        } catch (logErr) {
+          this.logger.error('Falha ao registrar o erro no sync_log', {
+            error: (logErr as Error).message,
+          });
+        }
       }
 
       throw error;
     } finally {
-      closeDatabase();
+      this.deps.closeDatabase();
     }
   }
 
@@ -207,70 +335,12 @@ export class SyncEngine {
   // Private helpers
   // -------------------------------------------------------------------------
 
-  private calculateDateRange(
-    repo: Repository,
-    fullSync: boolean,
-  ): { startDate: string; endDate: string } {
-    const endDate = new Date().toISOString().split('T')[0];
-
-    if (fullSync) {
-      const start = new Date();
-      start.setMonth(start.getMonth() - 3);
-      return { startDate: start.toISOString().split('T')[0], endDate };
-    }
-
-    const lastSync = repo.getLastSuccessfulSync();
-    if (lastSync?.completed_at) {
-      // Start 3 days before the last sync to catch updates
-      const start = new Date(lastSync.completed_at);
-      start.setDate(start.getDate() - 3);
-      return { startDate: start.toISOString().split('T')[0], endDate };
-    }
-
-    // No previous sync — pull 3 months
-    const start = new Date();
-    start.setMonth(start.getMonth() - 3);
-    return { startDate: start.toISOString().split('T')[0], endDate };
-  }
-
-  private flattenInstallments(
-    purchases: PierrePurchase[],
-    accounts: PierreAccount[],
-  ): Array<{
-    id: string;
-    purchaseDescription: string;
-    installmentNumber: number;
-    totalInstallments: number;
-    amount: number;
-    dueDate: string;
-    isPaid: boolean;
-    isProjected: boolean;
-    accountId: string;
-    accountName: string;
-  }> {
-    const result: ReturnType<typeof this.flattenInstallments> = [];
-
-    for (const purchase of purchases) {
-      for (const inst of purchase.installments ?? []) {
-        result.push({
-          id: `${purchase.description}-${inst.installmentNumber}/${inst.totalInstallments}`,
-          purchaseDescription: purchase.description,
-          installmentNumber: inst.installmentNumber,
-          totalInstallments: inst.totalInstallments,
-          amount: inst.amount,
-          dueDate: inst.dueDate,
-          isPaid: inst.isPaid,
-          isProjected: inst.isProjected,
-          accountId: '',
-          accountName: '',
-        });
-      }
-    }
-
-    return result;
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  /**
+   * Last successful sync, excluding the row created for the current run.
+   * (The current run is RUNNING, so it never matches, but the guard makes
+   * the intent explicit.)
+   */
+  private lastSyncBefore(repo: Repository, _currentSyncId: number | null) {
+    return repo.getLastSuccessfulSync();
   }
 }
