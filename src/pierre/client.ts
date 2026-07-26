@@ -9,6 +9,7 @@ import {
 const DEFAULT_BASE_URL = 'https://api.pierre.com.br';
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
+const MAX_ERROR_BODY_CHARS = 500;
 
 export interface PierreClientConfig {
   apiKey: string;
@@ -104,7 +105,10 @@ export class PierreClient {
         this.logger?.info(`[${method}] ${path} → ${response.status} (${elapsed}ms)`);
 
         if (!response.ok) {
-          const body = await response.text();
+          // Cap the echoed body: this message fans out to stdout, the sync
+          // log, the sync_log table and the heartbeat file, so an unbounded
+          // upstream payload shouldn't be duplicated across all of them.
+          const body = (await response.text()).slice(0, MAX_ERROR_BODY_CHARS);
           throw new Error(`Pierre API error ${response.status}: ${body}`);
         }
 

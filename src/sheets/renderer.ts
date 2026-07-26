@@ -18,9 +18,6 @@ import {
   SUMMARY_COLS_PER_MONTH,
   DASHBOARD_LAYOUT,
   TRANSACTIONS_HEADER,
-  TransactionRow,
-  AccountRow,
-  InstallmentRow,
 } from './builders';
 
 interface Logger {
@@ -70,7 +67,7 @@ export class SheetsRenderer {
 
   private async renderBalance(): Promise<void> {
     this.logger?.info('  Renderizando: Saldo');
-    const accounts = this.repo.getAllAccounts() as unknown as AccountRow[];
+    const accounts = this.repo.getAllAccounts();
     const rows = buildBalanceRows(accounts);
 
     await this.client.clearSheet(SHEET_NAMES.BALANCE);
@@ -102,7 +99,7 @@ export class SheetsRenderer {
 
   private async renderTransactions(): Promise<void> {
     this.logger?.info('  Renderizando: Transações');
-    const transactions = this.repo.getAllTransactions() as unknown as TransactionRow[];
+    const transactions = this.repo.getAllTransactions();
     const rows = buildTransactionRows(transactions);
 
     await this.client.clearSheet(SHEET_NAMES.TRANSACTIONS);
@@ -282,7 +279,7 @@ export class SheetsRenderer {
     const currentMonth = this.repo.getTransactionsByMonth(
       now.getFullYear(),
       now.getMonth() + 1,
-    ) as unknown as TransactionRow[];
+    );
 
     const creditCardTxs = currentMonth.filter(
       (tx) => tx.account_type === 'CREDIT' && tx.direction === 'EXPENSE',
@@ -319,7 +316,7 @@ export class SheetsRenderer {
 
   private async renderFutureCommitments(): Promise<void> {
     this.logger?.info('  Renderizando: Compromissos Futuros');
-    const installments = this.repo.getUnpaidInstallments() as unknown as InstallmentRow[];
+    const installments = this.repo.getUnpaidInstallments();
     const rows = buildCommitmentRows(installments);
 
     await this.client.clearSheet(SHEET_NAMES.FUTURE_COMMITMENTS);
@@ -371,7 +368,13 @@ export class SheetsRenderer {
     const sheetId = await this.client.getSheetId(SHEET_NAMES.DASHBOARD);
     const L = DASHBOARD_LAYOUT;
 
-    const sectionRows = [1, 8, 13, L.TOP_HEADER_ROW, 28]; // 1-based section headers
+    const sectionRows = [
+      L.OVERVIEW_HEADER_ROW,
+      L.GROUPS_HEADER_ROW,
+      L.CARD_HEADER_ROW,
+      L.TOP_HEADER_ROW,
+      L.EVOLUTION_HEADER_ROW - 1, // "EVOLUÇÃO (12 MESES)" title sits above the column header
+    ]; // 1-based section header rows
     const requests: Request[] = [
       ...this.client.columnWidthRequests(sheetId, [
         { column: 0, width: 220 },
@@ -394,9 +397,9 @@ export class SheetsRenderer {
           },
         }),
       ),
-      // KPIs
-      this.client.numberFormatRequest(sheetId, { startRowIndex: 1, endRowIndex: 5, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.CURRENCY),
-      this.client.numberFormatRequest(sheetId, { startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.PERCENT),
+      // KPIs (currency block + savings-rate percent)
+      this.client.numberFormatRequest(sheetId, { startRowIndex: L.KPI_FIRST_ROW - 1, endRowIndex: L.KPI_LAST_ROW, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.CURRENCY),
+      this.client.numberFormatRequest(sheetId, { startRowIndex: L.SAVINGS_RATE_ROW - 1, endRowIndex: L.SAVINGS_RATE_ROW, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.PERCENT),
       // 50/30/20 realizado + alvo
       this.client.numberFormatRequest(
         sheetId,
@@ -404,7 +407,7 @@ export class SheetsRenderer {
         NUMBER_FORMATS.CURRENCY,
       ),
       // Cartão
-      this.client.numberFormatRequest(sheetId, { startRowIndex: 13, endRowIndex: 16, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.CURRENCY),
+      this.client.numberFormatRequest(sheetId, { startRowIndex: L.CARD_FIRST_ROW - 1, endRowIndex: L.CARD_LAST_ROW, startColumnIndex: 1, endColumnIndex: 2 }, NUMBER_FORMATS.CURRENCY),
       // Top categorias
       this.client.numberFormatRequest(
         sheetId,

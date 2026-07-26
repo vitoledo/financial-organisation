@@ -21,6 +21,14 @@ export function getDatabase(dbPath?: string): Database.Database {
 
   db = new Database(resolvedPath);
 
+  // 0600 — the DB holds financial transactions; keep it unreadable to other
+  // local accounts. Best-effort (filesystems without POSIX perms will throw).
+  try {
+    fs.chmodSync(resolvedPath, 0o600);
+  } catch {
+    /* non-POSIX filesystem */
+  }
+
   // Enable WAL mode for better concurrent read performance
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');

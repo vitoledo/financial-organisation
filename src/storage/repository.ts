@@ -13,6 +13,50 @@ export interface CategoryMapping {
 }
 
 // ---------------------------------------------------------------------------
+// Row shapes returned by the read queries. SQLite results are untyped at
+// runtime, so there is a single unavoidable cast at each `.all()`/`.get()`
+// boundary; declaring the shapes here lets the compiler check every consumer
+// (the sheet renderer, the builders) against these contracts instead of `any`.
+// ---------------------------------------------------------------------------
+
+export interface AccountRow {
+  id: string;
+  name: string;
+  type: string;
+  subtype: string;
+  closing_balance: number | null;
+  credit_limit: number | null;
+  available_credit: number | null;
+  last_synced_at: string | null;
+}
+
+export interface TransactionRow {
+  id: string;
+  date: string;
+  description: string;
+  category_mapped: string | null;
+  category_pierre: string | null;
+  category_group: string | null;
+  direction: string;
+  amount: number;
+  account_name: string | null;
+  account_type: string | null;
+  status: string;
+}
+
+export interface InstallmentRow {
+  id: string;
+  purchase_description: string | null;
+  installment_number: number;
+  total_installments: number;
+  amount: number;
+  due_date: string | null;
+  is_paid: number;
+  is_projected: number;
+  account_name: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Repository — CRUD operations for the financial database
 // ---------------------------------------------------------------------------
 
@@ -42,17 +86,8 @@ export class Repository {
     stmt.run(account);
   }
 
-  getAllAccounts(): Array<{
-    id: string;
-    name: string;
-    type: string;
-    subtype: string;
-    closing_balance: number | null;
-    credit_limit: number | null;
-    available_credit: number | null;
-    last_synced_at: string | null;
-  }> {
-    return this.db.prepare('SELECT * FROM accounts ORDER BY type, name').all() as any;
+  getAllAccounts(): AccountRow[] {
+    return this.db.prepare('SELECT * FROM accounts ORDER BY type, name').all() as AccountRow[];
   }
 
   // -------------------------------------------------------------------------
@@ -134,16 +169,16 @@ export class Repository {
   /**
    * Get all transactions, ordered by date descending.
    */
-  getAllTransactions(): Array<Record<string, unknown>> {
+  getAllTransactions(): TransactionRow[] {
     return this.db.prepare(`
       SELECT * FROM transactions ORDER BY date DESC
-    `).all() as Array<Record<string, unknown>>;
+    `).all() as TransactionRow[];
   }
 
   /**
    * Get transactions for a specific month.
    */
-  getTransactionsByMonth(year: number, month: number): Array<Record<string, unknown>> {
+  getTransactionsByMonth(year: number, month: number): TransactionRow[] {
     const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
     const nextMonth = month === 12 ? 1 : month + 1;
     const nextYear = month === 12 ? year + 1 : year;
@@ -153,7 +188,7 @@ export class Repository {
       SELECT * FROM transactions
       WHERE date >= ? AND date < ?
       ORDER BY date DESC
-    `).all(startDate, endDate) as Array<Record<string, unknown>>;
+    `).all(startDate, endDate) as TransactionRow[];
   }
 
   /**
@@ -276,12 +311,12 @@ export class Repository {
     run();
   }
 
-  getUnpaidInstallments(): Array<Record<string, unknown>> {
+  getUnpaidInstallments(): InstallmentRow[] {
     return this.db.prepare(`
       SELECT * FROM installments
       WHERE is_paid = 0
       ORDER BY due_date ASC
-    `).all() as Array<Record<string, unknown>>;
+    `).all() as InstallmentRow[];
   }
 
   // -------------------------------------------------------------------------

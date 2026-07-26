@@ -109,16 +109,22 @@ O consent do Google precisa de um navegador **uma vez**. Faça num desktop e
 leve o token para o servidor:
 
 ```bash
-# 1. Numa máquina com navegador (desktop):
-docker compose run --rm app sync --setup-only
+# 1. Numa máquina com navegador (desktop). HEADLESS=0 força o fluxo interativo,
+#    já que a imagem roda headless por padrão:
+docker compose run --rm -e HEADLESS=0 app sync --setup-only
 #    → grava data/google-tokens.json e cria a planilha
+#    (fora do Docker, `pnpm setup` faz o mesmo sem precisar do -e)
 
 # 2. Copie ./data/google-tokens.json e ./data/spreadsheet-id.txt para o servidor.
 
-# 3. No servidor (dono do bind mount = uid 1000, para o WAL do SQLite escrever):
-mkdir -p data && sudo chown -R 1000:1000 data
+# 3. No servidor (dono do bind mount = uid 1000, para o WAL do SQLite escrever;
+#    0700 para o diretório e os arquivos de token/DB ficarem privados):
+mkdir -p data && sudo chown -R 1000:1000 data && chmod 700 data
 docker compose up -d
 ```
+
+> Combine com disco criptografado no host (LUKS/BitLocker): o token do Google e
+> o banco SQLite ficam em texto puro no bind mount.
 
 No servidor (headless), se faltar token o programa **falha rápido** com
 instruções, em vez de travar esperando um navegador que não existe.

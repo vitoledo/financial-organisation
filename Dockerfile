@@ -33,9 +33,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # supercronic: a single static binary that runs the crontab as PID 1 and logs
-# each job (and its exit code) to stdout. Pin + verify per release checksums.
+# each job (and its exit code) to stdout. The binary is verified against the
+# .sha1 checksum published alongside it in the same pinned release, so a
+# corrupted or tampered download fails the build instead of shipping.
 ADD https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH} /usr/local/bin/supercronic
-RUN chmod +x /usr/local/bin/supercronic
+ADD https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}.sha1 /tmp/supercronic.sha1
+RUN echo "$(awk '{print $1}' /tmp/supercronic.sha1)  /usr/local/bin/supercronic" | sha1sum -c - \
+ && chmod +x /usr/local/bin/supercronic \
+ && rm /tmp/supercronic.sha1
 
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./

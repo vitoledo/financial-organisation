@@ -67,9 +67,6 @@ program
   .option('--skip-update', 'Pula o manual-update do Pierre', false)
   .option('--setup-only', 'Apenas cria/configura a planilha, sem sincronizar dados', false)
   .action(async (opts) => {
-    const config = loadConfig();
-    const logger = buildLogger(config);
-
     const options: SyncOptions = {
       fullSync: opts.full,
       dryRun: opts.dryRun,
@@ -77,33 +74,51 @@ program
       setupOnly: opts.setupOnly,
     };
 
-    const engine = new SyncEngine(config, logger);
     const startedAt = new Date().toISOString();
+    // loadConfig/buildLogger are inside the try so a config error (e.g. a
+    // missing env var on first boot — the most likely production failure)
+    // still logs, writes a failure heartbeat, and exits 1, instead of escaping
+    // as an unhandled rejection.
+    let logger: pino.Logger | undefined;
+    let dataDir: string | undefined;
 
     try {
-      await engine.run(options);
+      const config = loadConfig();
+      dataDir = config.dataDir;
+      logger = buildLogger(config);
+
+      await new SyncEngine(config, logger).run(options);
+
       // A --setup-only run is not a data sync; leave the heartbeat untouched so
       // it keeps reflecting the last real sync.
       if (!options.setupOnly) {
-        writeHeartbeat(config.dataDir, {
-          status: 'success',
-          startedAt,
-          finishedAt: new Date().toISOString(),
-          exitCode: 0,
+        writeHeartbeat(dataDir, {
+          status: 'success', startedAt, finishedAt: new Date().toISOString(), exitCode: 0,
         });
       }
       process.exit(0);
     } catch (err) {
-      logger.error(err as Error, 'Fatal error');
-      writeHeartbeat(config.dataDir, {
-        status: 'failure',
-        startedAt,
-        finishedAt: new Date().toISOString(),
-        exitCode: 1,
-        error: (err as Error).message,
-      });
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (logger) logger.error(error, 'Fatal error');
+      else console.error('Fatal error:', error.message);
+
+      // Only overwrite the heartbeat for real syncs, and only once we know
+      // where to write it — a failed --setup-only run must not flip the
+      // healthcheck for the healthy scheduled pipeline.
+      if (dataDir && !options.setupOnly) {
+        writeHeartbeat(dataDir, {
+          status: 'failure', startedAt, finishedAt: new Date().toISOString(),
+          exitCode: 1, error: error.message,
+        });
+      }
       process.exit(1);
     }
   });
 
-program.parse();
+// parseAsync so a rejection from the async action is caught here rather than
+// becoming an unhandled rejection (the action already exits the process on both
+// paths; this is the last-resort net for anything thrown before it can).
+program.parseAsync().catch((err) => {
+  console.error('Fatal error:', err instanceof Error ? err.message : err);
+  process.exit(1);
+});

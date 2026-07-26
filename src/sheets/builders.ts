@@ -1,4 +1,9 @@
 import { SHEET_NAMES } from './names';
+import type { AccountRow, TransactionRow, InstallmentRow } from '../storage/repository';
+
+// Re-exported so sheet-facing code (and tests) keep a single import site for
+// the row shapes, while the canonical definitions live with the schema.
+export type { AccountRow, TransactionRow, InstallmentRow };
 
 // =============================================================================
 // Pure builders — turn database rows into cell matrices.
@@ -74,6 +79,18 @@ export function monthKey(isoDate: string): string {
   return isoDate.slice(0, 7);
 }
 
+/**
+ * Defuse spreadsheet formula injection. Cells are written with USER_ENTERED, so
+ * a value beginning with = + - @ (or a control char) is evaluated as a formula.
+ * Bank/Pix transaction descriptions are attacker-controlled free text — a Pix
+ * sender can set the description — so any external string must render as
+ * literal text. Prefixing an apostrophe forces Sheets to treat it as text.
+ */
+export function sanitizeCellText(value: string | null | undefined): string {
+  if (value === null || value === undefined) return '';
+  return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+}
+
 export function monthLabel(year: number, month: number): string {
   return `${MONTH_NAMES_PT[month]}/${year}`;
 }
@@ -112,14 +129,23 @@ export function parseMoneyBR(raw: unknown): number | null {
   if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
   if (typeof raw !== 'string') return null;
 
-  const cleaned = raw
-    .replace(/R\$/gi, '')
-    .replace(/\s| /g, '')
-    .replace(/\./g, '')
-    .replace(',', '.');
+  const stripped = raw.replace(/R\$/gi, '').replace(/\s/g, '');
+  if (!stripped) return null;
 
-  if (!cleaned) return null;
-  const value = Number(cleaned);
+  let normalized: string;
+  if (stripped.includes(',')) {
+    // pt-BR: dots are thousands separators, comma is the decimal.
+    normalized = stripped.replace(/\./g, '').replace(',', '.');
+  } else if (/^[0-9]*\.[0-9]{1,2}$/.test(stripped)) {
+    // A single dot with 1-2 trailing digits and no comma is almost certainly a
+    // decimal point ("50.5"), not a thousands group. "1.234" (3 digits) stays
+    // a thousands group via the else branch.
+    normalized = stripped;
+  } else {
+    normalized = stripped.replace(/\./g, '');
+  }
+
+  const value = Number(normalized);
   return Number.isFinite(value) ? value : null;
 }
 
@@ -145,23 +171,13 @@ function txCol(index: number): string {
 // Saldo
 // ---------------------------------------------------------------------------
 
-export interface AccountRow {
-  name: string;
-  type: string;
-  subtype: string;
-  closing_balance: number | null;
-  credit_limit: number | null;
-  available_credit: number | null;
-  last_synced_at: string | null;
-}
-
 export const BALANCE_HEADER = [
   'Conta', 'Tipo', 'Saldo (R$)', 'Limite (R$)', 'Disponível (R$)', 'Última Atualização',
 ];
 
 export function buildBalanceRows(accounts: AccountRow[]): unknown[][] {
   const rows: unknown[][] = accounts.map((acc) => [
-    acc.name,
+    sanitizeCellText(acc.name),
     accountTypeLabel(acc.subtype),
     acc.closing_balance ?? '',
     acc.credit_limit ?? '',
@@ -188,19 +204,6 @@ export function buildBalanceRows(accounts: AccountRow[]): unknown[][] {
 // Transações
 // ---------------------------------------------------------------------------
 
-export interface TransactionRow {
-  date: string;
-  description: string;
-  category_mapped: string | null;
-  category_pierre: string | null;
-  category_group: string | null;
-  direction: string;
-  amount: number;
-  account_name: string | null;
-  status: string;
-  account_type?: string;
-}
-
 export const TRANSACTIONS_HEADER = [
   'Data', 'Descrição', 'Categoria', 'Grupo', 'Tipo', 'Valor (R$)', 'Conta', 'Status', 'Mês',
 ];
@@ -208,12 +211,12 @@ export const TRANSACTIONS_HEADER = [
 export function buildTransactionRows(transactions: TransactionRow[]): unknown[][] {
   const rows = transactions.map((tx) => [
     formatDateBR(tx.date),
-    tx.description,
-    tx.category_mapped || tx.category_pierre || 'Outros',
+    sanitizeCellText(tx.description),
+    sanitizeCellText(tx.category_mapped || tx.category_pierre || 'Outros'),
     tx.category_group ?? '',
     directionLabel(tx.direction),
     tx.amount,
-    tx.account_name ?? '',
+    sanitizeCellText(tx.account_name),
     statusLabel(tx.status),
     monthKey(tx.date),
   ]);
@@ -361,11 +364,21 @@ export interface DashboardInput {
   totalExpenses: number;
 }
 
-// Fixed 1-based layout. Charts anchor to these rows, so the grid must keep its
-// shape even when a section has no data — short sections are padded.
+// Fixed 1-based layout. Charts anchor to these rows and the renderer applies
+// number formats by row, so the grid must keep its shape even when a section
+// has no data — short sections are padded. buildDashboardData constructs the
+// rows in exactly this order; keep the two in sync.
 export const DASHBOARD_LAYOUT = {
+  OVERVIEW_HEADER_ROW: 1,
+  KPI_FIRST_ROW: 2,          // Saldo em conta
+  KPI_LAST_ROW: 5,           // Sobra do mês (currency block)
+  SAVINGS_RATE_ROW: 6,       // Taxa de poupança (percent)
+  GROUPS_HEADER_ROW: 8,
   GROUPS_FIRST_ROW: 9,
   GROUPS_LAST_ROW: 11,
+  CARD_HEADER_ROW: 13,
+  CARD_FIRST_ROW: 14,        // Limite total
+  CARD_LAST_ROW: 16,         // Limite usado (currency block)
   TOP_HEADER_ROW: 18,
   TOP_FIRST_ROW: 19,
   TOP_SLOTS: 8,
@@ -492,8 +505,8 @@ export const CURRENT_BILL_HEADER = ['Data', 'Descrição', 'Categoria', 'Valor (
 export function buildCurrentBillRows(transactions: TransactionRow[]): unknown[][] {
   const rows: unknown[][] = transactions.map((tx) => [
     formatDateBR(tx.date),
-    tx.description,
-    tx.category_mapped || tx.category_pierre || 'Outros',
+    sanitizeCellText(tx.description),
+    sanitizeCellText(tx.category_mapped || tx.category_pierre || 'Outros'),
     Math.abs(tx.amount),
     statusLabel(tx.status),
   ]);
@@ -512,16 +525,6 @@ export function buildCurrentBillRows(transactions: TransactionRow[]): unknown[][
 // Compromissos Futuros
 // ---------------------------------------------------------------------------
 
-export interface InstallmentRow {
-  purchase_description: string | null;
-  installment_number: number;
-  total_installments: number;
-  amount: number;
-  due_date: string | null;
-  is_projected: number;
-  account_name: string | null;
-}
-
 export const COMMITMENTS_HEADER = [
   'Descrição', 'Parcela', 'Valor (R$)', 'Vencimento', 'Mês', 'Status', 'Cartão',
 ];
@@ -532,13 +535,13 @@ export function buildCommitmentRows(installments: InstallmentRow[]): unknown[][]
   }
 
   const rows: unknown[][] = installments.map((inst) => [
-    inst.purchase_description ?? '',
+    sanitizeCellText(inst.purchase_description),
     `${inst.installment_number}/${inst.total_installments}`,
     inst.amount,
     inst.due_date ? formatDateBR(inst.due_date) : '',
     inst.due_date ? monthKey(inst.due_date) : '',
     inst.is_projected ? 'Projetada' : 'Confirmada',
-    inst.account_name ?? '',
+    sanitizeCellText(inst.account_name),
   ]);
 
   const lastRow = rows.length + 1;

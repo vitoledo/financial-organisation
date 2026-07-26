@@ -81,14 +81,27 @@ export function calculateDateRange(
   const endDate = now.toISOString().split('T')[0];
 
   if (!fullSync && lastSyncCompletedAt) {
-    const start = new Date(lastSyncCompletedAt);
-    start.setDate(start.getDate() - INCREMENTAL_OVERLAP_DAYS);
+    const start = parseSqliteUtc(lastSyncCompletedAt);
+    start.setUTCDate(start.getUTCDate() - INCREMENTAL_OVERLAP_DAYS);
     return { startDate: start.toISOString().split('T')[0], endDate };
   }
 
   const start = new Date(now);
   start.setMonth(start.getMonth() - FULL_SYNC_MONTHS);
   return { startDate: start.toISOString().split('T')[0], endDate };
+}
+
+/**
+ * Parse a SQLite `datetime('now')` value ("YYYY-MM-DD HH:MM:SS", UTC, no zone
+ * suffix). Left as-is, `new Date()` reads it in the host's local time, which
+ * under TZ=America/Sao_Paulo shifts it +3h and can silently shrink the overlap
+ * window near a day boundary. An explicit "Z" (when no zone is present) keeps it
+ * in UTC. ISO strings that already carry a zone pass through unchanged.
+ */
+function parseSqliteUtc(value: string): Date {
+  const hasZone = /[Zz]|[+-]\d{2}:?\d{2}$/.test(value.trim());
+  const normalized = hasZone ? value.trim() : `${value.trim().replace(' ', 'T')}Z`;
+  return new Date(normalized);
 }
 
 export interface FlatInstallment {
@@ -246,7 +259,9 @@ export class SyncEngine {
 
       // 6. Fetch transactions
       this.logger.info('\n[6/8] Buscando transações...');
-      const lastSync = options.dryRun ? repo.getLastSuccessfulSync() : this.lastSyncBefore(repo, syncId);
+      // The current run's row is RUNNING, so getLastSuccessfulSync never
+      // returns it — it yields the previous successful sync, as intended.
+      const lastSync = repo.getLastSuccessfulSync();
       const { startDate, endDate } = calculateDateRange(
         lastSync?.completed_at ?? null,
         options.fullSync,
@@ -272,23 +287,32 @@ export class SyncEngine {
         this.logger.info('  [DRY RUN] Nenhuma transação gravada.');
       }
 
-      // 7. Fetch installments
+      // 7. Fetch installments.
+      // The FETCH is best-effort: parcelas are already retried inside the
+      // client, and a persistent fetch failure should not sink the whole sync —
+      // we keep the previously stored parcelas. But the TRANSFORM and DB WRITE
+      // run outside the catch on purpose: a bug there (or a failed SQLite write)
+      // must surface and fail the sync loudly, instead of being mislabeled as
+      // "falha ao buscar" and silently reported as SUCCESS.
       this.logger.info('\n[7/8] Buscando parcelas...');
+      let purchasesByCard: PierrePurchasesByCard[] | null = null;
       try {
         const installmentsResponse = await pierreClient.getInstallments();
-        const purchasesByCard = installmentsResponse.data?.purchasesByCard ?? [];
-        const installments = flattenInstallments(purchasesByCard);
+        purchasesByCard = installmentsResponse.data?.purchasesByCard ?? [];
+      } catch (err) {
+        this.logger.warn('  Falha ao BUSCAR parcelas (mantendo as existentes)', {
+          error: (err as Error).message,
+        });
+      }
 
-        if (installments.length > 0 && !options.dryRun) {
+      if (purchasesByCard !== null && !options.dryRun) {
+        const installments = flattenInstallments(purchasesByCard);
+        if (installments.length > 0) {
           repo.replaceInstallments(installments);
           this.logger.info(`  ${installments.length} parcelas processadas.`);
         } else {
           this.logger.info('  Nenhuma parcela encontrada.');
         }
-      } catch (err) {
-        this.logger.warn('  Falha ao buscar parcelas (continuando)', {
-          error: (err as Error).message,
-        });
       }
 
       // 8. Render to Google Sheets
@@ -327,20 +351,16 @@ export class SyncEngine {
 
       throw error;
     } finally {
-      this.deps.closeDatabase();
+      // Guarded like failSync above: a close failure (e.g. a WAL checkpoint I/O
+      // error under disk pressure) must not replace the real error propagating
+      // out of the catch.
+      try {
+        this.deps.closeDatabase();
+      } catch (closeErr) {
+        this.logger.error('Falha ao fechar o banco de dados', {
+          error: (closeErr as Error).message,
+        });
+      }
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // Private helpers
-  // -------------------------------------------------------------------------
-
-  /**
-   * Last successful sync, excluding the row created for the current run.
-   * (The current run is RUNNING, so it never matches, but the guard makes
-   * the intent explicit.)
-   */
-  private lastSyncBefore(repo: Repository, _currentSyncId: number | null) {
-    return repo.getLastSuccessfulSync();
   }
 }

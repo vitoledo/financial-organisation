@@ -167,6 +167,10 @@ export class SheetsClient {
       spreadsheetId: this.spreadsheetId,
       requestBody: { requests },
     });
+    // Any structural request (sheets, charts, bandings) changes the metadata a
+    // later getSheetId/getChartIds would read, so drop the cache. Cheaper and
+    // safer than requiring every caller to remember to invalidate.
+    if (requests.some(isStructuralRequest)) this.invalidateMeta();
     return res.data;
   }
 
@@ -179,16 +183,6 @@ export class SheetsClient {
       repeatCell: {
         range: { sheetId, ...range },
         cell: { userEnteredFormat: { numberFormat: { type: 'NUMBER', pattern } } },
-        fields: 'userEnteredFormat.numberFormat',
-      },
-    };
-  }
-
-  dateFormatRequest(sheetId: number, range: Omit<GridRange, 'sheetId'>): Request {
-    return {
-      repeatCell: {
-        range: { sheetId, ...range },
-        cell: { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: NUMBER_FORMATS.DATE } } },
         fields: 'userEnteredFormat.numberFormat',
       },
     };
@@ -337,7 +331,12 @@ export class SheetsClient {
     const meta = await this.getSpreadsheetMeta(true);
     const sheet = meta.sheets?.find((s) => s.properties?.title === sheetName);
     const sheetId = sheet?.properties?.sheetId;
-    if (sheetId === undefined || sheetId === null) return [];
+    // Throw rather than silently no-op: a missing sheet here means a bug in the
+    // render order, not a benign "nothing to clear". Returning [] would let
+    // duplicate rules accumulate undetected.
+    if (sheetId === undefined || sheetId === null) {
+      throw new Error(`Sheet "${sheetName}" not found (clearConditionalFormatRequests).`);
+    }
 
     const count = sheet?.conditionalFormats?.length ?? 0;
     const requests: Request[] = [];
@@ -355,7 +354,10 @@ export class SheetsClient {
   async getChartIds(sheetName: string): Promise<number[]> {
     const meta = await this.getSpreadsheetMeta(true);
     const sheet = meta.sheets?.find((s) => s.properties?.title === sheetName);
-    return (sheet?.charts ?? [])
+    if (!sheet) {
+      throw new Error(`Sheet "${sheetName}" not found (getChartIds).`);
+    }
+    return (sheet.charts ?? [])
       .map((c) => c.chartId)
       .filter((id): id is number => typeof id === 'number');
   }
@@ -447,4 +449,17 @@ export class SheetsClient {
       },
     };
   }
+}
+
+// Requests that alter spreadsheet/sheet/chart structure, and therefore
+// invalidate any cached metadata (sheet ids, chart ids).
+const STRUCTURAL_REQUEST_KEYS: Array<keyof Request> = [
+  'addSheet', 'deleteSheet', 'updateSheetProperties',
+  'addChart', 'deleteEmbeddedObject', 'updateEmbeddedObjectPosition',
+  'addBanding', 'deleteBanding',
+  'updateSpreadsheetProperties',
+];
+
+function isStructuralRequest(request: Request): boolean {
+  return STRUCTURAL_REQUEST_KEYS.some((key) => request[key] !== undefined);
 }

@@ -1,6 +1,7 @@
-import { describe, test, expect, vi } from 'vitest';
+import { describe, test, expect, vi, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { runMigrations } from '../src/storage/migrations';
+import { Repository } from '../src/storage/repository';
 import {
   SyncEngine,
   SyncEngineDeps,
@@ -33,6 +34,21 @@ describe('calculateDateRange', () => {
     const range = calculateDateRange(null, false, now);
 
     expect(range).toEqual({ startDate: '2026-04-06', endDate: '2026-07-06' });
+  });
+
+  test('parses a naive SQLite datetime as UTC, not host-local time', () => {
+    // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS", UTC, no zone suffix.
+    // Read as UTC (23:30Z minus 3 days), the start date is the 17th regardless
+    // of the host timezone; a local-time misparse under TZ=America/Sao_Paulo
+    // would push 23:30 to the next UTC day and shift the window.
+    const range = calculateDateRange('2026-07-20 23:30:00', false, now);
+
+    expect(range.startDate).toBe('2026-07-17');
+  });
+
+  test('still honors an explicit-zone ISO string', () => {
+    const range = calculateDateRange('2026-07-20T23:30:00.000Z', false, now);
+    expect(range.startDate).toBe('2026-07-17');
   });
 });
 
@@ -395,5 +411,45 @@ describe('SyncEngine.run', () => {
 
     expect(pierre.getAccounts).not.toHaveBeenCalled();
     expect(deps.createPierreClient).not.toHaveBeenCalled();
+  });
+
+  test('a persistent installments FETCH failure does not sink the sync', async () => {
+    const db = new Database(':memory:');
+    runMigrations(db);
+    const pierre = makePierreStub({
+      getInstallments: vi.fn(async () => {
+        throw new Error('installments endpoint 500');
+      }),
+    });
+    const engine = new SyncEngine(config, noopLogger, makeDeps(db, pierre));
+
+    await engine.run({ fullSync: false, dryRun: false, skipUpdate: true, setupOnly: false });
+
+    // Transactions persisted, sync SUCCESS, and existing installments untouched.
+    expect((db.prepare('SELECT status FROM sync_log ORDER BY id DESC LIMIT 1').get() as any).status).toBe('SUCCESS');
+    expect((db.prepare('SELECT COUNT(*) c FROM transactions').get() as any).c).toBe(1);
+    expect((db.prepare('SELECT COUNT(*) c FROM installments').get() as any).c).toBe(0);
+  });
+
+  test('an installments DB-WRITE failure fails the sync loudly (not swallowed as SUCCESS)', async () => {
+    const db = new Database(':memory:');
+    runMigrations(db);
+    const spy = vi
+      .spyOn(Repository.prototype, 'replaceInstallments')
+      .mockImplementation(() => {
+        throw new Error('disk full');
+      });
+
+    const engine = new SyncEngine(config, noopLogger, makeDeps(db, makePierreStub()));
+
+    await expect(
+      engine.run({ fullSync: false, dryRun: false, skipUpdate: true, setupOnly: false }),
+    ).rejects.toThrow('disk full');
+
+    const row = db.prepare('SELECT * FROM sync_log ORDER BY id DESC LIMIT 1').get() as any;
+    expect(row.status).toBe('ERROR');
+    expect(row.error_message).toContain('disk full');
+
+    spy.mockRestore();
   });
 });

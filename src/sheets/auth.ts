@@ -107,7 +107,14 @@ function saveTokens(
     ...tokens,
     refresh_token: tokens.refresh_token ?? previous?.refresh_token,
   };
-  fs.writeFileSync(tokensPath, JSON.stringify(merged, null, 2));
+  // 0600 — the token grants Sheets access; keep it unreadable to other local
+  // accounts on the host/bind mount.
+  fs.writeFileSync(tokensPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
+  try {
+    fs.chmodSync(tokensPath, 0o600); // enforce even if the file pre-existed
+  } catch {
+    // Best-effort on filesystems without POSIX perms (e.g. some Windows mounts).
+  }
 }
 
 /* v8 ignore start -- interactive OAuth flow: spins up a localhost server and

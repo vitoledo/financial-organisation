@@ -18,6 +18,7 @@ import {
   buildCurrentBillRows,
   buildCommitmentRows,
   parseBudgetConfig,
+  sanitizeCellText,
   lastMonths,
   DASHBOARD_LAYOUT,
   TransactionRow,
@@ -89,6 +90,35 @@ describe('parseMoneyBR', () => {
     expect(parseMoneyBR('abc')).toBeNull();
     expect(parseMoneyBR(undefined)).toBeNull();
     expect(parseMoneyBR(null)).toBeNull();
+  });
+
+  test('tolerates a dot used as a decimal separator (no comma)', () => {
+    expect(parseMoneyBR('50.5')).toBeCloseTo(50.5, 2);
+    expect(parseMoneyBR('1234.56')).toBeCloseTo(1234.56, 2);
+  });
+
+  test('still treats a dot with 3+ trailing digits as a thousands group', () => {
+    expect(parseMoneyBR('1.234')).toBe(1234);
+    expect(parseMoneyBR('1.234.567')).toBe(1234567);
+  });
+});
+
+describe('sanitizeCellText', () => {
+  test.each(['=1+1', '+1', '-1', '@x', '=HYPERLINK("http://e","x")'])(
+    'prefixes an apostrophe to formula-triggering text %s',
+    (value) => {
+      expect(sanitizeCellText(value)).toBe(`'${value}`);
+    },
+  );
+
+  test('leaves ordinary text untouched', () => {
+    expect(sanitizeCellText('Mercado Pão de Açúcar')).toBe('Mercado Pão de Açúcar');
+    expect(sanitizeCellText('99app *99app')).toBe('99app *99app');
+  });
+
+  test('maps null/undefined to empty string', () => {
+    expect(sanitizeCellText(null)).toBe('');
+    expect(sanitizeCellText(undefined)).toBe('');
   });
 });
 
@@ -216,6 +246,13 @@ describe('buildTransactionRows', () => {
     expect(mapped[2]).toBe('Alimentação');
     expect(pierre[2]).toBe('Supermercado');
     expect(fallback[2]).toBe('Outros');
+  });
+
+  test('neutralizes a formula-injection payload in the description', () => {
+    const evil = '=HYPERLINK("https://evil.example","Clique")';
+    const [, row] = buildTransactionRows([{ ...tx, description: evil }]);
+
+    expect(row[1]).toBe(`'${evil}`); // written as literal text, not a formula
   });
 });
 
