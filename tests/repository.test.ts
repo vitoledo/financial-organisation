@@ -208,6 +208,27 @@ describe('Repository monthly aggregations', () => {
   test('getMonthlyIncome returns 0 for empty months', () => {
     expect(repo.getMonthlyIncome(2020, 1)).toBe(0);
   });
+
+  test('getExpenseCategories lists expense categories with their group, biggest first', () => {
+    repo.upsertTransaction(
+      makeTx({ id: 'fun-1', amount: -20, categoryPierre: 'Lazer' }),
+      { categoryPierre: 'Lazer', categoryMapped: 'Lazer', group: 'Desejo', variability: 'Variável' },
+    );
+
+    const categories = repo.getExpenseCategories();
+
+    expect(categories).toEqual([
+      { category: 'Alimentação', group: 'Necessidade' },
+      { category: 'Lazer', group: 'Desejo' },
+    ]);
+  });
+
+  test('getExpenseCategories excludes income and transfers', () => {
+    const categories = repo.getExpenseCategories().map((c) => c.category);
+
+    expect(categories).toContain('Alimentação');
+    expect(categories).not.toContain('Compras'); // only used by INCOME/TRANSFER fixtures
+  });
 });
 
 // ---------------------------------------------------------------------------

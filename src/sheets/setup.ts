@@ -1,91 +1,108 @@
 import { Auth } from 'googleapis';
-import { SheetsClient } from './client';
 import fs from 'fs';
 import path from 'path';
+import { SheetsClient, Request } from './client';
+import { SHEET_NAMES } from './names';
+
+export { SHEET_NAMES };
 
 // ---------------------------------------------------------------------------
-// Sheet names (in Portuguese, as decided)
+// Seed data
 // ---------------------------------------------------------------------------
 
-export const SHEET_NAMES = {
-  CONFIG_CATEGORIES: 'Config: Categorias',
-  CONFIG_BUDGET: 'Config: Orçamento',
-  BALANCE: 'Saldo',
-  TRANSACTIONS: 'Transações',
-  MONTHLY_SUMMARY: 'Resumo Mensal',
-  CURRENT_BILL: 'Fatura Atual',
-  FUTURE_COMMITMENTS: 'Compromissos Futuros',
-  DASHBOARD: 'Dashboard',
-} as const;
+export const CATEGORY_HEADER = [
+  'Categoria Pierre', 'Categoria Planilha', 'Grupo 50/30/20', 'Fixa/Variável',
+];
 
-// ---------------------------------------------------------------------------
-// Default category mappings (pre-populated)
-// ---------------------------------------------------------------------------
+export const GROUP_OPTIONS = ['Necessidade', 'Desejo', 'Poupança', '—'];
+export const VARIABILITY_OPTIONS = ['Fixa', 'Variável', '—'];
 
+/**
+ * Pierre → spreadsheet category map. The left column holds the category names
+ * Pierre actually emits (confirmed against real API payloads); the rest is the
+ * user's taxonomy and is theirs to edit.
+ */
 const DEFAULT_CATEGORY_MAPPINGS: string[][] = [
-  ['Categoria Pierre', 'Categoria Planilha', 'Grupo 50/30/20', 'Fixa/Variável'],
+  CATEGORY_HEADER,
+  // Transfers — money moving, not spending. Kept out of every total.
   ['Pagamento de cartão de crédito', '(Transferência)', '—', '—'],
   ['Transferências', '(Transferência)', '—', '—'],
   ['Transferência', '(Transferência)', '—', '—'],
+  ['Transferência mesma titularidade', '(Transferência)', '—', '—'],
   ['Resgate', '(Transferência)', '—', '—'],
   ['Aplicação', '(Transferência)', '—', '—'],
-  ['Compras', 'Compras', 'Necessidade', 'Variável'],
-  ['Alimentação', 'Alimentação', 'Necessidade', 'Variável'],
+  // Alimentação
   ['Supermercado', 'Alimentação', 'Necessidade', 'Variável'],
-  ['Restaurantes', 'Alimentação', 'Desejo', 'Variável'],
-  ['Delivery', 'Alimentação', 'Desejo', 'Variável'],
+  ['Alimentação', 'Alimentação', 'Necessidade', 'Variável'],
+  ['Restaurantes', 'Restaurantes e Delivery', 'Desejo', 'Variável'],
+  ['Delivery', 'Restaurantes e Delivery', 'Desejo', 'Variável'],
+  ['Bares e baladas', 'Restaurantes e Delivery', 'Desejo', 'Variável'],
+  // Transporte
+  ['Táxi e transporte privado urbano', 'Transporte', 'Necessidade', 'Variável'],
   ['Transporte', 'Transporte', 'Necessidade', 'Variável'],
-  ['Uber', 'Transporte', 'Necessidade', 'Variável'],
+  ['Postos de gasolina', 'Transporte', 'Necessidade', 'Variável'],
   ['Combustível', 'Transporte', 'Necessidade', 'Variável'],
-  ['Saúde', 'Saúde', 'Necessidade', 'Fixa'],
-  ['Farmácia', 'Saúde', 'Necessidade', 'Variável'],
-  ['Educação', 'Educação', 'Necessidade', 'Fixa'],
-  ['Lazer', 'Lazer', 'Desejo', 'Variável'],
-  ['Entretenimento', 'Lazer', 'Desejo', 'Variável'],
-  ['Streaming', 'Lazer', 'Desejo', 'Fixa'],
-  ['Vestuário', 'Vestuário', 'Desejo', 'Variável'],
+  ['Transporte público', 'Transporte', 'Necessidade', 'Variável'],
+  ['Estacionamento', 'Transporte', 'Necessidade', 'Variável'],
+  // Moradia e contas
   ['Moradia', 'Moradia', 'Necessidade', 'Fixa'],
   ['Aluguel', 'Moradia', 'Necessidade', 'Fixa'],
   ['Contas e Utilidades', 'Contas e Utilidades', 'Necessidade', 'Fixa'],
   ['Internet', 'Contas e Utilidades', 'Necessidade', 'Fixa'],
   ['Telefone', 'Contas e Utilidades', 'Necessidade', 'Fixa'],
+  ['Energia', 'Contas e Utilidades', 'Necessidade', 'Fixa'],
+  ['Água', 'Contas e Utilidades', 'Necessidade', 'Fixa'],
+  // Saúde e bem-estar
+  ['Saúde', 'Saúde', 'Necessidade', 'Fixa'],
+  ['Farmácia', 'Saúde', 'Necessidade', 'Variável'],
+  ['Bem-estar', 'Saúde', 'Desejo', 'Variável'],
+  ['Academia', 'Saúde', 'Desejo', 'Fixa'],
+  // Educação
+  ['Educação', 'Educação', 'Necessidade', 'Fixa'],
+  ['Cursos', 'Educação', 'Necessidade', 'Fixa'],
+  // Lazer
+  ['Lazer', 'Lazer', 'Desejo', 'Variável'],
+  ['Entretenimento', 'Lazer', 'Desejo', 'Variável'],
+  ['Streaming', 'Assinaturas', 'Desejo', 'Fixa'],
   ['Assinaturas', 'Assinaturas', 'Desejo', 'Fixa'],
+  ['Viagens', 'Lazer', 'Desejo', 'Variável'],
+  // Compras e serviços
+  ['Compras', 'Compras', 'Desejo', 'Variável'],
+  ['Vestuário', 'Vestuário', 'Desejo', 'Variável'],
+  ['Serviços', 'Serviços', 'Necessidade', 'Variável'],
+  ['Eletrônicos', 'Compras', 'Desejo', 'Variável'],
+  // Poupança e outros
   ['Poupança', 'Poupança/Investimentos', 'Poupança', '—'],
   ['Investimentos', 'Poupança/Investimentos', 'Poupança', '—'],
   ['Presentes', 'Presentes/Doações', 'Desejo', 'Variável'],
   ['Doações', 'Presentes/Doações', 'Desejo', 'Variável'],
+  ['Impostos e taxas', 'Impostos e Taxas', 'Necessidade', 'Variável'],
+  ['Salário', 'Salário', '—', '—'],
   ['Outros', 'Outros', 'Desejo', 'Variável'],
 ];
 
-// ---------------------------------------------------------------------------
-// Default budget config
-// ---------------------------------------------------------------------------
+/** Distinct spreadsheet categories that should get a budget line. */
+const BUDGET_CATEGORIES = Array.from(
+  new Set(
+    DEFAULT_CATEGORY_MAPPINGS.slice(1)
+      .map((row) => row[1])
+      .filter((c) => c !== '(Transferência)' && c !== 'Salário'),
+  ),
+).sort((a, b) => a.localeCompare(b, 'pt-BR'));
 
-const DEFAULT_BUDGET_CONFIG: string[][] = [
-  ['Parâmetro', 'Valor'],
-  ['Renda Líquida Mensal', ''],
-  ['% Necessidades', '50%'],
-  ['% Desejos', '30%'],
-  ['% Poupança', '20%'],
-  ['', ''],
-  ['Categoria', 'Orçamento Mensal (R$)'],
-  ['Alimentação', ''],
-  ['Transporte', ''],
-  ['Saúde', ''],
-  ['Educação', ''],
-  ['Lazer', ''],
-  ['Vestuário', ''],
-  ['Moradia', ''],
-  ['Contas e Utilidades', ''],
-  ['Assinaturas', ''],
-  ['Compras', ''],
-  ['Poupança/Investimentos', ''],
-  ['Presentes/Doações', ''],
-  ['Outros', ''],
+const DEFAULT_BUDGET_CONFIG: unknown[][] = [
+  ['Parâmetro', 'Valor', 'Observação'],
+  ['Renda Líquida Mensal', '', 'Preencha: base da regra 50/30/20 e da taxa de poupança'],
+  ['% Necessidades', 0.5, 'Alvo do grupo Necessidade'],
+  ['% Desejos', 0.3, 'Alvo do grupo Desejo'],
+  ['% Poupança', 0.2, 'Alvo do grupo Poupança'],
+  ['', '', ''],
+  ['Categoria', 'Orçamento Mensal (R$)', 'Deixe em branco para não acompanhar'],
+  ...BUDGET_CATEGORIES.map((c) => [c, '', '']),
 ];
 
 // ---------------------------------------------------------------------------
-// Setup: creates the spreadsheet and all tabs
+// Setup
 // ---------------------------------------------------------------------------
 
 export interface SetupResult {
@@ -93,111 +110,122 @@ export interface SetupResult {
   spreadsheetUrl: string;
 }
 
+const SPREADSHEET_TITLE = 'Financeiro — Controle Automatizado';
+
+export function spreadsheetUrl(spreadsheetId: string): string {
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}`;
+}
+
 /**
- * Create a new Google Sheets spreadsheet with all tabs pre-configured.
- * Saves the spreadsheet ID to disk.
+ * Create the spreadsheet (or adopt the saved one) and make sure every tab
+ * exists. Idempotent: safe to run on every sync, so a spreadsheet created by an
+ * older version gains new tabs (e.g. Consolidado Anual) without a rebuild.
  */
 export async function setupSpreadsheet(
   auth: Auth.OAuth2Client,
   idFilePath: string,
   logger?: { info: (msg: string) => void },
 ): Promise<SetupResult> {
-  // Check if a spreadsheet ID already exists
-  if (fs.existsSync(idFilePath)) {
-    const existingId = fs.readFileSync(idFilePath, 'utf8').trim();
-    if (existingId) {
-      logger?.info(`Spreadsheet already exists: ${existingId}`);
-      return {
-        spreadsheetId: existingId,
-        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${existingId}`,
-      };
-    }
+  const existingId = readSpreadsheetId(idFilePath);
+
+  if (existingId) {
+    const client = new SheetsClient(auth, existingId);
+    await client.ensureLocale();
+    await ensureTabs(client, logger);
+    return { spreadsheetId: existingId, spreadsheetUrl: spreadsheetUrl(existingId) };
   }
 
-  logger?.info('Creating new spreadsheet...');
-
-  // 1. Create the spreadsheet
-  const spreadsheetId = await SheetsClient.createSpreadsheet(
-    auth,
-    'Financeiro — Controle Automatizado',
-  );
+  logger?.info('Criando nova planilha...');
+  const spreadsheetId = await SheetsClient.createSpreadsheet(auth, SPREADSHEET_TITLE);
   const client = new SheetsClient(auth, spreadsheetId);
+  logger?.info(`Planilha criada: ${spreadsheetId}`);
 
-  logger?.info(`Spreadsheet created: ${spreadsheetId}`);
-
-  // 2. Create all tabs in order
-  const tabNames = Object.values(SHEET_NAMES);
-  for (let i = 0; i < tabNames.length; i++) {
-    logger?.info(`  Creating tab: ${tabNames[i]}`);
-    await client.addSheet(tabNames[i], i);
-  }
-
-  // 3. Delete the default "Sheet1" / "Planilha1"
+  await ensureTabs(client, logger);
   await client.deleteDefaultSheet();
+  await seedConfigTabs(client, logger);
 
-  // 4. Pre-populate Config: Categorias
-  logger?.info('  Populating Config: Categorias...');
+  writeSpreadsheetId(idFilePath, spreadsheetId);
+  logger?.info(`\n✅ Planilha pronta: ${spreadsheetUrl(spreadsheetId)}\n`);
+
+  return { spreadsheetId, spreadsheetUrl: spreadsheetUrl(spreadsheetId) };
+}
+
+/** Create any tab that does not exist yet, preserving the intended order. */
+async function ensureTabs(
+  client: SheetsClient,
+  logger?: { info: (msg: string) => void },
+): Promise<void> {
+  const existing = new Set(await client.listSheetTitles());
+  const wanted = Object.values(SHEET_NAMES);
+
+  for (let i = 0; i < wanted.length; i++) {
+    if (existing.has(wanted[i])) continue;
+    logger?.info(`  Criando aba: ${wanted[i]}`);
+    await client.addSheet(wanted[i], i);
+  }
+}
+
+/**
+ * Config tabs hold the user's own decisions, so they are written exactly once —
+ * at creation. Later syncs read them and never overwrite them.
+ */
+async function seedConfigTabs(
+  client: SheetsClient,
+  logger?: { info: (msg: string) => void },
+): Promise<void> {
+  logger?.info('  Preenchendo Config: Categorias...');
   await client.writeRows(SHEET_NAMES.CONFIG_CATEGORIES, DEFAULT_CATEGORY_MAPPINGS);
-  await client.freezeHeader(SHEET_NAMES.CONFIG_CATEGORIES);
-  await client.formatHeaderRow(SHEET_NAMES.CONFIG_CATEGORIES, 4, { red: 0.15, green: 0.35, blue: 0.55 });
-  await client.setColumnWidths(SHEET_NAMES.CONFIG_CATEGORIES, [
-    { column: 0, width: 280 },
-    { column: 1, width: 250 },
-    { column: 2, width: 150 },
-    { column: 3, width: 130 },
-  ]);
 
-  // 5. Pre-populate Config: Orçamento
-  logger?.info('  Populating Config: Orçamento...');
+  logger?.info('  Preenchendo Config: Orçamento...');
   await client.writeRows(SHEET_NAMES.CONFIG_BUDGET, DEFAULT_BUDGET_CONFIG);
-  await client.formatHeaderRow(SHEET_NAMES.CONFIG_BUDGET, 2, { red: 0.15, green: 0.35, blue: 0.55 });
 
-  // 6. Write placeholder headers for data tabs
-  const dataTabHeaders: Record<string, string[]> = {
-    [SHEET_NAMES.BALANCE]: ['Conta', 'Tipo', 'Saldo (R$)', 'Limite (R$)', 'Disponível (R$)', 'Última Atualização'],
-    [SHEET_NAMES.TRANSACTIONS]: ['Data', 'Descrição', 'Categoria', 'Tipo', 'Valor (R$)', 'Conta', 'Status'],
-    [SHEET_NAMES.MONTHLY_SUMMARY]: ['Categoria', 'Grupo', 'Orçado (R$)', 'Realizado (R$)', 'Diferença (R$)', '% Usado'],
-    [SHEET_NAMES.CURRENT_BILL]: ['Data', 'Descrição', 'Categoria', 'Valor (R$)', 'Status'],
-    [SHEET_NAMES.FUTURE_COMMITMENTS]: ['Descrição', 'Parcela', 'Valor (R$)', 'Vencimento', 'Status', 'Cartão'],
-    [SHEET_NAMES.DASHBOARD]: ['Indicador', 'Valor'],
-  };
+  const categoriesId = await client.getSheetId(SHEET_NAMES.CONFIG_CATEGORIES);
+  const budgetId = await client.getSheetId(SHEET_NAMES.CONFIG_BUDGET);
 
-  for (const [tabName, headers] of Object.entries(dataTabHeaders)) {
-    logger?.info(`  Setting up headers: ${tabName}`);
-    await client.writeRows(tabName, [headers]);
-    await client.freezeHeader(tabName);
-    await client.formatHeaderRow(tabName, headers.length, { red: 0.2, green: 0.2, blue: 0.3 });
-  }
+  const requests: Request[] = [
+    ...client.headerRequest(categoriesId, CATEGORY_HEADER.length, { red: 0.11, green: 0.31, blue: 0.47 }),
+    ...client.columnWidthRequests(categoriesId, [
+      { column: 0, width: 300 },
+      { column: 1, width: 240 },
+      { column: 2, width: 150 },
+      { column: 3, width: 130 },
+    ]),
+    // Dropdowns keep the taxonomy typo-free — a misspelled group silently
+    // breaks the dashboard's SUMIFS.
+    client.dataValidationRequest(categoriesId, 2, GROUP_OPTIONS),
+    client.dataValidationRequest(categoriesId, 3, VARIABILITY_OPTIONS),
 
-  // 7. Set column widths for key data tabs
-  await client.setColumnWidths(SHEET_NAMES.TRANSACTIONS, [
-    { column: 0, width: 120 },  // Data
-    { column: 1, width: 300 },  // Descrição
-    { column: 2, width: 200 },  // Categoria
-    { column: 3, width: 120 },  // Tipo
-    { column: 4, width: 120 },  // Valor
-    { column: 5, width: 150 },  // Conta
-    { column: 6, width: 100 },  // Status
-  ]);
+    ...client.headerRequest(budgetId, 3, { red: 0.11, green: 0.31, blue: 0.47 }),
+    ...client.columnWidthRequests(budgetId, [
+      { column: 0, width: 240 },
+      { column: 1, width: 190 },
+      { column: 2, width: 420 },
+    ]),
+    client.numberFormatRequest(budgetId, { startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 }, '"R$" #,##0.00'),
+    client.numberFormatRequest(budgetId, { startRowIndex: 2, endRowIndex: 5, startColumnIndex: 1, endColumnIndex: 2 }, '0%'),
+    client.numberFormatRequest(
+      budgetId,
+      { startRowIndex: 7, endRowIndex: 7 + BUDGET_CATEGORIES.length, startColumnIndex: 1, endColumnIndex: 2 },
+      '"R$" #,##0.00',
+    ),
+    client.boldRowRequest(budgetId, 6, 3),
+  ];
 
-  await client.setColumnWidths(SHEET_NAMES.BALANCE, [
-    { column: 0, width: 200 },
-    { column: 1, width: 150 },
-    { column: 2, width: 130 },
-    { column: 3, width: 130 },
-    { column: 4, width: 130 },
-    { column: 5, width: 170 },
-  ]);
+  await client.batchUpdate(requests);
+}
 
-  // 8. Save spreadsheet ID to disk
+// ---------------------------------------------------------------------------
+// Spreadsheet id persistence
+// ---------------------------------------------------------------------------
+
+function readSpreadsheetId(idFilePath: string): string | null {
+  if (!fs.existsSync(idFilePath)) return null;
+  const id = fs.readFileSync(idFilePath, 'utf8').trim();
+  return id || null;
+}
+
+function writeSpreadsheetId(idFilePath: string, spreadsheetId: string): void {
   const dir = path.dirname(idFilePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(idFilePath, spreadsheetId);
-
-  const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}`;
-  logger?.info(`\n✅ Spreadsheet created: ${url}\n`);
-
-  return { spreadsheetId, spreadsheetUrl: url };
 }

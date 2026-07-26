@@ -110,6 +110,9 @@ function saveTokens(
   fs.writeFileSync(tokensPath, JSON.stringify(merged, null, 2));
 }
 
+/* v8 ignore start -- interactive OAuth flow: spins up a localhost server and
+   waits on a real browser redirect from Google; only reachable in the one-off
+   `--setup-only` provisioning run, not exercisable in unit tests. */
 /**
  * Opens a temporary local HTTP server, generates the consent URL,
  * and waits for the redirect with the authorization code.
@@ -184,3 +187,4 @@ function interactiveConsent(
     }, 5 * 60 * 1000);
   });
 }
+/* v8 ignore stop */

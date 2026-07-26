@@ -179,16 +179,33 @@ const config: AppConfig = {
 
 function makeSheetsStub() {
   return {
+    // Values
     clearSheet: vi.fn(async () => undefined),
     writeRows: vi.fn(async () => undefined),
     readRows: vi.fn(async () => [] as unknown[][]),
-    batchUpdate: vi.fn(async () => undefined),
+    // Metadata
+    ensureLocale: vi.fn(async () => undefined),
     getSheetId: vi.fn(async () => 0),
     getSpreadsheetMeta: vi.fn(async () => ({ sheets: [] })),
-    applyBudgetFormatting: vi.fn(async () => undefined),
-    freezeHeader: vi.fn(async () => undefined),
-    formatHeaderRow: vi.fn(async () => undefined),
-    setColumnWidths: vi.fn(async () => undefined),
+    listSheetTitles: vi.fn(async () => [] as string[]),
+    invalidateMeta: vi.fn(),
+    // Batch
+    batchUpdate: vi.fn(async () => undefined),
+    // Request builders — return plain markers; the engine only forwards them.
+    headerRequest: vi.fn(() => []),
+    boldRowRequest: vi.fn(() => ({})),
+    columnWidthRequests: vi.fn(() => []),
+    numberFormatRequest: vi.fn(() => ({})),
+    dateFormatRequest: vi.fn(() => ({})),
+    bandingRequest: vi.fn(() => ({})),
+    dataValidationRequest: vi.fn(() => ({})),
+    budgetTrafficLightRequests: vi.fn(() => []),
+    negativeRedRequest: vi.fn(() => ({})),
+    clearConditionalFormatRequests: vi.fn(async () => []),
+    getChartIds: vi.fn(async () => [] as number[]),
+    replaceChartsRequests: vi.fn(async () => []),
+    pieChartRequest: vi.fn(() => ({})),
+    basicChartRequest: vi.fn(() => ({})),
   };
 }
 

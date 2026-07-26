@@ -187,6 +187,22 @@ export class Repository {
   }
 
   /**
+   * Distinct expense categories with their 50/30/20 group, ordered by total
+   * spend. Drives the rows of Resumo Mensal and Consolidado Anual.
+   */
+  getExpenseCategories(): Array<{ category: string; group: string }> {
+    return this.db.prepare(`
+      SELECT
+        COALESCE(NULLIF(category_mapped, ''), category_pierre, 'Outros') AS category,
+        COALESCE(MAX(NULLIF(category_group, '')), '')                    AS "group"
+      FROM transactions
+      WHERE direction = 'EXPENSE'
+      GROUP BY category
+      ORDER BY SUM(amount) ASC
+    `).all() as Array<{ category: string; group: string }>;
+  }
+
+  /**
    * Get the list of distinct months that have transactions.
    */
   getDistinctMonths(): Array<{ year: number; month: number }> {
