@@ -15,7 +15,6 @@ export default defineConfig({
       // tests regardless of the % denominator.
       exclude: [
         'src/index.ts',            // CLI entrypoint
-        'src/scheduler.ts',        // cron entrypoint
         'src/**/index.ts',         // barrel re-exports
         'src/sheets/client.ts',    // thin googleapis wrapper (builders tested separately)
         'src/sheets/setup.ts',     // live spreadsheet creation + seeding

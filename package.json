@@ -9,7 +9,7 @@
     "sync:full": "ts-node src/index.ts --full",
     "sync:dry": "ts-node src/index.ts --dry-run",
     "setup": "ts-node src/index.ts --setup-only",
-    "scheduler": "ts-node src/scheduler.ts",
+    "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
