@@ -66,7 +66,7 @@ VOLUME ["/app/data"]
 # Cron work is idle between runs, so the healthcheck reads the heartbeat and
 # goes unhealthy if the last run failed or is stale. start-period covers the
 # window before the first scheduled run on a fresh container.
-HEALTHCHECK --interval=6h --timeout=10s --start-period=72h \
+HEALTHCHECK --interval=6h --timeout=10s --start-period=24h \
   CMD node /app/docker/healthcheck.mjs || exit 1
 
 ENTRYPOINT ["entrypoint.sh"]

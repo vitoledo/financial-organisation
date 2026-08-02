@@ -3,7 +3,7 @@
 // last run failed, or if it is older than the expected cadence plus a margin.
 import { readFileSync } from 'node:fs';
 
-const STALE_HOURS = Number(process.env.STALE_HOURS ?? 96); // 2x/week + margin
+const STALE_HOURS = Number(process.env.STALE_HOURS ?? 30); // 2x/day + margin
 const HEARTBEAT = '/app/data/last-run.json';
 
 try {

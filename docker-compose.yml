@@ -19,7 +19,8 @@ services:
       TZ: America/Sao_Paulo
       HEADLESS: "1"      # nunca abrir navegador no servidor
       LOG_TO_FILE: "0"   # só stdout; o Docker rotaciona os logs
-      STALE_HOURS: "96"  # limite de "atraso" do heartbeat p/ o healthcheck
+      STALE_HOURS: "30"  # limite de "atraso" do heartbeat p/ o healthcheck
+                         # (roda a cada 12h → 30h tolera 1 run perdido + margem)
     volumes:
       # Guarda google-tokens.json, financial.db (+ -wal/-shm), spreadsheet-id.txt
       # e last-run.json. Precisa ser um filesystem LOCAL (não NFS/SMB): o WAL do

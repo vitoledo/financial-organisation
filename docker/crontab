@@ -1,6 +1,6 @@
-# supercronic crontab — schedules the sync twice a week.
+# supercronic crontab — schedules the sync twice a day, every day.
 # Times are local (America/Sao_Paulo), set via CRON_TZ + the TZ env var.
 CRON_TZ=America/Sao_Paulo
 
-# Segunda e quinta, 06:30 (horário de Brasília).
-30 6 * * 1,4 node /app/dist/index.js
+# Todos os dias às 06:30 e 18:30 (horário de Brasília).
+30 6,18 * * * node /app/dist/index.js

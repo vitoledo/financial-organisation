@@ -92,9 +92,9 @@ pnpm build                # compila para dist/
 
 ## Execução autônoma (Docker no home server)
 
-O alvo é rodar 2x/semana, de madrugada, num servidor sempre ligado. Um
+O alvo é rodar 2x/dia, todos os dias, num servidor sempre ligado. Um
 container roda o **supercronic** como PID 1, que dispara `node dist/index.js`
-no horário agendado (`docker/crontab`, hoje seg. e qui. às 06:30 BRT). Cada
+no horário agendado (`docker/crontab`, hoje às 06:30 e 18:30 BRT). Cada
 execução é um processo novo — conexão SQLite limpa e código de saída honesto.
 
 ### Pré-requisito que trava tudo
@@ -133,7 +133,7 @@ instruções, em vez de travar esperando um navegador que não existe.
 
 - **Heartbeat:** cada run escreve `data/last-run.json` (sucesso ou falha).
 - **Healthcheck:** o container fica *unhealthy* se o último run falhou ou está
-  mais velho que `STALE_HOURS` (padrão 96h). O Docker só marca — para agir,
+  mais velho que `STALE_HOURS` (30h, ~1 run perdido de margem). O Docker só marca — para agir,
   use um alerta externo ou um sidecar de autoheal.
 - **Logs:** vão para o stdout (rotacionado pelo Docker: `max-size` / `max-file`).
 
@@ -169,4 +169,4 @@ tests/                  vitest (lógica de negócio + builders)
 
 - Não movimenta dinheiro (a API é somente leitura).
 - Não substitui o Pierre — usa o Pierre como motor.
-- Não é tempo real — é uma fotografia recente, atualizada 2x/semana.
+- Não é tempo real — é uma fotografia recente, atualizada 2x/dia.
