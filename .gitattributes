@@ -1,0 +1,10 @@
+# Normaliza quebras de linha para LF no repositório e no checkout.
+# Crítico para o container: um entrypoint.sh/crontab com CRLF (padrão do
+# Windows) quebra no Linux ("bad interpreter: /bin/sh^M").
+* text=auto eol=lf
+
+# Binários — nunca normalizar.
+*.png binary
+*.jpg binary
+*.ico binary
+*.db  binary
