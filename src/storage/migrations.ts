@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
 
 /**
  * Run all pending migrations. Uses a simple user_version pragma to track
@@ -8,11 +8,14 @@ const SCHEMA_VERSION = 1;
  */
 export function runMigrations(db: Database.Database): void {
   const currentVersion = db.pragma('user_version', { simple: true }) as number;
+  if (currentVersion >= SCHEMA_VERSION) return;
 
-  if (currentVersion < 1) {
-    db.exec(MIGRATION_001);
+  db.transaction(() => {
+    if (currentVersion < 1) db.exec(MIGRATION_001);
+    if (currentVersion < 2) db.exec(MIGRATION_002);
+    if (currentVersion < 3) db.exec(MIGRATION_003);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  }
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -88,4 +91,49 @@ const MIGRATION_001 = `
   CREATE INDEX IF NOT EXISTS idx_transactions_account  ON transactions(account_id);
   CREATE INDEX IF NOT EXISTS idx_transactions_direction ON transactions(direction);
   CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_mapped);
+`;
+
+// ---------------------------------------------------------------------------
+// Migration 002 — Investments table
+// ---------------------------------------------------------------------------
+
+const MIGRATION_002 = `
+  CREATE TABLE IF NOT EXISTS investments (
+    id                 TEXT PRIMARY KEY,
+    asset_name         TEXT NOT NULL,
+    asset_type         TEXT NOT NULL,   -- Cripto | Ação | FII | ETF | Renda Fixa | Outro
+    origin             TEXT NOT NULL,   -- EXTERNAL | PIERRE
+    pricing_method     TEXT NOT NULL,   -- GOOGLEFINANCE | CDI | MANUAL | PIERRE
+    ticker_or_rate     TEXT,
+    quantity           REAL,
+    cost_basis         REAL,
+    start_date         TEXT,
+    manual_value       REAL,
+    market_value       REAL,            -- preenchido pelo read-back (D1)
+    market_value_at    TEXT,
+    pricing_status     TEXT,            -- OK | FALLBACK | ERROR
+    linked_account_id  TEXT,
+    notes              TEXT,
+    source             TEXT NOT NULL,   -- CONFIG_TAB | PIERRE_RESERVED
+    updated_at         TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (linked_account_id) REFERENCES accounts(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_investments_origin ON investments(origin);
+  CREATE INDEX IF NOT EXISTS idx_investments_source ON investments(source);
+`;
+
+
+// ---------------------------------------------------------------------------
+// Migration 003 — Reserve amounts on accounts
+//
+// These two numbers previously lived only inside raw_json, so nothing could
+// check them. They exist to settle one question: is the money in a caixinha
+// already part of closingBalance, or is it held alongside it? Getting that
+// wrong either double counts the balance or silently drops the reserve out of
+// the net worth. Persisting them makes the assumption auditable.
+// ---------------------------------------------------------------------------
+
+const MIGRATION_003 = `
+  ALTER TABLE accounts ADD COLUMN automatically_invested_balance REAL;
+  ALTER TABLE accounts ADD COLUMN reserved_total REAL;
 `;

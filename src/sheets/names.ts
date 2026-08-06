@@ -9,8 +9,10 @@ export const SHEET_NAMES = {
   TRANSACTIONS: 'Transações',
   CURRENT_BILL: 'Fatura Atual',
   FUTURE_COMMITMENTS: 'Compromissos Futuros',
+  INVESTMENTS: 'Investimentos',
   CONFIG_CATEGORIES: 'Config: Categorias',
   CONFIG_BUDGET: 'Config: Orçamento',
+  CONFIG_INVESTMENTS: 'Config: Investimentos',
 } as const;
 
 export type SheetName = (typeof SHEET_NAMES)[keyof typeof SHEET_NAMES];

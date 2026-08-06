@@ -1,4 +1,7 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import Database from 'better-sqlite3';
 import { runMigrations } from '../src/storage/migrations';
 import { Repository } from '../src/storage/repository';
@@ -183,14 +186,22 @@ describe('flattenInstallments', () => {
 
 const noopLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
+// A throwaway data dir per run: the sync writes financial-summary.json into
+// config.dataDir, and a test must never drop that file in the repo.
+const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-engine-test-'));
+
 const config: AppConfig = {
   pierreApiKey: 'key',
   googleClientId: 'id',
   googleClientSecret: 'secret',
+  dataDir: testDataDir,
   dbPath: ':memory:',
-  logPath: 'data/sync.log',
-  tokensPath: 'data/google-tokens.json',
-  spreadsheetIdPath: 'data/spreadsheet-id.txt',
+  logPath: path.join(testDataDir, 'sync.log'),
+  tokensPath: path.join(testDataDir, 'google-tokens.json'),
+  spreadsheetIdPath: path.join(testDataDir, 'spreadsheet-id.txt'),
+  headless: true,
+  logToFile: false,
+  staleHours: 96,
 };
 
 function makeSheetsStub() {

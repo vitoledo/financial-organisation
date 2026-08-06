@@ -1,14 +1,17 @@
 import Database from 'better-sqlite3';
+import path from 'path';
 import { Auth } from 'googleapis';
 import { PierreClient, PierreClientConfig } from '../pierre/client';
 import {
   normalizeTransaction,
   normalizeAccount,
   shouldExcludeAccount,
+  extractReservedInvestments,
   NormalizedTransaction,
+  NormalizedInvestment,
 } from '../pierre/normalizer';
 import { PierrePurchasesByCard } from '../pierre/types';
-import { getDatabase, closeDatabase, Repository } from '../storage';
+import { getDatabase, closeDatabase, Repository, buildFinancialSummary, writeFinancialSummary } from '../storage';
 import {
   getAuthClient,
   SheetsClient,
@@ -184,7 +187,7 @@ export class SyncEngine {
 
     try {
       // 1. Setup Google Sheets auth + spreadsheet
-      this.logger.info('\n[1/8] Autenticando com Google Sheets...');
+      this.logger.info('\n[1/10] Autenticando com Google Sheets...');
       const auth = await this.deps.getAuthClient({
         clientId: this.config.googleClientId,
         clientSecret: this.config.googleClientSecret,
@@ -207,7 +210,7 @@ export class SyncEngine {
       const sheetsClient = this.deps.createSheetsClient(auth, spreadsheetId);
 
       // 2. Initialize SQLite
-      this.logger.info('\n[2/8] Inicializando banco de dados...');
+      this.logger.info('\n[2/10] Inicializando banco de dados...');
       const db = this.deps.getDatabase(this.config.dbPath);
       repo = new Repository(db);
 
@@ -215,11 +218,23 @@ export class SyncEngine {
         syncId = repo.startSync();
       }
 
-      // 3. Read category mappings from Google Sheets
-      this.logger.info('\n[3/8] Lendo configurações da planilha...');
+      // 3. Read category mappings & investment config from Google Sheets
+      this.logger.info('\n[3/10] Lendo configurações da planilha...');
       const renderer = new SheetsRenderer(sheetsClient, repo, this.logger);
       const categoryMappings = await renderer.readCategoryMappings();
       this.logger.info(`  ${categoryMappings.size} mapeamentos de categoria carregados.`);
+
+      const configInvestments = await renderer.readInvestmentsConfig();
+      if (!options.dryRun) {
+        const { droppedLinks } = repo.replaceInvestments(configInvestments, 'CONFIG_TAB');
+        this.logger.info(`  ${configInvestments.length} investimentos da planilha gravados.`);
+        if (droppedLinks > 0) {
+          this.logger.warn(
+            `  ${droppedLinks} investimento(s) com "Conta Vinculada" que não corresponde a ` +
+            'nenhuma conta conhecida — o vínculo foi ignorado. Confira a coluna em Config: Investimentos.',
+          );
+        }
+      }
 
       // 4. Trigger Pierre manual-update
       const pierreClient = this.deps.createPierreClient({
@@ -229,7 +244,7 @@ export class SyncEngine {
       });
 
       if (!options.skipUpdate) {
-        this.logger.info('\n[4/8] Sincronizando dados no Pierre...');
+        this.logger.info('\n[4/10] Sincronizando dados no Pierre...');
         try {
           await pierreClient.triggerManualUpdate();
           this.logger.info('  Aguardando 30s para o Pierre sincronizar com os bancos...');
@@ -240,11 +255,11 @@ export class SyncEngine {
           });
         }
       } else {
-        this.logger.info('\n[4/8] Pulando manual-update (--skip-update)');
+        this.logger.info('\n[4/10] Pulando manual-update (--skip-update)');
       }
 
-      // 5. Fetch accounts
-      this.logger.info('\n[5/8] Buscando contas...');
+      // 5. Fetch accounts & reserved investments
+      this.logger.info('\n[5/10] Buscando contas...');
       const accountsResponse = await pierreClient.getAccounts();
       const allAccounts = accountsResponse.data;
 
@@ -255,10 +270,45 @@ export class SyncEngine {
         for (const account of relevantAccounts) {
           repo.upsertAccount(normalizeAccount(account));
         }
+
+        const reservedInvestments = relevantAccounts.flatMap(extractReservedInvestments);
+        const mappedInvestments = reservedInvestments.map((inv) => ({
+          id: inv.id,
+          asset_name: inv.assetName,
+          asset_type: inv.assetType,
+          origin: inv.origin,
+          pricing_method: inv.pricingMethod,
+          ticker_or_rate: inv.tickerOrRate,
+          quantity: inv.quantity,
+          cost_basis: inv.costBasis,
+          start_date: inv.startDate,
+          manual_value: inv.manualValue,
+          market_value: inv.marketValue,
+          market_value_at: inv.marketValueAt,
+          pricing_status: inv.pricingStatus,
+          linked_account_id: inv.linkedAccountId,
+          notes: inv.notes,
+          source: inv.source,
+        }));
+        repo.replaceInvestments(mappedInvestments, 'PIERRE_RESERVED');
+        this.logger.info(`  ${mappedInvestments.length} reservas/caixinhas automáticas do Pierre gravadas.`);
+
+        // A reserve larger than its account balance cannot be a part of that
+        // balance — the only case where the placement is provable rather than
+        // assumed. Those rows are counted as standalone value; say so loudly,
+        // because it changes the reported net worth.
+        const outsideBalance = mappedInvestments.filter((inv) => inv.origin === 'EXTERNAL');
+        for (const inv of outsideBalance) {
+          this.logger.warn(
+            `  Caixinha FORA do saldo detectada: "${inv.asset_name}" (R$ ${inv.market_value}). ` +
+            'A reserva excede o saldo da conta, então está sendo somada ao patrimônio ' +
+            'em vez de tratada como detalhe. Confira na aba Saldo.',
+          );
+        }
       }
 
       // 6. Fetch transactions
-      this.logger.info('\n[6/8] Buscando transações...');
+      this.logger.info('\n[6/10] Buscando transações...');
       // The current run's row is RUNNING, so getLastSuccessfulSync never
       // returns it — it yields the previous successful sync, as intended.
       const lastSync = repo.getLastSuccessfulSync();
@@ -294,7 +344,7 @@ export class SyncEngine {
       // run outside the catch on purpose: a bug there (or a failed SQLite write)
       // must surface and fail the sync loudly, instead of being mislabeled as
       // "falha ao buscar" and silently reported as SUCCESS.
-      this.logger.info('\n[7/8] Buscando parcelas...');
+      this.logger.info('\n[7/10] Buscando parcelas...');
       let purchasesByCard: PierrePurchasesByCard[] | null = null;
       try {
         const installmentsResponse = await pierreClient.getInstallments();
@@ -317,14 +367,41 @@ export class SyncEngine {
 
       // 8. Render to Google Sheets
       if (!options.dryRun) {
-        this.logger.info('\n[8/8] Atualizando planilha...');
+        this.logger.info('\n[8/10] Atualizando planilha...');
         await renderer.renderAll();
+
+        // 9. Read-back of computed market values
+        this.logger.info('\n[9/10] Lendo cotações computadas da planilha (Read-back)...');
+        try {
+          await renderer.readBackInvestmentValues();
+        } catch (readBackErr) {
+          this.logger.warn('  Read-back de investimentos falhou', {
+            error: (readBackErr as Error).message,
+          });
+        }
+
+        // 10. Export JSON for AI agents
+        this.logger.info('\n[10/10] Exportando resumo financeiro JSON...');
+        try {
+          const summary = buildFinancialSummary(repo);
+          // Anchored to dataDir, not to dirname(dbPath): dbPath can be ':memory:'
+          // (tests) or point outside the data dir, and this file holds the whole
+          // financial picture — it must never land somewhere untracked by
+          // .gitignore.
+          const exportPath = path.join(this.config.dataDir, 'financial-summary.json');
+          writeFinancialSummary(summary, exportPath);
+          this.logger.info(`  Resumo financeiro exportado para ${exportPath}`);
+        } catch (exportErr) {
+          this.logger.warn('  Exportação de resumo financeiro JSON falhou', {
+            error: (exportErr as Error).message,
+          });
+        }
 
         if (syncId !== null) {
           repo.completeSync(syncId, stats);
         }
       } else {
-        this.logger.info('\n[8/8] [DRY RUN] Planilha não atualizada.');
+        this.logger.info('\n[8/10] [DRY RUN] Planilha não atualizada.');
       }
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);

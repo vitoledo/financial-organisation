@@ -101,6 +101,37 @@ const DEFAULT_BUDGET_CONFIG: unknown[][] = [
   ...BUDGET_CATEGORIES.map((c) => [c, '', '']),
 ];
 
+export const INVESTMENTS_HEADER = [
+  'Ativo', 'Tipo', 'Origem', 'Método', 'Ticker ou % Indexador',
+  'Quantidade', 'Custo Total (R$)', 'Data do Aporte', 'Valor Manual (R$)',
+  'Conta Vinculada', 'Anotações',
+];
+
+export const ASSET_TYPE_OPTIONS = ['Cripto', 'Ação', 'FII', 'ETF', 'Renda Fixa', 'Outro'];
+export const ORIGIN_OPTIONS = ['Carteira Externa', 'Conta Pierre'];
+export const PRICING_METHOD_OPTIONS = ['GOOGLEFINANCE', 'CDI', 'MANUAL', 'PIERRE'];
+
+/** 0-based index of the asset table header inside DEFAULT_INVESTMENTS_CONFIG. */
+export const INVESTMENTS_TABLE_HEADER_ROW = 3;
+
+/** 0-based index of the first asset row — where dropdowns and formats belong. */
+export const INVESTMENTS_DATA_FIRST_ROW = INVESTMENTS_TABLE_HEADER_ROW + 1;
+
+/**
+ * Seeded holdings must be inert. The two rows below exist to show the expected
+ * format, so they carry the "(exemplo)" marker that parseInvestmentsConfig
+ * skips — otherwise the very first sync would credit the user with R$ 1.500 of
+ * assets they do not own and report an inflated net worth.
+ */
+export const DEFAULT_INVESTMENTS_CONFIG: unknown[][] = [
+  ['Parâmetro', 'Valor', 'Observação'],
+  ['CDI anual (%)', 0.105, 'Atualize quando o Copom mudar a Selic. Usado SÓ para Renda Fixa fora do Pierre — a caixinha vem automática da API.'],
+  ['', '', 'Linhas que começam com "(exemplo)" são ignoradas pela sincronização. Apague o marcador para transformá-las em posições reais.'],
+  INVESTMENTS_HEADER,
+  ['(exemplo) Bitcoin (BTC)', 'Cripto', 'Carteira Externa', 'GOOGLEFINANCE', 'CURRENCY:BTCBRL', 0.003, 1000, '2026-01-15', '', '', 'Modelo — remova "(exemplo)" para valer'],
+  ['(exemplo) CDB 102% CDI', 'Renda Fixa', 'Carteira Externa', 'CDI', '102%', 1, 500, '2026-01-01', '', '', 'Modelo — remova "(exemplo)" para valer'],
+];
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -119,7 +150,7 @@ export function spreadsheetUrl(spreadsheetId: string): string {
 /**
  * Create the spreadsheet (or adopt the saved one) and make sure every tab
  * exists. Idempotent: safe to run on every sync, so a spreadsheet created by an
- * older version gains new tabs (e.g. Consolidado Anual) without a rebuild.
+ * older version gains new tabs (e.g. Consolidado Anual, Investimentos) without a rebuild.
  */
 export async function setupSpreadsheet(
   auth: Auth.OAuth2Client,
@@ -132,6 +163,7 @@ export async function setupSpreadsheet(
     const client = new SheetsClient(auth, existingId);
     await client.ensureLocale();
     await ensureTabs(client, logger);
+    await seedMissingConfigTabs(client, logger);
     return { spreadsheetId: existingId, spreadsheetUrl: spreadsheetUrl(existingId) };
   }
 
@@ -142,7 +174,7 @@ export async function setupSpreadsheet(
 
   await ensureTabs(client, logger);
   await client.deleteDefaultSheet();
-  await seedConfigTabs(client, logger);
+  await seedMissingConfigTabs(client, logger);
 
   writeSpreadsheetId(idFilePath, spreadsheetId);
   logger?.info(`\n✅ Planilha pronta: ${spreadsheetUrl(spreadsheetId)}\n`);
@@ -166,52 +198,93 @@ async function ensureTabs(
 }
 
 /**
- * Config tabs hold the user's own decisions, so they are written exactly once —
- * at creation. Later syncs read them and never overwrite them.
+ * Config tabs hold the user's own decisions. Sows missing config tabs idempotently.
  */
-async function seedConfigTabs(
+export async function seedMissingConfigTabs(
   client: SheetsClient,
   logger?: { info: (msg: string) => void },
 ): Promise<void> {
-  logger?.info('  Preenchendo Config: Categorias...');
-  await client.writeRows(SHEET_NAMES.CONFIG_CATEGORIES, DEFAULT_CATEGORY_MAPPINGS);
+  const categoriesRows = await client.readRows(SHEET_NAMES.CONFIG_CATEGORIES);
+  const budgetRows = await client.readRows(SHEET_NAMES.CONFIG_BUDGET);
+  const investmentsRows = await client.readRows(SHEET_NAMES.CONFIG_INVESTMENTS);
 
-  logger?.info('  Preenchendo Config: Orçamento...');
-  await client.writeRows(SHEET_NAMES.CONFIG_BUDGET, DEFAULT_BUDGET_CONFIG);
+  const requests: Request[] = [];
 
-  const categoriesId = await client.getSheetId(SHEET_NAMES.CONFIG_CATEGORIES);
-  const budgetId = await client.getSheetId(SHEET_NAMES.CONFIG_BUDGET);
+  if (categoriesRows.length === 0) {
+    logger?.info('  Preenchendo Config: Categorias...');
+    await client.writeRows(SHEET_NAMES.CONFIG_CATEGORIES, DEFAULT_CATEGORY_MAPPINGS);
+    const catId = await client.getSheetId(SHEET_NAMES.CONFIG_CATEGORIES);
+    requests.push(
+      ...client.headerRequest(catId, CATEGORY_HEADER.length, { red: 0.11, green: 0.31, blue: 0.47 }),
+      ...client.columnWidthRequests(catId, [
+        { column: 0, width: 300 },
+        { column: 1, width: 240 },
+        { column: 2, width: 150 },
+        { column: 3, width: 130 },
+      ]),
+      client.dataValidationRequest(catId, 2, GROUP_OPTIONS),
+      client.dataValidationRequest(catId, 3, VARIABILITY_OPTIONS),
+    );
+  }
 
-  const requests: Request[] = [
-    ...client.headerRequest(categoriesId, CATEGORY_HEADER.length, { red: 0.11, green: 0.31, blue: 0.47 }),
-    ...client.columnWidthRequests(categoriesId, [
-      { column: 0, width: 300 },
-      { column: 1, width: 240 },
-      { column: 2, width: 150 },
-      { column: 3, width: 130 },
-    ]),
-    // Dropdowns keep the taxonomy typo-free — a misspelled group silently
-    // breaks the dashboard's SUMIFS.
-    client.dataValidationRequest(categoriesId, 2, GROUP_OPTIONS),
-    client.dataValidationRequest(categoriesId, 3, VARIABILITY_OPTIONS),
+  if (budgetRows.length === 0) {
+    logger?.info('  Preenchendo Config: Orçamento...');
+    await client.writeRows(SHEET_NAMES.CONFIG_BUDGET, DEFAULT_BUDGET_CONFIG);
+    const budgetId = await client.getSheetId(SHEET_NAMES.CONFIG_BUDGET);
+    requests.push(
+      ...client.headerRequest(budgetId, 3, { red: 0.11, green: 0.31, blue: 0.47 }),
+      ...client.columnWidthRequests(budgetId, [
+        { column: 0, width: 240 },
+        { column: 1, width: 190 },
+        { column: 2, width: 420 },
+      ]),
+      client.numberFormatRequest(budgetId, { startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 }, '"R$" #,##0.00'),
+      client.numberFormatRequest(budgetId, { startRowIndex: 2, endRowIndex: 5, startColumnIndex: 1, endColumnIndex: 2 }, '0%'),
+      client.numberFormatRequest(
+        budgetId,
+        { startRowIndex: 7, endRowIndex: 7 + BUDGET_CATEGORIES.length, startColumnIndex: 1, endColumnIndex: 2 },
+        '"R$" #,##0.00',
+      ),
+      client.boldRowRequest(budgetId, 6, 3),
+    );
+  }
 
-    ...client.headerRequest(budgetId, 3, { red: 0.11, green: 0.31, blue: 0.47 }),
-    ...client.columnWidthRequests(budgetId, [
-      { column: 0, width: 240 },
-      { column: 1, width: 190 },
-      { column: 2, width: 420 },
-    ]),
-    client.numberFormatRequest(budgetId, { startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 }, '"R$" #,##0.00'),
-    client.numberFormatRequest(budgetId, { startRowIndex: 2, endRowIndex: 5, startColumnIndex: 1, endColumnIndex: 2 }, '0%'),
-    client.numberFormatRequest(
-      budgetId,
-      { startRowIndex: 7, endRowIndex: 7 + BUDGET_CATEGORIES.length, startColumnIndex: 1, endColumnIndex: 2 },
-      '"R$" #,##0.00',
-    ),
-    client.boldRowRequest(budgetId, 6, 3),
-  ];
+  if (investmentsRows.length === 0) {
+    logger?.info('  Preenchendo Config: Investimentos...');
+    await client.writeRows(SHEET_NAMES.CONFIG_INVESTMENTS, DEFAULT_INVESTMENTS_CONFIG);
+    const invId = await client.getSheetId(SHEET_NAMES.CONFIG_INVESTMENTS);
+    requests.push(
+      ...client.headerRequest(invId, 3, { red: 0.11, green: 0.31, blue: 0.47 }),
+      ...client.columnWidthRequests(invId, [
+        { column: 0, width: 220 },
+        { column: 1, width: 130 },
+        { column: 2, width: 150 },
+        { column: 3, width: 150 },
+        { column: 4, width: 180 },
+        { column: 5, width: 120 },
+        { column: 6, width: 140 },
+        { column: 7, width: 130 },
+        { column: 8, width: 140 },
+        { column: 9, width: 180 },
+        { column: 10, width: 250 },
+      ]),
+      client.numberFormatRequest(invId, { startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2 }, '0.00%'),
+      client.boldRowRequest(invId, INVESTMENTS_TABLE_HEADER_ROW, INVESTMENTS_HEADER.length),
+      // The asset table starts on the row after its header, so validation has
+      // to start there too. Anchoring it at row 1 (the default) would put the
+      // dropdowns on the CDI parameter block and on the header itself, leaving
+      // every real asset row unvalidated — exactly the typos these prevent.
+      client.dataValidationRequest(invId, 1, ASSET_TYPE_OPTIONS, 1000, INVESTMENTS_DATA_FIRST_ROW),
+      client.dataValidationRequest(invId, 2, ORIGIN_OPTIONS, 1000, INVESTMENTS_DATA_FIRST_ROW),
+      client.dataValidationRequest(invId, 3, PRICING_METHOD_OPTIONS, 1000, INVESTMENTS_DATA_FIRST_ROW),
+      client.numberFormatRequest(invId, { startRowIndex: INVESTMENTS_DATA_FIRST_ROW, endRowIndex: 1000, startColumnIndex: 6, endColumnIndex: 7 }, '"R$" #,##0.00'),
+      client.numberFormatRequest(invId, { startRowIndex: INVESTMENTS_DATA_FIRST_ROW, endRowIndex: 1000, startColumnIndex: 8, endColumnIndex: 9 }, '"R$" #,##0.00'),
+    );
+  }
 
-  await client.batchUpdate(requests);
+  if (requests.length > 0) {
+    await client.batchUpdate(requests);
+  }
 }
 
 // ---------------------------------------------------------------------------

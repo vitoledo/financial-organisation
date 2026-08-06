@@ -1,8 +1,9 @@
 import { SheetsClient, Request, NUMBER_FORMATS } from './client';
 import { SHEET_NAMES } from './names';
-import { Repository, CategoryMapping } from '../storage/repository';
+import { Repository, CategoryMapping, InvestmentRow } from '../storage/repository';
 import {
   buildBalanceRows,
+  balanceTotalRow,
   buildTransactionRows,
   buildMonthlySummaryHeader,
   buildMonthlySummaryRows,
@@ -11,6 +12,9 @@ import {
   buildDashboardData,
   buildCurrentBillRows,
   buildCommitmentRows,
+  buildInvestmentTabRows,
+  parseInvestmentsConfig,
+  INVESTMENTS_TAB_HEADER,
   parseBudgetConfig,
   BudgetConfig,
   MonthRef,
@@ -24,6 +28,9 @@ interface Logger {
   info: (msg: string, meta?: Record<string, unknown>) => void;
   warn?: (msg: string, meta?: Record<string, unknown>) => void;
 }
+
+/** Grace period for GOOGLEFINANCE to resolve before a quote is called failed. */
+const READ_BACK_RETRY_MS = 3_000;
 
 /**
  * Writes the SQLite state into Google Sheets.
@@ -56,6 +63,7 @@ export class SheetsRenderer {
     await this.renderAnnual(categories, months);
     await this.renderCurrentBill();
     await this.renderFutureCommitments();
+    await this.renderInvestments();
     await this.renderDashboard();
 
     this.logger?.info('Planilha atualizada.');
@@ -89,7 +97,11 @@ export class SheetsRenderer {
         { column: 4, width: 130 },
         { column: 5, width: 160 },
       ]),
-      ...(rows.length > 1 ? [this.client.boldRowRequest(sheetId, rows.length - 1, rows[0].length)] : []),
+      // Bold the TOTAL line specifically — the reconciliation block now sits
+      // below it, so "last row" would bold the wrong thing.
+      ...(accounts.length > 0
+        ? [this.client.boldRowRequest(sheetId, balanceTotalRow(accounts.length) - 1, rows[0].length)]
+        : []),
     ]);
   }
 
@@ -476,6 +488,83 @@ export class SheetsRenderer {
   }
 
   // -------------------------------------------------------------------------
+  // Investimentos
+  // -------------------------------------------------------------------------
+
+  private async renderInvestments(): Promise<void> {
+    this.logger?.info('  Renderizando: Investimentos');
+    const investments = this.repo.getAllInvestments();
+    const rows = buildInvestmentTabRows(investments);
+
+    await this.client.clearSheet(SHEET_NAMES.INVESTMENTS);
+    await this.client.writeRows(SHEET_NAMES.INVESTMENTS, rows);
+
+    const sheetId = await this.client.getSheetId(SHEET_NAMES.INVESTMENTS);
+    const clearRules = await this.client.clearConditionalFormatRequests(SHEET_NAMES.INVESTMENTS);
+
+    const requests: Request[] = [
+      ...clearRules,
+      ...this.client.headerRequest(sheetId, INVESTMENTS_TAB_HEADER.length),
+      ...this.client.columnWidthRequests(sheetId, [
+        { column: 0, width: 220 }, // Ativo
+        { column: 1, width: 120 }, // Tipo
+        { column: 2, width: 140 }, // Origem
+        { column: 3, width: 100 }, // Qtd
+        { column: 4, width: 130 }, // Custo
+        { column: 5, width: 130 }, // Preço Atual
+        { column: 6, width: 150 }, // Valor Mercado
+        { column: 7, width: 130 }, // L/P
+        { column: 8, width: 110 }, // Rent. %
+        { column: 9, width: 110 }, // % Carteira
+        { column: 10, width: 200 }, // Fonte do Preço
+        { column: 11, width: 250 }, // Anotações
+      ]),
+      // Currency columns: E, F, G, H
+      this.client.numberFormatRequest(
+        sheetId,
+        { startRowIndex: 1, startColumnIndex: 4, endColumnIndex: 8 },
+        NUMBER_FORMATS.CURRENCY,
+      ),
+      // Percent columns: I, J
+      this.client.numberFormatRequest(
+        sheetId,
+        { startRowIndex: 1, startColumnIndex: 8, endColumnIndex: 10 },
+        NUMBER_FORMATS.PERCENT,
+      ),
+      this.client.negativeRedRequest(sheetId, { startRowIndex: 1, startColumnIndex: 7, endColumnIndex: 8 }),
+    ];
+
+    if (investments.length > 0) {
+      const dataEnd = investments.length + 1;
+      const totalRow = dataEnd + 1;
+      requests.push(
+        this.client.boldRowRequest(sheetId, totalRow - 1, INVESTMENTS_TAB_HEADER.length),
+        this.client.boldRowRequest(sheetId, totalRow + 4, INVESTMENTS_TAB_HEADER.length),
+        this.client.numberFormatRequest(
+          sheetId,
+          { startRowIndex: totalRow + 1, endRowIndex: totalRow + 5, startColumnIndex: 6, endColumnIndex: 7 },
+          NUMBER_FORMATS.CURRENCY,
+        ),
+      );
+
+      // Pie chart for asset allocation
+      const chartRequests = await this.client.replaceChartsRequests(SHEET_NAMES.INVESTMENTS, [
+        this.client.pieChartRequest({
+          sheetId,
+          title: 'Alocação da Carteira de Investimentos',
+          labelsRange: { sheetId, startRowIndex: 1, endRowIndex: dataEnd, startColumnIndex: 0, endColumnIndex: 1 },
+          valuesRange: { sheetId, startRowIndex: 1, endRowIndex: dataEnd, startColumnIndex: 6, endColumnIndex: 7 },
+          anchorRow: 1,
+          anchorColumn: 13,
+        }),
+      ]);
+      requests.push(...chartRequests);
+    }
+
+    await this.client.batchUpdate(requests);
+  }
+
+  // -------------------------------------------------------------------------
   // Config tabs (read-only from here)
   // -------------------------------------------------------------------------
 
@@ -503,5 +592,68 @@ export class SheetsRenderer {
   async readBudgetConfig(): Promise<BudgetConfig> {
     const rows = await this.client.readRows(SHEET_NAMES.CONFIG_BUDGET);
     return parseBudgetConfig(rows);
+  }
+
+  /**
+   * Read with UNFORMATTED_VALUE so numbers arrive as numbers. Under
+   * FORMATTED_VALUE a quantity of 0.003 comes back as the locale string
+   * "0,003" (or "R$ 1.000,00" for money), and every consumer has to re-parse
+   * pt-BR text — a round trip that silently mangles crypto quantities.
+   */
+  async readInvestmentsConfig(): Promise<InvestmentRow[]> {
+    const rows = await this.client.readRows(SHEET_NAMES.CONFIG_INVESTMENTS, 'UNFORMATTED_VALUE');
+    return parseInvestmentsConfig(rows);
+  }
+
+  async readBackInvestmentValues(): Promise<void> {
+    this.logger?.info('  Lendo valores computados da aba Investimentos (Read-back)...');
+    const investments = this.repo.getAllInvestments();
+    if (investments.length === 0) return;
+
+    let updates = await this.collectMarketValues(investments);
+
+    // GOOGLEFINANCE returns "Loading..." / #N/A on its first evaluation, so a
+    // read issued right after the write can catch a quote mid-flight. One
+    // retry converts that transient miss into a real value; anything still
+    // unresolved is reported as ERROR rather than guessed at.
+    if (updates.some((u) => u.pricingStatus === 'ERROR')) {
+      this.logger?.info('  Cotações ainda carregando — repetindo a leitura em 3s...');
+      await new Promise((resolve) => setTimeout(resolve, READ_BACK_RETRY_MS));
+      updates = await this.collectMarketValues(investments);
+    }
+
+    this.repo.updateMarketValues(updates);
+
+    const failed = updates.filter((u) => u.pricingStatus === 'ERROR').length;
+    this.logger?.info(`  ${updates.length} valores de mercado atualizados no banco de dados.`);
+    if (failed > 0) {
+      this.logger?.warn?.(`  ${failed} ativo(s) sem cotação — gravados como ERROR, sem valor estimado.`);
+    }
+  }
+
+  private async collectMarketValues(
+    investments: InvestmentRow[],
+  ): Promise<Array<{ id: string; marketValue: number | null; pricingStatus: string }>> {
+    const unformattedRows = await this.client.readRows(SHEET_NAMES.INVESTMENTS, 'UNFORMATTED_VALUE');
+
+    // Header is row 0, data starts at row index 1. Positional matching is safe
+    // because both this read and renderInvestments source their order from the
+    // same getAllInvestments() query.
+    return investments.map((inv, idx) => {
+      const row = (unformattedRows[idx + 1] ?? []) as unknown[];
+      const marketValCell = row[6]; // Column G — Valor Mercado (R$)
+      const priceSourceCell = row[10]; // Column K — Fonte do Preço
+
+      if (typeof marketValCell !== 'number' || !Number.isFinite(marketValCell)) {
+        return { id: inv.id, marketValue: null, pricingStatus: 'ERROR' };
+      }
+
+      const isFallback = typeof priceSourceCell === 'string' && priceSourceCell.includes('Fallback');
+      return {
+        id: inv.id,
+        marketValue: marketValCell,
+        pricingStatus: isFallback ? 'FALLBACK' : 'OK',
+      };
+    });
   }
 }

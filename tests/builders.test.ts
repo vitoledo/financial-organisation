@@ -9,6 +9,8 @@ import {
   statusLabel,
   accountTypeLabel,
   buildBalanceRows,
+  balanceTotalRow,
+  RESERVE_RECONCILIATION_LABEL,
   buildTransactionRows,
   buildMonthlySummaryHeader,
   buildMonthlySummaryRows,
@@ -17,6 +19,11 @@ import {
   buildDashboardData,
   buildCurrentBillRows,
   buildCommitmentRows,
+  buildInvestmentTabRows,
+  parseInvestmentsConfig,
+  parseIndexerPercentage,
+  parseQuantity,
+  parseSheetDate,
   parseBudgetConfig,
   sanitizeCellText,
   lastMonths,
@@ -572,5 +579,298 @@ describe('parseBudgetConfig', () => {
 
     expect(config.netIncome).toBeNull();
     expect(config.categoryBudgets.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Investment tab builders and config parsing
+// ---------------------------------------------------------------------------
+
+describe('parseIndexerPercentage', () => {
+  test('parses indexer percentages correctly', () => {
+    expect(parseIndexerPercentage('102%')).toBeCloseTo(1.02);
+    expect(parseIndexerPercentage('102% CDI')).toBeCloseTo(1.02);
+    expect(parseIndexerPercentage('100%')).toBeCloseTo(1.0);
+    expect(parseIndexerPercentage('95.5%')).toBeCloseTo(0.955);
+    expect(parseIndexerPercentage(null)).toBe(1.0);
+  });
+});
+
+describe('buildInvestmentTabRows', () => {
+  test('builds formulas and summary rows with IFERROR and correct wealth summary', () => {
+    const rows = buildInvestmentTabRows([
+      {
+        id: 'inv1',
+        asset_name: 'Bitcoin',
+        asset_type: 'Cripto',
+        origin: 'EXTERNAL',
+        pricing_method: 'GOOGLEFINANCE',
+        ticker_or_rate: 'CURRENCY:BTCBRL',
+        quantity: 0.003,
+        cost_basis: 1000,
+        start_date: '2026-01-01',
+        manual_value: null,
+        market_value: 1800,
+        market_value_at: null,
+        pricing_status: 'OK',
+        linked_account_id: null,
+        notes: 'Reserva BTC',
+        source: 'CONFIG_TAB',
+      },
+      {
+        id: 'inv2',
+        asset_name: 'Nubank Caixinha',
+        asset_type: 'Renda Fixa',
+        origin: 'PIERRE',
+        pricing_method: 'PIERRE',
+        ticker_or_rate: '100% CDI',
+        quantity: 1,
+        cost_basis: 500,
+        start_date: null,
+        manual_value: null,
+        market_value: 520,
+        market_value_at: null,
+        pricing_status: 'OK',
+        linked_account_id: 'acc1',
+        notes: 'Reserva Nubank',
+        source: 'PIERRE_RESERVED',
+      },
+    ]);
+
+    expect(rows).toHaveLength(8); // Header + 2 data + 1 total + 1 blank + 3 summary rows
+
+    // Check GOOGLEFINANCE price formula wrapping with IFERROR
+    const btcRow = rows[1];
+    expect(btcRow[5]).toContain('IFERROR(GOOGLEFINANCE("CURRENCY:BTCBRL"),"")');
+    expect(btcRow[6]).toContain('IFERROR');
+
+    // Check Summary rows
+    const externasRow = rows[5];
+    expect(externasRow[0]).toBe('Investido em carteiras externas');
+    expect(externasRow[6]).toContain('SUMIF($C$2:$C$3, "Carteira Externa"');
+
+    const pierreRow = rows[6];
+    expect(pierreRow[0]).toBe('Já contido no Saldo (Pierre)');
+    expect(pierreRow[6]).toContain('SUMIF($C$2:$C$3, "Conta Pierre"');
+
+    const netWorthRow = rows[7];
+    expect(netWorthRow[0]).toBe('PATRIMÔNIO TOTAL');
+  });
+});
+
+describe('parseInvestmentsConfig', () => {
+  test('parses Config: Investimentos tab correctly', () => {
+    const configRows: unknown[][] = [
+      ['Parâmetro', 'Valor', 'Observação'],
+      ['CDI anual (%)', '0,1050'],
+      ['', ''],
+      ['Ativo', 'Tipo', 'Origem', 'Método', 'Ticker ou % Indexador', 'Quantidade', 'Custo Total (R$)', 'Data do Aporte', 'Valor Manual (R$)', 'Conta Vinculada', 'Anotações'],
+      ['Bitcoin (BTC)', 'Cripto', 'Carteira Externa', 'GOOGLEFINANCE', 'CURRENCY:BTCBRL', '0,003', '1000,00', '2026-01-15', '', '', 'Minhas moedas'],
+    ];
+
+    const result = parseInvestmentsConfig(configRows);
+    expect(result).toHaveLength(1);
+    expect(result[0].asset_name).toBe('Bitcoin (BTC)');
+    expect(result[0].asset_type).toBe('Cripto');
+    expect(result[0].origin).toBe('EXTERNAL');
+    expect(result[0].pricing_method).toBe('GOOGLEFINANCE');
+    expect(result[0].ticker_or_rate).toBe('CURRENCY:BTCBRL');
+    expect(result[0].quantity).toBe(0.003);
+    expect(result[0].cost_basis).toBe(1000);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Regression guards for the investments feature
+// ---------------------------------------------------------------------------
+
+describe('parseQuantity', () => {
+  test('keeps crypto precision where the money parser would corrupt it', () => {
+    // parseMoneyBR reads a lone dot with 3+ digits as a thousands group, which
+    // would turn a 0.00034 BTC position into 34 BTC.
+    expect(parseMoneyBR('0.00034')).toBe(34);
+    expect(parseQuantity('0.00034')).toBe(0.00034);
+  });
+
+  test('accepts pt-BR decimals and raw numbers', () => {
+    expect(parseQuantity('0,003')).toBe(0.003);
+    expect(parseQuantity('1.234,5')).toBe(1234.5);
+    expect(parseQuantity(0.5)).toBe(0.5);
+  });
+
+  test('returns null for blanks and garbage', () => {
+    expect(parseQuantity('')).toBeNull();
+    expect(parseQuantity('abc')).toBeNull();
+    expect(parseQuantity(null)).toBeNull();
+  });
+});
+
+describe('parseSheetDate', () => {
+  test('converts a Sheets serial number to ISO', () => {
+    // UNFORMATTED_VALUE returns dates as days since 1899-12-30.
+    expect(parseSheetDate(46037)).toBe('2026-01-15');
+  });
+
+  test('accepts pt-BR and ISO strings', () => {
+    expect(parseSheetDate('15/01/2026')).toBe('2026-01-15');
+    expect(parseSheetDate('2026-01-15')).toBe('2026-01-15');
+  });
+
+  test('returns null for blanks and unparseable text', () => {
+    expect(parseSheetDate('')).toBeNull();
+    expect(parseSheetDate('qualquer coisa')).toBeNull();
+    expect(parseSheetDate(null)).toBeNull();
+  });
+});
+
+describe('parseInvestmentsConfig — seeded examples and pricing honesty', () => {
+  const header = ['Ativo', 'Tipo', 'Origem', 'Método', 'Ticker ou % Indexador', 'Quantidade', 'Custo Total (R$)', 'Data do Aporte', 'Valor Manual (R$)', 'Conta Vinculada', 'Anotações'];
+
+  test('skips seeded "(exemplo)" rows so they never enter the net worth', () => {
+    const rows: unknown[][] = [
+      header,
+      ['(exemplo) Bitcoin (BTC)', 'Cripto', 'Carteira Externa', 'GOOGLEFINANCE', 'CURRENCY:BTCBRL', 0.003, 1000, '2026-01-15', '', '', ''],
+      ['(exemplo) CDB 102% CDI', 'Renda Fixa', 'Carteira Externa', 'CDI', '102%', 1, 500, '2026-01-01', '', '', ''],
+      ['Bitcoin de verdade', 'Cripto', 'Carteira Externa', 'GOOGLEFINANCE', 'CURRENCY:BTCBRL', 0.01, 3000, '2026-02-01', '', '', ''],
+    ];
+
+    const result = parseInvestmentsConfig(rows);
+    expect(result).toHaveLength(1);
+    expect(result[0].asset_name).toBe('Bitcoin de verdade');
+  });
+
+  test('leaves market value null and status PENDING until the read-back prices it', () => {
+    const rows: unknown[][] = [
+      header,
+      ['Bitcoin', 'Cripto', 'Carteira Externa', 'GOOGLEFINANCE', 'CURRENCY:BTCBRL', 0.01, 3000, '2026-02-01', '', '', ''],
+    ];
+
+    const [asset] = parseInvestmentsConfig(rows);
+    // Cost basis must never be passed off as a quote.
+    expect(asset.market_value).toBeNull();
+    expect(asset.market_value_at).toBeNull();
+    expect(asset.pricing_status).toBe('PENDING');
+    expect(asset.cost_basis).toBe(3000);
+  });
+
+  test('a MANUAL holding is priced by the value the user typed', () => {
+    const rows: unknown[][] = [
+      header,
+      ['Fundo fechado', 'Outro', 'Carteira Externa', 'MANUAL', '', 1, 1000, '', 1250, '', ''],
+    ];
+
+    const [asset] = parseInvestmentsConfig(rows);
+    expect(asset.market_value).toBe(1250);
+    expect(asset.pricing_status).toBe('OK');
+  });
+
+  test('folds accents and de-duplicates ids so the insert cannot abort the sync', () => {
+    const rows: unknown[][] = [
+      header,
+      ['Ação PETR4', 'Ação', 'Carteira Externa', 'GOOGLEFINANCE', 'BVMF:PETR4', 10, 300, '', '', '', ''],
+      ['Acao PETR4', 'Ação', 'Carteira Externa', 'GOOGLEFINANCE', 'BVMF:PETR4', 5, 150, '', '', '', ''],
+    ];
+
+    const result = parseInvestmentsConfig(rows);
+    const ids = result.map((r) => r.id);
+    expect(ids[0]).toBe('config:acao_petr4');
+    expect(new Set(ids).size).toBe(2);
+  });
+});
+
+describe('buildInvestmentTabRows — blank quantity must not zero a position', () => {
+  const base = {
+    asset_type: 'Cripto',
+    origin: 'EXTERNAL',
+    pricing_method: 'GOOGLEFINANCE',
+    ticker_or_rate: 'CURRENCY:BTCBRL',
+    start_date: null,
+    market_value: null,
+    market_value_at: null,
+    pricing_status: 'PENDING',
+    linked_account_id: null,
+    notes: null,
+    source: 'CONFIG_TAB',
+  };
+
+  test('guards the market value formula with ISNUMBER on quantity', () => {
+    const rows = buildInvestmentTabRows([
+      { id: 'a', asset_name: 'Bitcoin', quantity: null, cost_basis: 1000, manual_value: null, ...base },
+    ] as never);
+
+    // Sheets treats an empty cell as 0 in arithmetic, so `D2*F2` would evaluate
+    // to a valid 0 that IFERROR passes through — silently zeroing the holding.
+    expect(rows[1][6]).toContain('NOT(ISNUMBER(D2))');
+  });
+
+  test('the price-source column reports fallback when quantity is missing', () => {
+    const rows = buildInvestmentTabRows([
+      { id: 'a', asset_name: 'Bitcoin', quantity: null, cost_basis: 1000, manual_value: null, ...base },
+    ] as never);
+
+    expect(rows[1][10]).toContain('ISNUMBER(D2)');
+  });
+});
+
+describe('buildBalanceRows — reconciliation block (D3)', () => {
+  const account = (over: Record<string, unknown> = {}) => ({
+    name: 'Nubank Conta',
+    type: 'BANK',
+    subtype: 'CHECKING_ACCOUNT',
+    closing_balance: 1000,
+    credit_limit: null,
+    available_credit: null,
+    automatically_invested_balance: null,
+    reserved_total: null,
+    last_synced_at: '2026-07-06T10:00:00.000Z',
+    ...over,
+  });
+
+  test('stays silent for accounts without a reserve', () => {
+    const rows = buildBalanceRows([account()] as never);
+
+    expect(rows.some((r) => String(r[0]).includes('CONFERÊNCIA'))).toBe(false);
+    expect(rows[rows.length - 1][0]).toBe('TOTAL (contas)');
+  });
+
+  test('prints the assumption when a reserve exists', () => {
+    const rows = buildBalanceRows([account({ reserved_total: 400 })] as never);
+    const reconciliation = rows.find((r) => r[1] === RESERVE_RECONCILIATION_LABEL);
+
+    expect(reconciliation).toBeDefined();
+    expect(reconciliation?.[2]).toBe(400);
+    expect(String(reconciliation?.[5])).toContain('Já incluída no saldo');
+  });
+
+  test('flags the provable case where the reserve exceeds the balance', () => {
+    const rows = buildBalanceRows([account({ closing_balance: 100, reserved_total: 900 })] as never);
+    const reconciliation = rows.find((r) => r[1] === RESERVE_RECONCILIATION_LABEL);
+
+    expect(String(reconciliation?.[5])).toContain('FORA do saldo');
+  });
+
+  test('keeps the reconciliation rows out of every sum', () => {
+    const rows = buildBalanceRows([account({ reserved_total: 400 })] as never);
+    const totalRow = rows[balanceTotalRow(1) - 1];
+
+    // The TOTAL formula and the Investimentos patrimônio formula both match on
+    // column B — the reconciliation label must never equal an account type.
+    expect(totalRow[0]).toBe('TOTAL (contas)');
+    expect(RESERVE_RECONCILIATION_LABEL).not.toBe(accountTypeLabel('CHECKING_ACCOUNT'));
+    expect(RESERVE_RECONCILIATION_LABEL).not.toBe(accountTypeLabel('SAVINGS'));
+
+    // And they sit below the total, outside its A2:A<lastRow> window.
+    const reconciliationIndex = rows.findIndex((r) => r[1] === RESERVE_RECONCILIATION_LABEL);
+    expect(reconciliationIndex).toBeGreaterThan(balanceTotalRow(1) - 1);
+  });
+
+  test('balanceTotalRow points at the TOTAL line regardless of the block below', () => {
+    const rows = buildBalanceRows([
+      account({ reserved_total: 400 }),
+      account({ name: 'Outra', reserved_total: 50 }),
+    ] as never);
+
+    expect(rows[balanceTotalRow(2) - 1][0]).toBe('TOTAL (contas)');
   });
 });

@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import { runMigrations } from '../src/storage/migrations';
 import { Repository } from '../src/storage/repository';
@@ -206,5 +206,149 @@ describe('SheetsRenderer config reads', () => {
     expect(budget.netIncome).toBe(5000);
     expect(budget.groupTargets.get('Necessidade')).toBeCloseTo(0.5);
     expect(budget.categoryBudgets.get('Alimentação')).toBe(1200);
+  });
+
+  test('readBackInvestmentValues handles numeric and fallback/error values without throwing', async () => {
+    repo.replaceInvestments(
+      [
+        {
+          id: 'inv1',
+          asset_name: 'Bitcoin',
+          asset_type: 'Cripto',
+          origin: 'EXTERNAL',
+          pricing_method: 'GOOGLEFINANCE',
+          ticker_or_rate: 'CURRENCY:BTCBRL',
+          quantity: 0.003,
+          cost_basis: 1000,
+          start_date: null,
+          manual_value: null,
+          market_value: null,
+          market_value_at: null,
+          pricing_status: null,
+          linked_account_id: null,
+          notes: null,
+          source: 'CONFIG_TAB',
+        },
+        {
+          id: 'inv2',
+          asset_name: 'Broken Asset',
+          asset_type: 'Ação',
+          origin: 'EXTERNAL',
+          pricing_method: 'GOOGLEFINANCE',
+          ticker_or_rate: 'INVALID',
+          quantity: 1,
+          cost_basis: 100,
+          start_date: null,
+          manual_value: null,
+          market_value: null,
+          market_value_at: null,
+          pricing_status: null,
+          linked_account_id: null,
+          notes: null,
+          source: 'CONFIG_TAB',
+        },
+      ],
+      'CONFIG_TAB',
+    );
+
+    const client = makeRecordingClient({
+      [SHEET_NAMES.INVESTMENTS]: [
+        ['Ativo', 'Tipo', 'Origem', 'Qtd', 'Custo', 'Preço', 'Valor Mercado', 'L/P', 'Rent %', '% Cart', 'Fonte do Preço', 'Anotações'],
+        ['Bitcoin', 'Cripto', 'Carteira Externa', 0.003, 1000, 600000, 1800, 800, 0.8, 0.9, 'Google Finance (Ao Vivo)', ''],
+        ['Broken Asset', 'Ação', 'Carteira Externa', 1, 100, '#N/A', '#N/A', '#N/A', '#N/A', '#N/A', 'Manual / Custo (Fallback)', ''],
+      ],
+    });
+
+    const renderer = new SheetsRenderer(client as never, repo);
+    await renderer.readBackInvestmentValues();
+
+    const investments = repo.getAllInvestments();
+    const btc = investments.find((i) => i.id === 'inv1')!;
+    const broken = investments.find((i) => i.id === 'inv2')!;
+
+    expect(btc.market_value).toBe(1800);
+    expect(btc.pricing_status).toBe('OK');
+
+    expect(broken.market_value).toBeNull();
+    expect(broken.pricing_status).toBe('ERROR');
+  });
+});
+
+
+describe('SheetsRenderer.readBackInvestmentValues — transient quotes', () => {
+  let db: Database.Database;
+  let repo: Repository;
+
+  const holding = {
+    id: 'inv1',
+    asset_name: 'Bitcoin',
+    asset_type: 'Cripto',
+    origin: 'EXTERNAL',
+    pricing_method: 'GOOGLEFINANCE',
+    ticker_or_rate: 'CURRENCY:BTCBRL',
+    quantity: 0.003,
+    cost_basis: 1000,
+    start_date: null,
+    manual_value: null,
+    market_value: null,
+    market_value_at: null,
+    pricing_status: 'PENDING',
+    linked_account_id: null,
+    notes: null,
+    source: 'CONFIG_TAB',
+  };
+
+  beforeEach(() => {
+    db = new Database(':memory:');
+    runMigrations(db);
+    repo = new Repository(db);
+    repo.replaceInvestments([holding], 'CONFIG_TAB');
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    db.close();
+  });
+
+  function clientReturning(...responses: unknown[][][]) {
+    let call = 0;
+    return {
+      readRows: vi.fn(async () => responses[Math.min(call++, responses.length - 1)]),
+    } as never;
+  }
+
+  test('retries once when a quote is still loading, then keeps the resolved value', async () => {
+    // GOOGLEFINANCE answers "Loading..." on its first evaluation; a read fired
+    // right after the write can catch it mid-flight.
+    const loading = [['header'], ['Bitcoin', 'Cripto', 'Carteira Externa', 0.003, 1000, 0, 'Loading...', 0, 0, 0, 'Google Finance (Ao Vivo)']];
+    const resolved = [['header'], ['Bitcoin', 'Cripto', 'Carteira Externa', 0.003, 1000, 420000, 1260, 260, 0.26, 1, 'Google Finance (Ao Vivo)']];
+
+    const client = clientReturning(loading, resolved);
+    const renderer = new SheetsRenderer(client, repo);
+
+    const pending = renderer.readBackInvestmentValues();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await pending;
+
+    const [stored] = repo.getAllInvestments();
+    expect(stored.market_value).toBe(1260);
+    expect(stored.pricing_status).toBe('OK');
+  });
+
+  test('reports ERROR with a null value when the quote never resolves', async () => {
+    const loading = [['header'], ['Bitcoin', 'Cripto', 'Carteira Externa', 0.003, 1000, 0, '#N/A', 0, 0, 0, 'Google Finance (Ao Vivo)']];
+
+    const client = clientReturning(loading);
+    const renderer = new SheetsRenderer(client, repo);
+
+    const pending = renderer.readBackInvestmentValues();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await pending;
+
+    const [stored] = repo.getAllInvestments();
+    // No guessing: an unresolved quote must not fall back to cost basis here.
+    expect(stored.market_value).toBeNull();
+    expect(stored.pricing_status).toBe('ERROR');
   });
 });

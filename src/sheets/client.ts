@@ -1,8 +1,25 @@
 import { google, sheets_v4, Auth } from 'googleapis';
+import { localizeFormulas } from './formula-locale';
 
 export type Request = sheets_v4.Schema$Request;
 export type GridRange = sheets_v4.Schema$GridRange;
 export type Color = { red: number; green: number; blue: number };
+
+/**
+ * Render a threshold for a conditional-format ConditionValue.
+ *
+ * Sheets parses `userEnteredValue` literals **in the spreadsheet's locale**,
+ * and ensureLocale() pins this spreadsheet to pt_BR — where the decimal
+ * separator is a comma. Verified against the live API: for NUMBER_GREATER,
+ * "0.8" is rejected with `Invalid ConditionValue`, the formula form "=0.8" is
+ * rejected too, and only "0,8" is accepted.
+ *
+ * Every threshold goes through here so the two can never drift apart: change
+ * the locale in ensureLocale and this is the single place that must follow.
+ */
+export function conditionNumber(value: number): string {
+  return String(value).replace('.', ',');
+}
 
 export const NUMBER_FORMATS = {
   CURRENCY: '"R$" #,##0.00',
@@ -145,14 +162,20 @@ export class SheetsClient {
       spreadsheetId: this.spreadsheetId,
       range: `'${sheetName}'!A1`,
       valueInputOption: 'USER_ENTERED',
-      requestBody: { values: rows },
+      // Single choke point for the pt-BR formula syntax the sheet is pinned to.
+      // See formula-locale.ts: authored en-US, written pt-BR.
+      requestBody: { values: localizeFormulas(rows) },
     });
   }
 
-  async readRows(sheetName: string): Promise<unknown[][]> {
+  async readRows(
+    sheetName: string,
+    valueRenderOption: 'FORMATTED_VALUE' | 'UNFORMATTED_VALUE' | 'FORMULA' = 'FORMATTED_VALUE',
+  ): Promise<unknown[][]> {
     const res = await this.sheets.spreadsheets.values.get({
       spreadsheetId: this.spreadsheetId,
       range: `'${sheetName}'`,
+      valueRenderOption,
     });
     return (res.data.values as unknown[][]) ?? [];
   }
@@ -262,10 +285,11 @@ export class SheetsClient {
     columnIndex: number,
     values: string[],
     endRowIndex = 1000,
+    startRowIndex = 1,
   ): Request {
     return {
       setDataValidation: {
-        range: { sheetId, startRowIndex: 1, endRowIndex, startColumnIndex: columnIndex, endColumnIndex: columnIndex + 1 },
+        range: { sheetId, startRowIndex, endRowIndex, startColumnIndex: columnIndex, endColumnIndex: columnIndex + 1 },
         rule: {
           condition: { type: 'ONE_OF_LIST', values: values.map((v) => ({ userEnteredValue: v })) },
           showCustomUi: true,
@@ -283,7 +307,7 @@ export class SheetsClient {
     const full = { sheetId, ...range };
     const rule = (
       type: 'NUMBER_GREATER' | 'NUMBER_LESS_THAN_EQ',
-      value: string,
+      value: number,
       bg: Color,
       fg: Color,
       index: number,
@@ -292,7 +316,7 @@ export class SheetsClient {
         rule: {
           ranges: [full],
           booleanRule: {
-            condition: { type, values: [{ userEnteredValue: value }] },
+            condition: { type, values: [{ userEnteredValue: conditionNumber(value) }] },
             format: { backgroundColor: bg, textFormat: { foregroundColor: fg, bold: true } },
           },
         },
@@ -301,9 +325,9 @@ export class SheetsClient {
     });
 
     return [
-      rule('NUMBER_GREATER', '1', { red: 0.96, green: 0.80, blue: 0.80 }, { red: 0.6, green: 0.06, blue: 0.06 }, 0),
-      rule('NUMBER_GREATER', '0.8', { red: 1, green: 0.95, blue: 0.75 }, { red: 0.6, green: 0.4, blue: 0, }, 1),
-      rule('NUMBER_LESS_THAN_EQ', '0.8', { red: 0.85, green: 0.94, blue: 0.85 }, { red: 0.1, green: 0.45, blue: 0.15 }, 2),
+      rule('NUMBER_GREATER', 1, { red: 0.96, green: 0.80, blue: 0.80 }, { red: 0.6, green: 0.06, blue: 0.06 }, 0),
+      rule('NUMBER_GREATER', 0.8, { red: 1, green: 0.95, blue: 0.75 }, { red: 0.6, green: 0.4, blue: 0, }, 1),
+      rule('NUMBER_LESS_THAN_EQ', 0.8, { red: 0.85, green: 0.94, blue: 0.85 }, { red: 0.1, green: 0.45, blue: 0.15 }, 2),
     ];
   }
 
@@ -314,7 +338,7 @@ export class SheetsClient {
         rule: {
           ranges: [{ sheetId, ...range }],
           booleanRule: {
-            condition: { type: 'NUMBER_LESS', values: [{ userEnteredValue: '0' }] },
+            condition: { type: 'NUMBER_LESS', values: [{ userEnteredValue: conditionNumber(0) }] },
             format: { textFormat: { foregroundColor: { red: 0.7, green: 0.1, blue: 0.1 } } },
           },
         },

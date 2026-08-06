@@ -82,8 +82,23 @@ describe('budgetTrafficLightRequests', () => {
       { userEnteredValue: '1' },
     ]);
     expect(reqs[1].addConditionalFormatRule?.rule?.booleanRule?.condition?.values).toEqual([
-      { userEnteredValue: '0.8' },
+      { userEnteredValue: '0,8' },
     ]);
+  });
+
+  test('writes the threshold with a pt-BR decimal comma', () => {
+    // Not cosmetic. Sheets parses condition literals in the SPREADSHEET's
+    // locale, which ensureLocale() pins to pt_BR. Verified against the live
+    // API: "0.8" comes back as `Invalid ConditionValue` with HTTP 400 and the
+    // whole batchUpdate fails, taking the render — and the sync — down with it.
+    const values = reqs
+      .map((r) => r.addConditionalFormatRule?.rule?.booleanRule?.condition?.values?.[0]?.userEnteredValue)
+      .filter((v): v is string => typeof v === 'string');
+
+    expect(values).not.toContain('0.8');
+    for (const value of values) {
+      expect(value).not.toMatch(/\./);
+    }
   });
 
   test('red for overspend, green for under 80%', () => {

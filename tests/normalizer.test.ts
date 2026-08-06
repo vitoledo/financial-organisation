@@ -4,6 +4,9 @@ import {
   normalizeAccount,
   shouldExcludeAccount,
   isTransferCategory,
+  extractReservedInvestments,
+  detectReservePlacement,
+  sumReservedBalances,
 } from '../src/pierre/normalizer';
 import { PierreAccount, PierreTransaction } from '../src/pierre/types';
 
@@ -243,5 +246,224 @@ describe('normalizeAccount', () => {
     expect(result.creditLimit).toBe(1550);
     expect(result.availableCredit).toBe(200);
     expect(result.closingBalance).toBeNull();
+  });
+});
+
+describe('extractReservedInvestments', () => {
+  test('extracts reserved balances with rate info', () => {
+    const account = makeAccount({
+      bankData: {
+        closingBalance: 1000,
+        transferNumber: '',
+        reservedBalances: [
+          {
+            identification: 'Caixinha Reserva',
+            availableAmounts: [
+              {
+                amount: 500,
+                currencyCode: 'BRL',
+                remuneration: {
+                  indexer: 'CDI',
+                  rateType: 'POST_FIXED',
+                  calculation: '252',
+                  ratePeriodicity: 'ANNUAL',
+                  postFixedIndexerPercentage: 102,
+                },
+              },
+            ],
+          },
+        ],
+        hasReservedBalance: true,
+        overdraftUsedLimit: 0,
+        overdraftContractedLimit: 0,
+        unarrangedOverdraftAmount: 0,
+        automaticallyInvestedBalance: 0,
+      },
+    });
+
+    const res = extractReservedInvestments(account);
+
+    expect(res).toHaveLength(1);
+    expect(res[0].assetName).toContain('Caixinha Reserva');
+    expect(res[0].marketValue).toBe(500);
+    expect(res[0].tickerOrRate).toBe('102% CDI');
+    expect(res[0].origin).toBe('PIERRE');
+  });
+
+  test('falls back to synthetic row if automaticallyInvestedBalance > 0', () => {
+    const account = makeAccount({
+      bankData: {
+        closingBalance: 100,
+        transferNumber: '',
+        reservedBalances: [],
+        hasReservedBalance: true,
+        overdraftUsedLimit: 0,
+        overdraftContractedLimit: 0,
+        unarrangedOverdraftAmount: 0,
+        automaticallyInvestedBalance: 9.22,
+      },
+    });
+
+    const res = extractReservedInvestments(account);
+
+    expect(res).toHaveLength(1);
+    expect(res[0].id).toContain('auto');
+    expect(res[0].marketValue).toBe(9.22);
+    expect(res[0].origin).toBe('PIERRE');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Reserve placement (D3) — is a caixinha inside closingBalance or beside it?
+// ---------------------------------------------------------------------------
+
+function makeBankData(overrides: Partial<PierreAccount['bankData']> = {}) {
+  return {
+    closingBalance: 1000,
+    transferNumber: '',
+    reservedBalances: [],
+    hasReservedBalance: false,
+    overdraftUsedLimit: 0,
+    overdraftContractedLimit: 0,
+    unarrangedOverdraftAmount: 0,
+    automaticallyInvestedBalance: 0,
+    ...overrides,
+  } as PierreAccount['bankData'];
+}
+
+function makeReserve(amount: number, identification = 'Caixinha', currencyCode = 'BRL') {
+  return {
+    identification,
+    availableAmounts: [
+      {
+        amount,
+        currencyCode,
+        remuneration: {
+          indexer: 'CDI',
+          rateType: 'POS_FIXADO',
+          calculation: '252',
+          ratePeriodicity: 'ANUAL',
+          postFixedIndexerPercentage: 102,
+        },
+      },
+    ],
+  };
+}
+
+describe('detectReservePlacement', () => {
+  test('proves the reserve is outside when it exceeds the balance', () => {
+    // A part cannot be larger than the whole, so the balance must exclude it.
+    expect(detectReservePlacement(500, 900)).toBe('OUTSIDE_BALANCE');
+  });
+
+  test('assumes inside when the reserve fits within the balance', () => {
+    expect(detectReservePlacement(1000, 400)).toBe('INSIDE_BALANCE');
+  });
+
+  test('treats a fully invested balance as inside', () => {
+    // The observed Nubank case: closingBalance == automaticallyInvestedBalance.
+    // Both models fit, and INSIDE is the conservative default.
+    expect(detectReservePlacement(9.22, 9.22)).toBe('INSIDE_BALANCE');
+  });
+
+  test('does not trip on cent-level float noise', () => {
+    expect(detectReservePlacement(100, 100.005)).toBe('INSIDE_BALANCE');
+  });
+
+  test('is inert when there is no reserve at all', () => {
+    expect(detectReservePlacement(null, 0)).toBe('INSIDE_BALANCE');
+    expect(detectReservePlacement(0, 0)).toBe('INSIDE_BALANCE');
+  });
+});
+
+describe('sumReservedBalances', () => {
+  test('sums itemised reserves in BRL', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ reservedBalances: [makeReserve(300), makeReserve(200, 'Viagem')] }),
+    });
+
+    expect(sumReservedBalances(account)).toBe(500);
+  });
+
+  test('ignores non-BRL amounts rather than adding them at face value', () => {
+    const account = makeAccount({
+      bankData: makeBankData({
+        reservedBalances: [
+          { identification: 'Multi', availableAmounts: [{ amount: 100, currencyCode: 'USD' }, { amount: 50, currencyCode: 'BRL' }] },
+        ],
+      }),
+    });
+
+    expect(sumReservedBalances(account)).toBe(50);
+  });
+
+  test('falls back to the aggregate when no reserve is itemised', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ reservedBalances: [], automaticallyInvestedBalance: 750 }),
+    });
+
+    expect(sumReservedBalances(account)).toBe(750);
+  });
+
+  test('is zero for an account with no bankData', () => {
+    expect(sumReservedBalances(makeAccount({ bankData: null }))).toBe(0);
+  });
+});
+
+describe('normalizeAccount — reserve figures', () => {
+  test('persists both reserve numbers so the assumption stays auditable', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ closingBalance: 1000, automaticallyInvestedBalance: 400, reservedBalances: [makeReserve(400)] }),
+    });
+
+    const normalized = normalizeAccount(account);
+
+    expect(normalized.automaticallyInvestedBalance).toBe(400);
+    expect(normalized.reservedTotal).toBe(400);
+  });
+});
+
+describe('extractReservedInvestments — placement drives net worth', () => {
+  test('a reserve inside the balance is detail only (PIERRE)', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ closingBalance: 1000, reservedBalances: [makeReserve(400)] }),
+    });
+
+    const [reserve] = extractReservedInvestments(account);
+
+    expect(reserve.origin).toBe('PIERRE');
+    expect(reserve.notes).toContain('já incluída no saldo');
+  });
+
+  test('a reserve larger than the balance counts as standalone value (EXTERNAL)', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ closingBalance: 100, reservedBalances: [makeReserve(900)] }),
+    });
+
+    const [reserve] = extractReservedInvestments(account);
+
+    // Otherwise R$ 900 would be silently dropped from the net worth.
+    expect(reserve.origin).toBe('EXTERNAL');
+    expect(reserve.notes).toContain('FORA do saldo');
+  });
+
+  test('applies the same placement to the aggregate fallback path', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ closingBalance: 10, reservedBalances: [], automaticallyInvestedBalance: 900 }),
+    });
+
+    const [reserve] = extractReservedInvestments(account);
+
+    expect(reserve.origin).toBe('EXTERNAL');
+    expect(reserve.marketValue).toBe(900);
+  });
+
+  test('carries the indexer percentage through as the rate label', () => {
+    const account = makeAccount({
+      bankData: makeBankData({ closingBalance: 1000, reservedBalances: [makeReserve(400)] }),
+    });
+
+    expect(extractReservedInvestments(account)[0].tickerOrRate).toBe('102% CDI');
   });
 });

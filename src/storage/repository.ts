@@ -27,6 +27,8 @@ export interface AccountRow {
   closing_balance: number | null;
   credit_limit: number | null;
   available_credit: number | null;
+  automatically_invested_balance: number | null;
+  reserved_total: number | null;
   last_synced_at: string | null;
 }
 
@@ -56,6 +58,26 @@ export interface InstallmentRow {
   account_name: string | null;
 }
 
+export interface InvestmentRow {
+  id: string;
+  asset_name: string;
+  asset_type: string;
+  origin: string;           // EXTERNAL | PIERRE
+  pricing_method: string;   // GOOGLEFINANCE | CDI | MANUAL | PIERRE
+  ticker_or_rate: string | null;
+  quantity: number | null;
+  cost_basis: number | null;
+  start_date: string | null;
+  manual_value: number | null;
+  market_value: number | null;
+  market_value_at: string | null;
+  pricing_status: string | null; // OK | FALLBACK | ERROR
+  linked_account_id: string | null;
+  notes: string | null;
+  source: string;           // CONFIG_TAB | PIERRE_RESERVED
+  updated_at?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Repository — CRUD operations for the financial database
 // ---------------------------------------------------------------------------
@@ -73,17 +95,27 @@ export class Repository {
 
   upsertAccount(account: NormalizedAccount): void {
     const stmt = this.db.prepare(`
-      INSERT INTO accounts (id, name, type, subtype, connector_name, closing_balance, credit_limit, available_credit, last_synced_at, raw_json)
-      VALUES (@id, @name, @type, @subtype, @connectorName, @closingBalance, @creditLimit, @availableCredit, datetime('now'), @rawJson)
+      INSERT INTO accounts (id, name, type, subtype, connector_name, closing_balance, credit_limit, available_credit, automatically_invested_balance, reserved_total, last_synced_at, raw_json)
+      VALUES (@id, @name, @type, @subtype, @connectorName, @closingBalance, @creditLimit, @availableCredit, @automaticallyInvestedBalance, @reservedTotal, datetime('now'), @rawJson)
       ON CONFLICT(id) DO UPDATE SET
         name = @name,
         closing_balance = @closingBalance,
         credit_limit = @creditLimit,
         available_credit = @availableCredit,
+        automatically_invested_balance = @automaticallyInvestedBalance,
+        reserved_total = @reservedTotal,
         last_synced_at = datetime('now'),
         raw_json = @rawJson
     `);
-    stmt.run(account);
+    // Defaulted explicitly rather than spread blind: better-sqlite3 throws on a
+    // missing named parameter, and these two columns arrived in migration 003 —
+    // an older caller (or a fixture) that predates them should write NULL, not
+    // crash the sync.
+    stmt.run({
+      ...account,
+      automaticallyInvestedBalance: account.automaticallyInvestedBalance ?? null,
+      reservedTotal: account.reservedTotal ?? null,
+    });
   }
 
   getAllAccounts(): AccountRow[] {
@@ -267,6 +299,117 @@ export class Repository {
         AND direction = 'INCOME'
     `).get(startDate, endDate) as { total: number };
     return row.total;
+  }
+
+  // -------------------------------------------------------------------------
+  // Investments
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns how many rows had an unresolvable `linked_account_id` dropped, so
+   * the caller can surface it.
+   */
+  replaceInvestments(investments: InvestmentRow[], source: string): { droppedLinks: number } {
+    let droppedLinks = 0;
+
+    const run = this.db.transaction(() => {
+      // "Conta Vinculada" is a free-text column the user edits, and this write
+      // happens BEFORE accounts are fetched — on a first sync the accounts
+      // table is still empty. Enforcing the foreign key literally would abort
+      // the transaction and sink the whole sync over a typo, so an id that
+      // resolves to no account is stored as NULL and reported instead.
+      const knownAccountIds = new Set(
+        (this.db.prepare('SELECT id FROM accounts').all() as Array<{ id: string }>)
+          .map((row) => row.id),
+      );
+
+      this.db.prepare('DELETE FROM investments WHERE source = ?').run(source);
+      const stmt = this.db.prepare(`
+        INSERT INTO investments (
+          id, asset_name, asset_type, origin, pricing_method, ticker_or_rate,
+          quantity, cost_basis, start_date, manual_value, market_value,
+          market_value_at, pricing_status, linked_account_id, notes, source, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')
+        )
+      `);
+      for (const inv of investments) {
+        stmt.run(
+          inv.id,
+          inv.asset_name,
+          inv.asset_type,
+          inv.origin,
+          inv.pricing_method,
+          inv.ticker_or_rate ?? null,
+          inv.quantity ?? null,
+          inv.cost_basis ?? null,
+          inv.start_date ?? null,
+          inv.manual_value ?? null,
+          inv.market_value ?? null,
+          // Timestamp the price, not the row. Stamping datetime('now') on a row
+          // whose market_value is still null would tell the exporter (and the
+          // agent reading it) that an absent quote is fresh.
+          inv.market_value == null ? null : (inv.market_value_at ?? new Date().toISOString()),
+          // Default PENDING, never OK: a row arrives here before the read-back
+          // has priced it, and claiming OK would launder a missing quote.
+          inv.pricing_status ?? 'PENDING',
+          resolveLink(inv.linked_account_id),
+          inv.notes ?? null,
+          source,
+        );
+      }
+
+      function resolveLink(linkedAccountId: string | null): string | null {
+        if (!linkedAccountId) return null;
+        if (knownAccountIds.has(linkedAccountId)) return linkedAccountId;
+        droppedLinks++;
+        return null;
+      }
+    });
+
+    run();
+    return { droppedLinks };
+  }
+
+  updateMarketValues(updates: Array<{ id: string; marketValue: number | null; pricingStatus: string }>): void {
+    const stmt = this.db.prepare(`
+      UPDATE investments SET
+        market_value = ?,
+        market_value_at = datetime('now'),
+        pricing_status = ?,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `);
+    const run = this.db.transaction(() => {
+      for (const u of updates) {
+        stmt.run(u.marketValue, u.pricingStatus, u.id);
+      }
+    });
+    run();
+  }
+
+  getAllInvestments(): InvestmentRow[] {
+    return this.db.prepare(`
+      SELECT * FROM investments
+      ORDER BY origin ASC, asset_name ASC
+    `).all() as InvestmentRow[];
+  }
+
+  /**
+   * Totals split by origin. Never collapse these into one number: PIERRE
+   * holdings are already inside the accounts' closingBalance, so adding them to
+   * a net worth that also counts the account balance double-counts the money.
+   */
+  getInvestmentTotals(origin?: 'EXTERNAL' | 'PIERRE'): { totalCost: number; totalMarket: number } {
+    const where = origin ? 'WHERE origin = ?' : '';
+    const params = origin ? [origin] : [];
+    return this.db.prepare(`
+      SELECT
+        COALESCE(SUM(cost_basis), 0) as totalCost,
+        COALESCE(SUM(market_value), 0) as totalMarket
+      FROM investments
+      ${where}
+    `).get(...params) as { totalCost: number; totalMarket: number };
   }
 
   // -------------------------------------------------------------------------
