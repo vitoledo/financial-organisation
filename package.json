@@ -25,6 +25,8 @@
   "author": "",
   "license": "UNLICENSED",
   "private": true,
+  "//packageManager": "Pinned so corepack resolves the SAME pnpm on the host and in the Docker build. Without it corepack pulls the latest (pnpm 11), which ignores the pnpm.onlyBuiltDependencies field below — better-sqlite3's install script is then skipped and the image builds without a native binding.",
+  "packageManager": "pnpm@10.18.1",
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
