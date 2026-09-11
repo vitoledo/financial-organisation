@@ -94,6 +94,10 @@ export class SchemaPlanner {
       }
     }
 
+    const existingOptionNames = rawExistingOptions.map((opt: any) =>
+      typeof opt === 'string' ? opt : opt.name,
+    );
+
     steps.push({
       stepNumber: stepNumber++,
       operation: 'ALTER_SELECT_OPTIONS',
@@ -103,9 +107,11 @@ export class SchemaPlanner {
         id: obligationsDsId,
       },
       property: 'Status',
-      precondition: `Data Source Obrigações Mensais (${obligationsContract.envKey}) acessível; propriedade Status (select) contém opções físicas existentes [${Array.from(
-        seenNames,
-      ).join(', ')}]`,
+      precondition: `Data Source Obrigações Mensais (${obligationsContract.envKey}) acessível; propriedade Status (select) contém opções físicas existentes [${existingOptionNames.join(
+        ', ',
+      )}] para expansão para o conjunto alvo [${mergedOptionsPayload
+        .map((o) => o.name)
+        .join(', ')}]`,
       sanitizedPayload: {
         Status: {
           select: {

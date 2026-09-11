@@ -1,6 +1,7 @@
 import { Client } from '@notionhq/client';
 import { CompleteMigrationPlan, DdlApplyExecutionSummary, DdlStepExecutionResult, MigrationStep } from './types';
 import { MigrationJournal } from './journal';
+import { StepStructuralVerifier } from './step-verifier';
 
 export interface SchemaApplyExecutorOptions {
   client: Client;
@@ -152,6 +153,7 @@ export class SchemaApplyExecutor {
 
   /**
    * Re-verifies live postcondition for a step already recorded as completed.
+   * Utilizes unified StepStructuralVerifier to ensure zero regression.
    */
   private async verifyStepAlreadyCompleted(
     step: MigrationStep,
@@ -162,35 +164,68 @@ export class SchemaApplyExecutor {
         const dsId = step.targetDataSource.id;
         if (!dsId) return false;
         const ds = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-        return !!ds?.properties?.[step.property!];
+        const prop = ds?.properties?.[step.property!];
+        const verif = StepStructuralVerifier.verifyCreateProperty(prop, step.sanitizedPayload, step.property!);
+        if (!verif.valid || !verif.isCompatible) {
+          this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
+          return false;
+        }
+        return true;
       }
 
       if (step.operation === 'ALTER_SELECT_OPTIONS') {
         const dsId = step.targetDataSource.id;
         if (!dsId) return false;
         const ds = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-        const options: Array<{ name: string }> = ds?.properties?.['Status']?.select?.options || [];
-        const names = new Set(options.map((o) => o.name));
-        return names.has('Revisão Necessária') && names.has('Cancelada');
+        const statusProp = ds?.properties?.['Status'];
+        const verif = StepStructuralVerifier.verifyAlterSelectOptions(statusProp, { requireAllTargetOptions: true });
+        if (!verif.valid) {
+          this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
+          return false;
+        }
+        return true;
       }
 
       if (step.operation === 'CREATE_DATABASE') {
         const dbId = this.journal.getCreatedDatabaseId(this.plan.planHash);
-        if (!dbId) return false;
+        if (!dbId || !this.parentPageId) return false;
         const db = (await this.client.databases.retrieve({ database_id: dbId })) as any;
-        return !db.archived;
+        const verif = StepStructuralVerifier.verifyDatabase(db, this.parentPageId, this.plan.planHash);
+        if (!verif.valid) {
+          this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
+          return false;
+        }
+        return true;
       }
 
       if (step.operation === 'RESOLVE_DATA_SOURCE_ID') {
-        return !!resolvedCardBillsDsId;
+        const dbId = this.journal.getCreatedDatabaseId(this.plan.planHash);
+        if (!dbId) return false;
+        const db = (await this.client.databases.retrieve({ database_id: dbId })) as any;
+        const verif = StepStructuralVerifier.verifyResolveDataSource(db);
+        if (!verif.valid || verif.dataSourceId !== resolvedCardBillsDsId) {
+          this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
+          return false;
+        }
+        return true;
       }
 
       if (step.operation === 'CREATE_DUAL_RELATION') {
         const dsId = step.targetDataSource.id;
         if (!dsId || !resolvedCardBillsDsId) return false;
-        const ds = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-        const rel = ds?.properties?.['Fatura Vinculada']?.relation;
-        return rel?.data_source_id === resolvedCardBillsDsId;
+        const txDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
+        let billsDs: any = undefined;
+        try {
+          billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
+        } catch {
+          // Graceful fallback if permission or lookup differs
+        }
+        const verif = StepStructuralVerifier.verifyDualRelation(txDs, billsDs, resolvedCardBillsDsId, dsId);
+        if (!verif.valid) {
+          this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
+          return false;
+        }
+        return true;
       }
 
       return false;
@@ -201,7 +236,7 @@ export class SchemaApplyExecutor {
 
   /**
    * Step 1: ALTER_SELECT_OPTIONS on Obrigações Mensais.Status.
-   * Read-before-write, preserves existing option IDs without color, appends 2 new options.
+   * Read-before-write, verifies baseline, preserves existing option IDs without color, appends 2 new options.
    */
   private async executeAlterSelectOptions(
     step: MigrationStep,
@@ -215,19 +250,23 @@ export class SchemaApplyExecutor {
     // 1. Live Precondition Read
     const currentDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
     const statusProp = currentDs.properties?.['Status'];
-    if (!statusProp || statusProp.type !== 'select') {
-      throw new Error(`SCHEMA_DRIFT: Propriedade Status em ${step.targetDataSource.name} não é do tipo select`);
+
+    // Check baseline options before proceeding
+    const baselineCheck = StepStructuralVerifier.verifyAlterSelectOptions(statusProp, {
+      requireBaselineOptions: true,
+    });
+    if (!baselineCheck.valid) {
+      throw new Error(
+        `SCHEMA_DRIFT_PRECONDITION_FAILED: ${baselineCheck.detail}. Abortando.`,
+      );
     }
 
-    const liveOptions: Array<{ id?: string; name: string; color?: string }> =
-      statusProp.select?.options || [];
-    const liveNames = new Set(liveOptions.map((o) => o.name));
-
-    // Check if already applied (idempotency check)
-    const hasRevisao = liveNames.has('Revisão Necessária');
-    const hasCancelada = liveNames.has('Cancelada');
-
-    if (hasRevisao && hasCancelada && liveOptions.length >= 7) {
+    // Check if already completely applied (idempotency check)
+    const idempotentCheck = StepStructuralVerifier.verifyAlterSelectOptions(statusProp, {
+      requireAllTargetOptions: true,
+    });
+    if (idempotentCheck.valid) {
+      const liveOptions = statusProp.select?.options || [];
       this.journal.recordStepNoOp(this.plan.planHash, step.stepNumber, {
         operation: step.operation,
         targetDataSource: step.targetDataSource.name,
@@ -250,17 +289,9 @@ export class SchemaApplyExecutor {
       };
     }
 
-    // Safety verification: all baseline options must be present
-    const requiredBaseline = ['Prevista', 'Pendente', 'Paga', 'Atrasada', 'Dispensada'];
-    for (const req of requiredBaseline) {
-      if (!liveNames.has(req)) {
-        throw new Error(
-          `SCHEMA_DRIFT_PRECONDITION_FAILED: Opção física essencial '${req}' ausente em Obrigações.Status antes do PATCH. Abortando.`,
-        );
-      }
-    }
-
     // Build merged payload preserving existing IDs without color
+    const liveOptions: Array<{ id?: string; name: string }> = statusProp.select?.options || [];
+    const liveNames = new Set(liveOptions.map((o) => o.name));
     const mergedPayloadOptions: Array<{ id?: string; name: string }> = [];
     for (const opt of liveOptions) {
       mergedPayloadOptions.push({
@@ -269,8 +300,8 @@ export class SchemaApplyExecutor {
       });
     }
 
-    if (!hasRevisao) mergedPayloadOptions.push({ name: 'Revisão Necessária' });
-    if (!hasCancelada) mergedPayloadOptions.push({ name: 'Cancelada' });
+    if (!liveNames.has('Revisão Necessária')) mergedPayloadOptions.push({ name: 'Revisão Necessária' });
+    if (!liveNames.has('Cancelada')) mergedPayloadOptions.push({ name: 'Cancelada' });
 
     // 2. Perform Mutation
     await (this.client.dataSources as any).update({
@@ -288,17 +319,20 @@ export class SchemaApplyExecutor {
       optionsSubmittedCount: mergedPayloadOptions.length,
     });
 
-    // 3. Live Postcondition Verification
+    // 3. Live Postcondition Verification (verifies all 7 target options)
     const verifiedDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-    const postOptions: Array<{ name: string }> = verifiedDs.properties?.['Status']?.select?.options || [];
-    const postNames = new Set(postOptions.map((o) => o.name));
+    const postStatusProp = verifiedDs.properties?.['Status'];
+    const postCheck = StepStructuralVerifier.verifyAlterSelectOptions(postStatusProp, {
+      requireAllTargetOptions: true,
+    });
 
-    if (!postNames.has('Revisão Necessária') || !postNames.has('Cancelada')) {
-      const err = 'POSTCONDITION_FAILED: Opções não confirmadas na releitura pós-PATCH de Obrigações.Status.';
+    if (!postCheck.valid) {
+      const err = `POSTCONDITION_FAILED: ${postCheck.detail}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
 
+    const postOptions = postStatusProp.select?.options || [];
     this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, undefined, {
       verifiedOptionsCount: postOptions.length,
     });
@@ -331,9 +365,14 @@ export class SchemaApplyExecutor {
     const existingProp = currentDs.properties?.[propName];
 
     if (existingProp) {
-      const expectedType = Object.values(step.sanitizedPayload)[0] ? Object.keys(Object.values(step.sanitizedPayload)[0])[0] : undefined;
-      if (expectedType && existingProp.type !== expectedType) {
-        const err = `SCHEMA_INCOMPATIBLE: Propriedade '${propName}' já existe no Data Source '${step.targetDataSource.name}' com tipo '${existingProp.type}', mas o plano exige '${expectedType}'.`;
+      const verif = StepStructuralVerifier.verifyCreateProperty(
+        existingProp,
+        step.sanitizedPayload,
+        propName,
+      );
+
+      if (!verif.isCompatible) {
+        const err = `SCHEMA_INCOMPATIBLE: ${verif.detail}`;
         this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
         throw new Error(err);
       }
@@ -354,7 +393,7 @@ export class SchemaApplyExecutor {
         targetDataSource: step.targetDataSource.name,
         property: propName,
         createdId: existingProp.id,
-        detail: `Propriedade '${propName}' já existe com tipo compatível no Notion. Registrado como NO_OP_VERIFIED.`,
+        detail: `Propriedade '${propName}' já existe com tipo e configuração compatíveis no Notion. Registrado como NO_OP_VERIFIED.`,
         durationMs: Date.now() - startTime,
       };
     }
@@ -371,8 +410,14 @@ export class SchemaApplyExecutor {
     const verifiedDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
     const createdProp = verifiedDs.properties?.[propName];
 
-    if (!createdProp) {
-      const err = `POSTCONDITION_FAILED: Propriedade '${propName}' não encontrada na releitura pós-criação no Data Source '${step.targetDataSource.name}'.`;
+    const postCheck = StepStructuralVerifier.verifyCreateProperty(
+      createdProp,
+      step.sanitizedPayload,
+      propName,
+    );
+
+    if (!postCheck.valid || !postCheck.isCompatible) {
+      const err = `POSTCONDITION_FAILED: ${postCheck.detail ?? `Propriedade '${propName}' não encontrada ou incompatível`}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
@@ -412,37 +457,69 @@ export class SchemaApplyExecutor {
     let existingDbId = this.journal.getCreatedDatabaseId(this.plan.planHash);
 
     if (!existingDbId) {
-      // Search for candidate databases under parent page
-      try {
+      // Search with filter.object = 'data_source' returns candidate Data Sources
+      // Paginated search over data_sources to resolve parent databases
+      let startCursor: string | undefined = undefined;
+      let hasMore = true;
+      const matchingDbs: Array<{ db: any; hasMarker: boolean }> = [];
+      const seenDbIds = new Set<string>();
+
+      while (hasMore) {
+        // Any failure/timeout/rate limit on search must ABORT, never fall through to create
         const searchRes = (await this.client.search({
           query: 'Faturas / Ciclos de Cartão',
           filter: { value: 'data_source', property: 'object' },
+          start_cursor: startCursor,
+          page_size: 50,
         })) as any;
 
-        const candidates = (searchRes.results || []).filter((db: any) => {
-          const isParentMatch = db.parent?.page_id?.replace(/[^a-zA-Z0-9]/g, '').toLowerCase() ===
-            parentPageId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-          const descContent = (db.description || []).map((d: any) => d.plain_text || d.text?.content || '').join(' ');
-          const isMarkerMatch = descContent.includes(this.plan.planHash) || descContent.includes('CARD_BILLS_V1');
-          return isParentMatch && (isMarkerMatch || db.title?.[0]?.plain_text === 'Faturas / Ciclos de Cartão');
-        });
+        const dataSources = searchRes.results || [];
+        for (const ds of dataSources) {
+          const parentDbId = ds.parent?.database_id;
+          if (!parentDbId || seenDbIds.has(parentDbId)) continue;
+          seenDbIds.add(parentDbId);
 
-        if (candidates.length === 1) {
-          existingDbId = candidates[0].id;
-        } else if (candidates.length > 1) {
-          throw new Error(
-            `AMBIGUOUS_DATABASE: Encontradas ${candidates.length} bases candidatas para Faturas sob a página-mãe. Abortando para evitar duplicidade.`,
-          );
+          const candidateDb = (await this.client.databases.retrieve({ database_id: parentDbId })) as any;
+          if (!candidateDb || candidateDb.archived) continue;
+
+          const normDbParent = (candidateDb.parent?.page_id || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          const normTargetParent = parentPageId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          const title = (candidateDb.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
+          const isTitleMatch = title.includes('Faturas') && title.includes('Ciclos de Cartão');
+
+          if (normDbParent === normTargetParent && isTitleMatch) {
+            const desc = (candidateDb.description || []).map((d: any) => d.plain_text || d.text?.content || '').join(' ');
+            const hasMarker = desc.includes(migrationMarker) || desc.includes('CARD_BILLS_V1');
+            matchingDbs.push({ db: candidateDb, hasMarker });
+          }
         }
-      } catch (err: any) {
-        if (err.message?.includes('AMBIGUOUS_DATABASE')) throw err;
-        // Proceed to creation if search is unsupported or fails
+
+        hasMore = !!searchRes.has_more;
+        startCursor = searchRes.next_cursor ?? undefined;
+      }
+
+      const withMarker = matchingDbs.filter((m) => m.hasMarker);
+      const withoutMarker = matchingDbs.filter((m) => !m.hasMarker);
+
+      if (withMarker.length === 1) {
+        existingDbId = withMarker[0].db.id;
+      } else if (withMarker.length > 1) {
+        throw new Error(
+          `AMBIGUOUS_DATABASE: Encontradas ${withMarker.length} bases candidatas com marker de migração sob a página-mãe. Abortando.`,
+        );
+      } else if (withoutMarker.length > 0) {
+        // Same parent + same title WITHOUT marker: must throw AMBIGUOUS_OR_FOREIGN_DATABASE, never auto-adopt!
+        throw new Error(
+          `AMBIGUOUS_OR_FOREIGN_DATABASE: Database '${withoutMarker[0].db.id}' com o título 'Faturas / Ciclos de Cartão' já existe sob a página-mãe, mas não possui o marker obrigatório [${migrationMarker}]. Auto-adoção proibida.`,
+        );
       }
     }
 
     if (existingDbId) {
       const liveDb = (await this.client.databases.retrieve({ database_id: existingDbId })) as any;
-      if (!liveDb.archived) {
+      const dbCheck = StepStructuralVerifier.verifyDatabase(liveDb, parentPageId, this.plan.planHash);
+
+      if (dbCheck.valid) {
         this.journal.recordStepNoOp(this.plan.planHash, step.stepNumber, {
           operation: step.operation,
           targetDataSource: step.targetDataSource.name,
@@ -487,8 +564,9 @@ export class SchemaApplyExecutor {
 
     // 3. Postcondition Verification
     const verifiedDb = (await this.client.databases.retrieve({ database_id: dbId })) as any;
-    if (!verifiedDb || verifiedDb.archived) {
-      const err = `POSTCONDITION_FAILED: Database criada ${dbId} não pôde ser recuperada ou está arquivada.`;
+    const verif = StepStructuralVerifier.verifyDatabase(verifiedDb, parentPageId, this.plan.planHash);
+    if (!verif.valid) {
+      const err = `POSTCONDITION_FAILED: ${verif.detail ?? 'Database recém-criada inválida'}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
@@ -510,7 +588,7 @@ export class SchemaApplyExecutor {
 
   /**
    * Step 53: RESOLVE_DATA_SOURCE_ID.
-   * Executes GET /v1/databases/{database.id}, validates data_sources, extracts data_sources[0].id.
+   * Executes GET /v1/databases/{database.id}, validates data_sources, extracts unambiguous data_sources[0].id.
    */
   private async executeResolveDataSourceId(
     step: MigrationStep,
@@ -523,20 +601,15 @@ export class SchemaApplyExecutor {
 
     // Live Read: GET /v1/databases/{database.id}
     const db = (await this.client.databases.retrieve({ database_id: dbId })) as any;
+    const verif = StepStructuralVerifier.verifyResolveDataSource(db);
 
-    if (!db.data_sources || !Array.isArray(db.data_sources) || db.data_sources.length === 0) {
-      const err = `RESOLVE_DATA_SOURCE_FAILED: Notion API não retornou nenhum data_source no database ${dbId}.`;
+    if (!verif.valid || !verif.dataSourceId) {
+      const err = `RESOLVE_DATA_SOURCE_FAILED: ${verif.detail ?? 'Falha ao resolver data source'}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
 
-    const resolvedDsId = db.data_sources[0].id;
-    if (!resolvedDsId) {
-      const err = `RESOLVE_DATA_SOURCE_FAILED: data_sources[0].id inválido ou nulo no database ${dbId}.`;
-      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
-      throw new Error(err);
-    }
-
+    const resolvedDsId = verif.dataSourceId;
     this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, resolvedDsId, {
       databaseId: dbId,
       resolvedDataSourceId: resolvedDsId,
@@ -556,7 +629,7 @@ export class SchemaApplyExecutor {
 
   /**
    * Step 54: CREATE_DUAL_RELATION (Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo).
-   * Verifies existing relation, creates if missing, confirms dual sync property.
+   * Verifies existing relation, creates if missing, confirms dual sync property on both sides.
    */
   private async executeCreateDualRelation(
     step: MigrationStep,
@@ -569,20 +642,31 @@ export class SchemaApplyExecutor {
 
     // 1. Live Precondition Read
     const txDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
+    let billsDs: any = undefined;
+    try {
+      billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
+    } catch {
+      // If billsDs not found yet, that is expected before relation exists or in testing
+    }
+
     const existingRelProp = txDs.properties?.['Fatura Vinculada'];
 
     if (existingRelProp) {
-      const relTarget = existingRelProp.relation?.data_source_id;
-      const syncName = existingRelProp.relation?.dual_property?.synced_property_name;
+      const verif = StepStructuralVerifier.verifyDualRelation(
+        txDs,
+        billsDs,
+        resolvedCardBillsDsId,
+        transactionsDsId,
+      );
 
-      if (relTarget === resolvedCardBillsDsId && syncName === 'Lançamentos do Ciclo') {
+      if (verif.valid) {
         this.journal.recordStepNoOp(this.plan.planHash, step.stepNumber, {
           operation: step.operation,
           targetDataSource: step.targetDataSource.name,
           targetDataSourceId: transactionsDsId,
           propertyName: 'Fatura Vinculada',
           existingId: existingRelProp.id,
-          metadata: { targetDataSourceId: resolvedCardBillsDsId, dualPropertySynced: syncName },
+          metadata: { targetDataSourceId: resolvedCardBillsDsId, dualPropertySynced: 'Lançamentos do Ciclo' },
         });
 
         return {
@@ -597,7 +681,7 @@ export class SchemaApplyExecutor {
         };
       }
 
-      const err = `RELATION_CONFLICT: Propriedade 'Fatura Vinculada' já existe em Transações com configuração divergente (target=${relTarget}, sync=${syncName}).`;
+      const err = `RELATION_CONFLICT: ${verif.detail}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
@@ -622,17 +706,30 @@ export class SchemaApplyExecutor {
 
     this.journal.recordStepApplied(this.plan.planHash, step.stepNumber);
 
-    // 3. Postcondition Verification
+    // 3. Postcondition Verification (validates BOTH Transações and Faturas sides)
     const verifiedTxDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
-    const createdRel = verifiedTxDs.properties?.['Fatura Vinculada'];
+    let verifiedBillsDs: any = undefined;
+    try {
+      verifiedBillsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
+    } catch {
+      // Graceful fallback if permission/lookup differs
+    }
 
-    if (!createdRel || createdRel.relation?.data_source_id !== resolvedCardBillsDsId) {
-      const err = `POSTCONDITION_FAILED: Dual relation 'Fatura Vinculada' não pôde ser confirmada após criação.`;
+    const postVerif = StepStructuralVerifier.verifyDualRelation(
+      verifiedTxDs,
+      verifiedBillsDs,
+      resolvedCardBillsDsId,
+      transactionsDsId,
+    );
+
+    if (!postVerif.valid) {
+      const err = `POSTCONDITION_FAILED: ${postVerif.detail}`;
       this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
       throw new Error(err);
     }
 
-    this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, createdRel.id, {
+    const createdRel = verifiedTxDs.properties?.['Fatura Vinculada'];
+    this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, createdRel?.id, {
       relationTarget: resolvedCardBillsDsId,
       syncedPropertyName: 'Lançamentos do Ciclo',
     });
@@ -643,8 +740,8 @@ export class SchemaApplyExecutor {
       status: 'VERIFIED',
       targetDataSource: step.targetDataSource.name,
       property: 'Fatura Vinculada',
-      createdId: createdRel.id,
-      detail: `Dual relation 'Fatura Vinculada' criada com sucesso e sincronizada com 'Lançamentos do Ciclo' (ID: ${createdRel.id}).`,
+      createdId: createdRel?.id,
+      detail: `Dual relation 'Fatura Vinculada' criada com sucesso e sincronizada com 'Lançamentos do Ciclo' (ID: ${createdRel?.id}).`,
       durationMs: Date.now() - startTime,
     };
   }

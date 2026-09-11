@@ -83,10 +83,6 @@ export class MigrationRunner {
     this.journal = new MigrationJournal(journalDbPath);
   }
 
-  public setTestDoublesForTesting(testDoubles: TestDoubles): void {
-    this.testDoubles = testDoubles;
-  }
-
   public getJournal(): MigrationJournal {
     return this.journal;
   }
@@ -511,43 +507,195 @@ export class MigrationRunner {
       );
     }
 
-    const dryRunResult = await this.runDryRun();
+    const isResume = this.journal.hasPlan(providedPlanHash);
 
-    if (!dryRunResult.readiness.applyReady) {
+    if (!isResume) {
+      // -----------------------------------------------------------------------
+      // INITIAL_APPLY: Requer baseline homologado exato e persiste plano no SQLite
+      // -----------------------------------------------------------------------
+      const dryRunResult = await this.runDryRun();
+
+      if (!dryRunResult.readiness.applyReady) {
+        throw new Error(
+          `APPLY_BLOCKED: O workspace não está pronto para apply. Motivos: ${dryRunResult.readiness.reasons.join(' | ')}`,
+        );
+      }
+
+      if (!verifyPlanHash(dryRunResult.plan, providedPlanHash)) {
+        throw new Error(
+          `PLAN_HASH_MISMATCH: O hash fornecido (${providedPlanHash}) não coincide com o plano atual (${dryRunResult.plan.planHash}). A execução foi abortada por segurança.`,
+        );
+      }
+
+      if (!this.client) {
+        throw new Error('APPLY_BLOCKED: Client do Notion não inicializado. NOTION_API_KEY obrigatória.');
+      }
+
+      // Persist the approved immutable plan in SQLite BEFORE the first mutation
+      this.journal.savePlan(
+        dryRunResult.plan,
+        dryRunResult.readiness.gitBranch ?? 'unknown',
+      );
+
+      const executor = new SchemaApplyExecutor({
+        client: this.client,
+        journal: this.journal,
+        plan: dryRunResult.plan,
+        envVars: this.envVars,
+        parentPageId: dryRunResult.preflight.parentPage.pageId,
+        allowRealMutations: false,
+      });
+
+      const runId = `run_${Date.now()}`;
+      await executor.executeDdlPlan(
+        runId,
+        dryRunResult.readiness.gitCommitSha ?? 'unknown',
+        dryRunResult.readiness.gitBranch ?? 'unknown',
+      );
+
       throw new Error(
-        `APPLY_BLOCKED: O workspace não está pronto para apply. Motivos: ${dryRunResult.readiness.reasons.join(' | ')}`,
+        'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
+      );
+    } else {
+      // -----------------------------------------------------------------------
+      // RESUME_APPLY: Carrega plano imutável do SQLite e valida contra baseline + passos do journal
+      // -----------------------------------------------------------------------
+      const plan = this.journal.getPlan(providedPlanHash);
+      if (!plan) {
+        throw new Error(`PLAN_NOT_FOUND: Plano com hash ${providedPlanHash} não encontrado no journal.`);
+      }
+
+      const gitState = this.resolveGitState();
+      if (gitState.status !== 'WORKTREE_CLEAN') {
+        throw new Error(
+          `APPLY_BLOCKED: Estado git inválido para resume (${gitState.status}: ${gitState.unverifiedReason || gitState.dirtyFiles.join(', ')}).`,
+        );
+      }
+
+      if (!this.client) {
+        throw new Error('APPLY_BLOCKED: Client do Notion não inicializado. NOTION_API_KEY obrigatória.');
+      }
+
+      // Inspect live state via preflight
+      const preflight = await this.preflightValidator.runPreflight(this.envVars);
+      if (this.testDoubles?.liveSnapshotOverride) {
+        preflight.liveSnapshot = this.testDoubles.liveSnapshotOverride;
+      }
+
+      // Validate live state against: baseline + verified/applied steps in journal
+      const recordedSteps = this.journal.getAllSteps(providedPlanHash);
+      const completedSteps = recordedSteps.filter(
+        (s) => s.status === 'VERIFIED' || s.status === 'NO_OP_VERIFIED' || s.status === 'APPLIED',
+      );
+      const createdPropsByEnvKey = new Set<string>();
+      let isStep1Completed = false;
+
+      for (const s of completedSteps) {
+        if (s.stepNumber === 1 || s.operation === 'ALTER_SELECT_OPTIONS') {
+          isStep1Completed = true;
+        }
+        if (s.operation === 'CREATE_PROPERTY' && s.propertyName) {
+          const stepDef = plan.schemaPlan.steps.find((st) => st.stepNumber === s.stepNumber);
+          const envKey = stepDef?.targetDataSource.envKey;
+          if (envKey) {
+            createdPropsByEnvKey.add(`${envKey}.${s.propertyName}`);
+          }
+        }
+      }
+
+      const dataSourceIds: Record<string, string> = {};
+      for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
+        if (contract.isExisting) {
+          dataSourceIds[contract.envKey] = this.envVars[contract.envKey]?.trim() || '';
+        }
+      }
+
+      const schemaValidator = new NotionSchemaValidator(
+        this.client ? this.envVars.NOTION_API_KEY : undefined,
+        preflight.apiVersion,
+      );
+
+      const driftErrors: string[] = [];
+      const actualMissing = new Set<string>();
+
+      for (const [envKey, contract] of Object.entries(TARGET_CONTRACT)) {
+        if (!contract.isExisting) continue;
+        const actualProps = preflight.liveSnapshot[contract.envKey] ?? {};
+        const diffs = schemaValidator.compareProperties(contract, actualProps, dataSourceIds);
+
+        for (const diff of diffs) {
+          if (diff.status === 'TYPE_MISMATCH') {
+            driftErrors.push(`TYPE_MISMATCH em ${contract.defaultTitle}.${diff.notionProperty}`);
+          }
+          if (diff.status === 'RENAME_TYPE_MISMATCH') {
+            driftErrors.push(`RENAME_TYPE_MISMATCH em ${contract.defaultTitle}.${diff.notionProperty}`);
+          }
+          if (diff.status === 'RENAME_STRUCTURAL_MISMATCH') {
+            driftErrors.push(`RENAME_STRUCTURAL_MISMATCH em ${contract.defaultTitle}.${diff.notionProperty}`);
+          }
+          if (diff.status === 'HEURISTIC_SUGGESTION') {
+            driftErrors.push(`HEURISTIC_SUGGESTION em ${contract.defaultTitle}.${diff.notionProperty}`);
+          }
+          if (diff.status === 'STRUCTURAL_MISMATCH') {
+            if (isStep1Completed) {
+              driftErrors.push(`STRUCTURAL_MISMATCH inesperado pós-Step 1 em ${contract.defaultTitle}.${diff.notionProperty}`);
+            } else if (diff.notionProperty !== 'Status' || contract.envKey !== 'NOTION_DS_MONTHLY_OBLIGATIONS') {
+              driftErrors.push(`STRUCTURAL_MISMATCH não homologado em ${contract.defaultTitle}.${diff.notionProperty}`);
+            }
+          }
+          if (diff.status === 'MISSING') {
+            const propKey = `${contract.envKey}.${diff.notionProperty}`;
+            actualMissing.add(propKey);
+            if (!HOMOLOGATED_MISSING_PROPERTIES.has(propKey)) {
+              driftErrors.push(`UNEXPECTED_MISSING_PROPERTY: ${propKey}`);
+            }
+          }
+        }
+      }
+
+      // Check regression: properties recorded as completed must NOT be missing
+      for (const createdProp of createdPropsByEnvKey) {
+        if (actualMissing.has(createdProp)) {
+          driftErrors.push(`REGRESSION_DETECTED: Propriedade '${createdProp}' registrada como concluída no journal, mas ausente no Notion ao vivo.`);
+        }
+      }
+
+      // Check external modifications: properties not yet created by journal must remain missing
+      for (const homologatedProp of HOMOLOGATED_MISSING_PROPERTIES) {
+        if (!createdPropsByEnvKey.has(homologatedProp) && !actualMissing.has(homologatedProp)) {
+          driftErrors.push(`EXTERNAL_MODIFICATION_DETECTED: Propriedade '${homologatedProp}' apareceu no Notion sem execução registrada no journal.`);
+        }
+      }
+
+      if (driftErrors.length > 0) {
+        throw new Error(
+          `EXTERNAL_DRIFT_DETECTED: Workspace divergiu do baseline esperado com passos aplicados (${driftErrors.join(' | ')}). Abortando resume.`,
+        );
+      }
+
+      // Create pre-resume safety backup
+      await this.backupManager.createEncryptedBackup();
+
+      const executor = new SchemaApplyExecutor({
+        client: this.client,
+        journal: this.journal,
+        plan,
+        envVars: this.envVars,
+        parentPageId: plan.inputFingerprint.parentPageId,
+        allowRealMutations: false,
+      });
+
+      const runId = `resume_${Date.now()}`;
+      await executor.executeDdlPlan(
+        runId,
+        gitState.commitSha ?? 'unknown',
+        gitState.branch ?? 'unknown',
+      );
+
+      throw new Error(
+        'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
       );
     }
-
-    if (!verifyPlanHash(dryRunResult.plan, providedPlanHash)) {
-      throw new Error(
-        `PLAN_HASH_MISMATCH: O hash fornecido (${providedPlanHash}) não coincide com o plano atual (${dryRunResult.plan.planHash}). A execução foi abortada por segurança.`,
-      );
-    }
-
-    if (!this.client) {
-      throw new Error('APPLY_BLOCKED: Client do Notion não inicializado. NOTION_API_KEY obrigatória.');
-    }
-
-    // Gate: Physical mutations gate strictly disabled in SchemaApplyExecutor (allowRealMutations: false)
-    const executor = new SchemaApplyExecutor({
-      client: this.client,
-      journal: this.journal,
-      plan: dryRunResult.plan,
-      envVars: this.envVars,
-      allowRealMutations: false,
-    });
-
-    const runId = `run_${Date.now()}`;
-    await executor.executeDdlPlan(
-      runId,
-      dryRunResult.readiness.gitCommitSha ?? 'unknown',
-      dryRunResult.readiness.gitBranch ?? 'unknown',
-    );
-
-    throw new Error(
-      'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
-    );
   }
 
   /**
@@ -697,6 +845,35 @@ export class MigrationRunner {
 export class TestableMigrationRunner extends MigrationRunner {
   constructor(options: MigrationRunnerOptions = {}, testDoubles: TestDoubles = {}) {
     super(options);
-    this.setTestDoublesForTesting(testDoubles);
+    this.testDoubles = testDoubles;
+  }
+
+  public setClient(client: any): void {
+    this.client = client;
+    this.preflightValidator = new PreflightValidator(this.client, '2026-03-11');
+  }
+
+  public setTestDoubles(testDoubles: TestDoubles): void {
+    this.testDoubles = testDoubles;
+  }
+
+  public setTestDoublesForTesting(testDoubles: TestDoubles): void {
+    this.testDoubles = testDoubles;
+  }
+
+  public getJournalInstance(): MigrationJournal {
+    return this.journal;
+  }
+
+  public getPreflightValidator(): PreflightValidator {
+    return this.preflightValidator;
+  }
+
+  public getBackupManager(): FinancialBackupManager {
+    return this.backupManager;
+  }
+
+  public getClient(): Client | undefined {
+    return this.client;
   }
 }

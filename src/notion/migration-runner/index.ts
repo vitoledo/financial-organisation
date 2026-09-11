@@ -7,4 +7,5 @@ export * from './backfill-planner';
 export * from './journal';
 export * from './schema-executor';
 export * from './runner';
+export * from './step-verifier';
 

@@ -197,6 +197,19 @@ export interface JournalStepEntry {
   createdId?: string;
   metadataJson?: string;
   errorSanitized?: string;
+  attempts?: number;
+  lastAttemptAt?: string;
+}
+
+export interface StoredMigrationPlan {
+  planHash: string;
+  version: string;
+  commitSha: string;
+  gitBranch: string;
+  parentPageId: string;
+  liveSnapshotSha256: string;
+  planJson: string;
+  createdAt: string;
 }
 
 export interface JournalRunEntry {

@@ -15,6 +15,7 @@ import {
   computePlanHash,
   verifyPlanHash,
   canonicalizeJson,
+  StepStructuralVerifier,
 } from '../src/notion/migration-runner';
 import {
   PERCENTAGE_CONVENTION,
@@ -787,10 +788,25 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       });
 
       const step2 = journal.getStepStatus(planHash, 2);
-      expect(step2?.status).toBe('NO_OP_VERIFIED');
-      expect(step2?.createdId).toBe('prop_existing_123');
+      // Anti-regression: re-recording pending on a VERIFIED step does NOT revert it to PENDING
+      journal.recordStepPending({
+        planHash,
+        stepNumber: 1,
+        operation: 'ALTER_SELECT_OPTIONS',
+        targetDataSource: 'Obrigações Mensais',
+        propertyName: 'Status',
+      });
+      step1 = journal.getStepStatus(planHash, 1);
+      expect(step1?.status).toBe('VERIFIED');
+      expect(step1?.attempts).toBe(2);
 
-      // Update on conflict: re-recording pending on step 1 updates row cleanly
+      // Explicit revalidation failure is required to mark it FAILED
+      journal.recordRevalidationFailed(planHash, 1, 'Simulated live drift failure');
+      step1 = journal.getStepStatus(planHash, 1);
+      expect(step1?.status).toBe('FAILED');
+      expect(step1?.errorSanitized).toBe('Simulated live drift failure');
+
+      // Once failed, a subsequent pending call can transition it back to PENDING
       journal.recordStepPending({
         planHash,
         stepNumber: 1,
@@ -800,6 +816,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       });
       step1 = journal.getStepStatus(planHash, 1);
       expect(step1?.status).toBe('PENDING');
+      expect(step1?.attempts).toBe(3);
     });
 
     it('stores and retrieves createdDatabaseId and resolvedDataSourceId', () => {
@@ -1045,17 +1062,22 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       const mockClient: any = {
         databases: {
           retrieve: async (params: any) => {
-            return { id: params.database_id, archived: false };
+            return {
+              id: params.database_id,
+              archived: false,
+              parent: { page_id: 'parent-page-123' },
+              title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+              description: [{ plain_text: `Base canônica de faturas. [MIGRATION_MARKER:${planHash}:CARD_BILLS_V1]` }],
+            };
           },
         },
         search: async () => {
           return {
             results: [
               {
-                id: 'existing-faturas-db-id',
-                parent: { page_id: 'parent-page-123' },
-                title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
-                description: [{ plain_text: `Base canônica de faturas. [MIGRATION_MARKER:${planHash}:CARD_BILLS_V1]` }],
+                object: 'data_source',
+                id: 'ds-faturas-candidate',
+                parent: { type: 'database_id', database_id: 'existing-faturas-db-id' },
               },
             ],
           };
@@ -1176,9 +1198,26 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
 
       const mockClient: any = {
         dataSources: {
-          retrieve: async () => {
+          retrieve: async (params: any) => {
             if (updatePayload) {
+              if (params?.data_source_id === 'ds-resolved-card-bills-999') {
+                return {
+                  id: 'ds-resolved-card-bills-999',
+                  properties: {
+                    'Lançamentos do Ciclo': {
+                      id: 'rel-ciclo-id',
+                      type: 'relation',
+                      relation: {
+                        data_source_id: 'ds-transactions-id',
+                        type: 'dual_property',
+                        dual_property: { synced_property_name: 'Fatura Vinculada' },
+                      },
+                    },
+                  },
+                };
+              }
               return {
+                id: 'ds-transactions-id',
                 properties: {
                   'Fatura Vinculada': {
                     id: 'rel-fatura-id',
@@ -1368,5 +1407,465 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       expect(report.readiness.applyReady).toBe(false);
       expect(report.readiness.reasons.some((r) => r.includes('EXPECTED_MISSING_BUT_PRESENT'))).toBe(true);
     });
+  });
+
+  describe('10. Crash Recovery, Resume Apply, and Unified Structural Verification Hardening', () => {
+    it('StepStructuralVerifier verifies ALTER_SELECT_OPTIONS correctly', () => {
+      // Missing baseline options
+      const propWithMissingBaseline = {
+        type: 'select',
+        select: { options: [{ name: 'Prevista' }] },
+      };
+      const baselineRes = StepStructuralVerifier.verifyAlterSelectOptions(propWithMissingBaseline, {
+        requireBaselineOptions: true,
+      });
+      expect(baselineRes.valid).toBe(false);
+      expect(baselineRes.reason).toBe('BASELINE_OPTION_MISSING');
+
+      // Complete 7 options
+      const propComplete = {
+        type: 'select',
+        select: {
+          options: [
+            { name: 'Prevista' },
+            { name: 'Pendente' },
+            { name: 'Paga' },
+            { name: 'Atrasada' },
+            { name: 'Dispensada' },
+            { name: 'Revisão Necessária' },
+            { name: 'Cancelada' },
+          ],
+        },
+      };
+      const completeRes = StepStructuralVerifier.verifyAlterSelectOptions(propComplete, {
+        requireAllTargetOptions: true,
+      });
+      expect(completeRes.valid).toBe(true);
+    });
+
+    it('StepStructuralVerifier flags SCHEMA_INCOMPATIBLE on divergent property format or type', () => {
+      // Divergent format for number
+      const existingNumberProp = {
+        type: 'number',
+        number: { format: 'number' },
+      };
+      const expectedPayload = {
+        'Valor Total': {
+          number: { format: 'real' },
+        },
+      };
+      const formatCheck = StepStructuralVerifier.verifyCreateProperty(
+        existingNumberProp,
+        expectedPayload,
+        'Valor Total',
+      );
+      expect(formatCheck.isCompatible).toBe(false);
+      expect(formatCheck.reason).toBe('FORMAT_MISMATCH');
+
+      // Divergent type
+      const existingTextProp = {
+        type: 'rich_text',
+      };
+      const typeCheck = StepStructuralVerifier.verifyCreateProperty(
+        existingTextProp,
+        expectedPayload,
+        'Valor Total',
+      );
+      expect(typeCheck.isCompatible).toBe(false);
+      expect(typeCheck.reason).toBe('TYPE_MISMATCH');
+    });
+
+    it('StepStructuralVerifier rejects database without migration marker or mismatched parent page', () => {
+      const dbWithoutMarker = {
+        id: 'db-123',
+        archived: false,
+        parent: { page_id: 'parent-page-123' },
+        title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+        description: [{ plain_text: 'Database sem marker' }],
+      };
+      const markerCheck = StepStructuralVerifier.verifyDatabase(
+        dbWithoutMarker,
+        'parent-page-123',
+        'expected_hash',
+      );
+      expect(markerCheck.valid).toBe(false);
+      expect(markerCheck.reason).toBe('MIGRATION_MARKER_MISSING');
+
+      const dbWrongParent = {
+        id: 'db-123',
+        archived: false,
+        parent: { page_id: 'wrong-parent-page' },
+        title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+        description: [{ plain_text: 'MIGRATION_MARKER:expected_hash:CARD_BILLS_V1' }],
+      };
+      const parentCheck = StepStructuralVerifier.verifyDatabase(
+        dbWrongParent,
+        'parent-page-123',
+        'expected_hash',
+      );
+      expect(parentCheck.valid).toBe(false);
+      expect(parentCheck.reason).toBe('PARENT_PAGE_MISMATCH');
+    });
+
+    it('StepStructuralVerifier rejects ambiguous data sources in verifyResolveDataSource', () => {
+      const dbMultipleDs = {
+        id: 'db-multi',
+        data_sources: [{ id: 'ds-1' }, { id: 'ds-2' }],
+      };
+      const multiCheck = StepStructuralVerifier.verifyResolveDataSource(dbMultipleDs);
+      expect(multiCheck.valid).toBe(false);
+      expect(multiCheck.reason).toBe('AMBIGUOUS_DATA_SOURCE');
+
+      const dbSingleDs = {
+        id: 'db-single',
+        data_sources: [{ id: 'ds-sole-123' }],
+      };
+      const singleCheck = StepStructuralVerifier.verifyResolveDataSource(dbSingleDs);
+      expect(singleCheck.valid).toBe(true);
+      expect(singleCheck.dataSourceId).toBe('ds-sole-123');
+    });
+
+    it('AMBIGUOUS_OR_FOREIGN_DATABASE: base com mesmo título mas sem marker sob a página-mãe bloqueia criação', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_foreign_db_test';
+
+      const mockClient: any = {
+        databases: {
+          retrieve: async (params: any) => {
+            return {
+              id: params.database_id,
+              archived: false,
+              parent: { page_id: 'parent-page-test-123' },
+              title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+              description: [{ plain_text: 'Base legada estrangeira sem marker' }],
+            };
+          },
+        },
+        search: async () => {
+          return {
+            results: [
+              {
+                object: 'data_source',
+                id: 'ds-foreign',
+                parent: { type: 'database_id', database_id: 'foreign-db-id' },
+              },
+            ],
+          };
+        },
+      };
+
+      const plan: any = {
+        version: '1.0.0',
+        planHash,
+        schemaPlan: {
+          steps: [
+            {
+              stepNumber: 52,
+              operation: 'CREATE_DATABASE',
+              targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+              risk: 'SAFE_MUTATION',
+              precondition: 'none',
+              rollback: 'PLANNED_MANUAL',
+              sanitizedPayload: {},
+            },
+          ],
+        },
+        backfillPlan: { totalPipelines: 0, pipelines: [] },
+      };
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan,
+        parentPageId: 'parent-page-test-123',
+        allowRealMutations: true,
+      });
+
+      await expect(
+        executor.executeDdlPlan('run_foreign_test', 'commit_sha', 'main'),
+      ).rejects.toThrow('AMBIGUOUS_OR_FOREIGN_DATABASE');
+    });
+
+    it('falha no search aborta imediatamente e nunca cria base duplicada', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_search_failure_test';
+      let createCalled = false;
+
+      const mockClient: any = {
+        databases: {
+          create: async () => {
+            createCalled = true;
+            return { id: 'should-not-be-created' };
+          },
+        },
+        search: async () => {
+          throw new Error('RATE_LIMITED_OR_NETWORK_ERROR');
+        },
+      };
+
+      const plan: any = {
+        version: '1.0.0',
+        planHash,
+        schemaPlan: {
+          steps: [
+            {
+              stepNumber: 52,
+              operation: 'CREATE_DATABASE',
+              targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+              risk: 'SAFE_MUTATION',
+              precondition: 'none',
+              rollback: 'PLANNED_MANUAL',
+              sanitizedPayload: {},
+            },
+          ],
+        },
+        backfillPlan: { totalPipelines: 0, pipelines: [] },
+      };
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan,
+        parentPageId: 'parent-page-test-123',
+        allowRealMutations: true,
+      });
+
+      await expect(
+        executor.executeDdlPlan('run_search_fail', 'commit_sha', 'main'),
+      ).rejects.toThrow('RATE_LIMITED_OR_NETWORK_ERROR');
+      expect(createCalled).toBe(false);
+    });
+
+    it('janela crítica: databases.create teve sucesso mas processo foi encerrado antes de salvar no journal, retry reconcilia via marker', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_critical_window_reconciliation';
+      let createCallCount = 0;
+
+      const mockClient: any = {
+        databases: {
+          create: async () => {
+            createCallCount++;
+            return { id: 'created-in-first-run-id' };
+          },
+          retrieve: async (params: any) => {
+            return {
+              id: params.database_id,
+              archived: false,
+              parent: { page_id: 'parent-page-test-123' },
+              title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+              description: [{ plain_text: `Base canônica. [MIGRATION_MARKER:${planHash}:CARD_BILLS_V1]` }],
+            };
+          },
+        },
+        search: async () => {
+          return {
+            results: [
+              {
+                object: 'data_source',
+                id: 'ds-reconciled',
+                parent: { type: 'database_id', database_id: 'created-in-first-run-id' },
+              },
+            ],
+          };
+        },
+      };
+
+      const plan: any = {
+        version: '1.0.0',
+        planHash,
+        schemaPlan: {
+          steps: [
+            {
+              stepNumber: 52,
+              operation: 'CREATE_DATABASE',
+              targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+              risk: 'SAFE_MUTATION',
+              precondition: 'none',
+              rollback: 'PLANNED_MANUAL',
+              sanitizedPayload: {},
+            },
+          ],
+        },
+        backfillPlan: { totalPipelines: 0, pipelines: [] },
+      };
+
+      // Journal has NO record yet (simulating crash right after databases.create)
+      expect(journal.getStepStatus(planHash, 52)).toBeUndefined();
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan,
+        parentPageId: 'parent-page-test-123',
+        allowRealMutations: true,
+      });
+
+      const result = await executor.executeDdlPlan('retry_after_crash', 'commit_sha', 'main');
+      expect(createCallCount).toBe(0); // databases.create was NEVER called on retry
+      expect(result.stepResults[0].status).toBe('NO_OP_VERIFIED');
+      expect(result.stepResults[0].createdId).toBe('created-in-first-run-id');
+      expect(journal.getStepStatus(planHash, 52)?.status).toBe('NO_OP_VERIFIED');
+    });
+
+    it('CRASH RECOVERY OBRIGATÓRIO: aplica passos 1..N, simula crash, instancia novo runner com mesmo planHash, retoma em N+1 sem exigir 51 missing e sem reescrever passos verificados', async () => {
+      // 1. Setup preflight and baseline plan
+      const journal = new MigrationJournal(testDbPath);
+      const snapshot: Record<string, Record<string, any>> = JSON.parse(
+        JSON.stringify(LIVE_NOTION_FIXTURES),
+      );
+
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'dry-run',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          liveSnapshotOverride: snapshot,
+        },
+      );
+
+      const dryRunReport = await runner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+      expect(planHash).toMatch(/^[a-f0-9]{64}$/);
+
+      // Save plan into journal as INITIAL_APPLY would do
+      journal.savePlan(dryRunReport.plan, 'feat/phase-1-schema-apply-executor');
+      expect(journal.hasPlan(planHash)).toBe(true);
+
+      // 2. Simulate execution of Steps 1 to 3 in mock
+      // Step 1: ALTER_SELECT_OPTIONS on Obrigações Mensais.Status
+      journal.recordStepPending({
+        planHash,
+        stepNumber: 1,
+        operation: 'ALTER_SELECT_OPTIONS',
+        targetDataSource: 'Obrigações Mensais',
+        propertyName: 'Status',
+      });
+      journal.recordStepVerified(planHash, 1);
+
+      // Step 2 & 3: CREATE_PROPERTY on Contas and Categorias
+      journal.recordStepPending({
+        planHash,
+        stepNumber: 2,
+        operation: 'CREATE_PROPERTY',
+        targetDataSource: 'Contas',
+        propertyName: 'Limite Operacional Usado',
+      });
+      journal.recordStepVerified(planHash, 2, 'prop-contas-limite');
+
+      journal.recordStepPending({
+        planHash,
+        stepNumber: 3,
+        operation: 'CREATE_PROPERTY',
+        targetDataSource: 'Categorias',
+        propertyName: 'Cor Hex',
+      });
+      journal.recordStepVerified(planHash, 3, 'prop-categorias-cor');
+
+      // 3. Update live snapshot to reflect the applied steps 1..3
+      // Obrigações.Status now has 7 options
+      snapshot.NOTION_DS_MONTHLY_OBLIGATIONS['Status'] = {
+        name: 'Status',
+        type: 'select',
+        selectOptions: [
+          'Prevista',
+          'Pendente',
+          'Paga',
+          'Atrasada',
+          'Dispensada',
+          'Revisão Necessária',
+          'Cancelada',
+        ],
+      };
+      // Contas has Limite Operacional Usado
+      snapshot.NOTION_DS_ACCOUNTS['Limite Operacional Usado'] = {
+        name: 'Limite Operacional Usado',
+        type: 'number',
+      };
+      // Categorias has Cor Hex
+      snapshot.NOTION_DS_CATEGORIES['Cor Hex'] = {
+        name: 'Cor Hex',
+        type: 'rich_text',
+      };
+
+      // 4. Instantiate BRAND NEW RUNNER with the same planHash (simulating process restart)
+      const mockNotionClient: any = {
+        dataSources: {
+          retrieve: async () => ({ properties: {} }),
+          update: async () => ({}),
+        },
+        databases: {
+          retrieve: async () => ({ archived: false }),
+          create: async () => ({ id: 'mock-db' }),
+        },
+        search: async () => ({ results: [] }),
+      };
+
+      const resumeRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          liveSnapshotOverride: snapshot,
+        },
+      );
+      resumeRunner.setClient(mockNotionClient);
+
+      // Confirm journal has the plan and recognizes RESUME_APPLY
+      expect(resumeRunner.getJournalInstance().hasPlan(planHash)).toBe(true);
+
+      // Running resume execute() validates live state (which has 49 missing, NOT 51, because 2 properties were created!)
+      // And executes the apply safeguarding check
+      await expect(
+        resumeRunner.execute(planHash),
+      ).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+
+      // 5. Test EXTERNAL DRIFT rejection during resume:
+      // If an unexplained external modification occurs (e.g. a homologated missing property appears without journal execution)
+      const driftedSnapshot: Record<string, Record<string, any>> = JSON.parse(JSON.stringify(snapshot));
+      driftedSnapshot.NOTION_DS_ACCOUNTS['Dia de Fechamento'] = {
+        name: 'Dia de Fechamento',
+        type: 'number',
+      };
+
+      const driftRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          liveSnapshotOverride: driftedSnapshot,
+        },
+      );
+      driftRunner.setClient(mockNotionClient);
+
+      await expect(
+        driftRunner.execute(planHash),
+      ).rejects.toThrow('EXTERNAL_DRIFT_DETECTED');
+    }, 30000);
   });
 });
