@@ -7,6 +7,7 @@ export type PropertyStatus =
   | 'EXACT_MATCH'
   | 'RENAME_CANDIDATE'
   | 'RENAME_TYPE_MISMATCH'
+  | 'HEURISTIC_SUGGESTION'
   | 'TYPE_MISMATCH'
   | 'MISSING'
   | 'UNVERIFIED'
@@ -204,12 +205,16 @@ export class NotionSchemaValidator {
     const diffs: PropertyDiff[] = [];
     const consumedActualKeys = new Set<string>();
 
-    // 1. Pass 1: Exact matches (case-insensitive & trimmed)
-    const unmatchedExpected: PropertyContract[] = [];
+    // -------------------------------------------------------------------------
+    // Tier 1: Exact matches (case-insensitive & trimmed)
+    // -------------------------------------------------------------------------
+    const afterTier1Expected: PropertyContract[] = [];
 
     for (const expected of contract.properties) {
       const matchKey = Object.keys(actual).find(
-        (k) => !consumedActualKeys.has(k) && k.trim().toLowerCase() === expected.notionProperty.trim().toLowerCase(),
+        (k) =>
+          !consumedActualKeys.has(k) &&
+          normalizePropName(k) === normalizePropName(expected.notionProperty),
       );
 
       if (matchKey) {
@@ -226,12 +231,61 @@ export class NotionSchemaValidator {
           description: expected.description,
         });
       } else {
-        unmatchedExpected.push(expected);
+        afterTier1Expected.push(expected);
       }
     }
 
-    // 2. Pass 2: Rename candidates with type compatibility check
-    for (const expected of unmatchedExpected) {
+    // -------------------------------------------------------------------------
+    // Tier 2: Explicit alias matches (authoritative mapping from contract)
+    // -------------------------------------------------------------------------
+    const afterTier2Expected: PropertyContract[] = [];
+
+    for (const expected of afterTier1Expected) {
+      let matchedAliasKey: string | undefined;
+
+      if (expected.aliases && expected.aliases.length > 0) {
+        matchedAliasKey = Object.keys(actual).find(
+          (k) =>
+            !consumedActualKeys.has(k) &&
+            expected.aliases!.some((alias) => normalizePropName(k) === normalizePropName(alias)),
+        );
+      }
+
+      if (matchedAliasKey) {
+        consumedActualKeys.add(matchedAliasKey);
+        const actualType = actual[matchedAliasKey].type;
+        const isTypeCompatible = actualType === expected.notionType;
+
+        if (isTypeCompatible) {
+          diffs.push({
+            notionProperty: expected.notionProperty,
+            expectedType: expected.notionType,
+            actualType,
+            status: 'RENAME_CANDIDATE',
+            candidateName: matchedAliasKey,
+            authority: expected.authority,
+            description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}" com tipo compatível: ${actualType})`,
+          });
+        } else {
+          diffs.push({
+            notionProperty: expected.notionProperty,
+            expectedType: expected.notionType,
+            actualType,
+            status: 'RENAME_TYPE_MISMATCH',
+            candidateName: matchedAliasKey,
+            authority: expected.authority,
+            description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}", porém com tipo incompatível: esperado "${expected.notionType}", encontrado "${actualType}")`,
+          });
+        }
+      } else {
+        afterTier2Expected.push(expected);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tier 3: Heuristic suggestion (advisory only, NOT authoritative)
+    // -------------------------------------------------------------------------
+    for (const expected of afterTier2Expected) {
       let bestMatchKey: string | undefined;
       let bestSimilarity = 0;
 
@@ -246,31 +300,18 @@ export class NotionSchemaValidator {
       }
 
       if (bestMatchKey) {
-        consumedActualKeys.add(bestMatchKey);
         const actualType = actual[bestMatchKey].type;
-        const isTypeCompatible = actualType === expected.notionType;
-
-        if (isTypeCompatible) {
-          diffs.push({
-            notionProperty: expected.notionProperty,
-            expectedType: expected.notionType,
-            actualType,
-            status: 'RENAME_CANDIDATE',
-            candidateName: bestMatchKey,
-            authority: expected.authority,
-            description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}" com tipo compatível: ${actualType})`,
-          });
-        } else {
-          diffs.push({
-            notionProperty: expected.notionProperty,
-            expectedType: expected.notionType,
-            actualType,
-            status: 'RENAME_TYPE_MISMATCH',
-            candidateName: bestMatchKey,
-            authority: expected.authority,
-            description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}", porém com tipo incompatível: esperado "${expected.notionType}", encontrado "${actualType}")`,
-          });
-        }
+        const simPercent = Math.round(bestSimilarity * 100);
+        diffs.push({
+          notionProperty: expected.notionProperty,
+          expectedType: expected.notionType,
+          actualType,
+          status: 'HEURISTIC_SUGGESTION',
+          candidateName: bestMatchKey,
+          authority: expected.authority,
+          description: `${expected.description} (Sugestão heurística não-autoritativa: "${bestMatchKey}" [${actualType}], similaridade: ${simPercent}%. Requer confirmação por alias explícito).`,
+        });
+        // Note: Heuristic does NOT consume bestMatchKey, preserving it for EXTRA_PRESERVE
       } else {
         diffs.push({
           notionProperty: expected.notionProperty,
@@ -282,7 +323,9 @@ export class NotionSchemaValidator {
       }
     }
 
-    // 3. Pass 3: All remaining properties in Notion are EXTRA_PRESERVE
+    // -------------------------------------------------------------------------
+    // Tier 4: All unconsumed properties in Notion are EXTRA_PRESERVE
+    // -------------------------------------------------------------------------
     for (const [actualKey, actualProp] of Object.entries(actual)) {
       if (!consumedActualKeys.has(actualKey)) {
         diffs.push({
@@ -331,6 +374,7 @@ export class NotionSchemaValidator {
     const totalExact = allProps.filter((p) => p.status === 'EXACT_MATCH').length;
     const totalRename = allProps.filter((p) => p.status === 'RENAME_CANDIDATE').length;
     const totalRenameMismatch = allProps.filter((p) => p.status === 'RENAME_TYPE_MISMATCH').length;
+    const totalHeuristic = allProps.filter((p) => p.status === 'HEURISTIC_SUGGESTION').length;
     const totalTypeMismatch = allProps.filter((p) => p.status === 'TYPE_MISMATCH').length;
     const totalMissing = allProps.filter((p) => p.status === 'MISSING').length;
     const totalUnverified = allProps.filter((p) => p.status === 'UNVERIFIED').length;
@@ -340,8 +384,9 @@ export class NotionSchemaValidator {
     lines.push('| Status das Propriedades | Quantidade |');
     lines.push('| :--- | :--- |');
     lines.push(`| Correspondência Exata (EXACT_MATCH) | ${totalExact} |`);
-    lines.push(`| Candidatos a Renomeação Compatíveis (RENAME_CANDIDATE) | ${totalRename} |`);
-    lines.push(`| Candidatos com Tipo Divergente (RENAME_TYPE_MISMATCH) | ${totalRenameMismatch} |`);
+    lines.push(`| Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | ${totalRename} |`);
+    lines.push(`| Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | ${totalRenameMismatch} |`);
+    lines.push(`| Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | ${totalHeuristic} |`);
     lines.push(`| Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | ${totalTypeMismatch} |`);
     lines.push(`| Propriedades Ausentes em Bases Verificadas (MISSING) | ${totalMissing} |`);
     lines.push(`| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | ${totalUnverified} |`);
@@ -396,6 +441,9 @@ export class NotionSchemaValidator {
             break;
           case 'RENAME_TYPE_MISMATCH':
             statusBadge = `🔄❌ RENAME_TYPE_MISMATCH (\`${p.candidateName}\`)`;
+            break;
+          case 'HEURISTIC_SUGGESTION':
+            statusBadge = `💡 HEURISTIC_SUGGESTION (\`${p.candidateName}\`) [Não-autoritativo]`;
             break;
           case 'TYPE_MISMATCH':
             statusBadge = `❌ TYPE_MISMATCH (esperado: ${p.expectedType}, no Notion: ${p.actualType})`;

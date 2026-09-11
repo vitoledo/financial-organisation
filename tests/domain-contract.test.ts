@@ -11,6 +11,8 @@ import {
   updateCostBasisOnSale,
   calculateUnrealizedProfitLoss,
   calculateMarketValue,
+  calculateBillDiscrepancy,
+  TransactionBankStatus,
 } from '../src/domain/types';
 import { TARGET_CONTRACT } from '../src/domain/schema-contract';
 import { NotionSchemaValidator } from '../src/notion/schema-validator';
@@ -25,18 +27,63 @@ describe('Domain: Money (BigInt Minor Units & Exact Rational Math)', () => {
     expect(m.toFormattedBR()).toBe('R$ 15,00');
   });
 
-  test('creates Money from decimal string and number', () => {
+  test('creates Money from decimal string and boundary floats', () => {
     const m1 = Money.fromDecimal('1250.50');
     expect(m1.amountMinor).toBe(125050n);
     expect(m1.toFormattedBR()).toBe('R$ 1.250,50');
 
-    const m2 = Money.fromDecimal(400.25);
+    // Canonical fromDecimal strictly rejects number:
+    expect(() => Money.fromDecimal(400.25 as any)).toThrow(TypeError);
+
+    // Boundary conversion handles number safely:
+    const m2 = Money.fromDecimalBoundary(400.25);
     expect(m2.amountMinor).toBe(40025n);
 
     const m3 = Money.fromDecimal('-15.00');
     expect(m3.amountMinor).toBe(-1500n);
     expect(m3.isNegative()).toBe(true);
     expect(m3.toFormattedBR()).toBe('-R$ 15,00');
+  });
+
+  test('exact half-up rounding on 1.005 in BigInt without IEEE-754 loss', () => {
+    // 1.005 in scale 2 rounds up to 1.01 (101 minor units)
+    const mRoundUp = Money.fromDecimal('1.005');
+    expect(mRoundUp.amountMinor).toBe(101n);
+    expect(mRoundUp.toDecimalString()).toBe('1.01');
+    expect(mRoundUp.toFormattedBR()).toBe('R$ 1,01');
+
+    // 1.004 in scale 2 rounds down to 1.00 (100 minor units)
+    const mRoundDown = Money.fromDecimal('1.004');
+    expect(mRoundDown.amountMinor).toBe(100n);
+    expect(mRoundDown.toDecimalString()).toBe('1.00');
+
+    // 1.0050 with trailing zero rounds to 101n
+    const mTrailing = Money.fromDecimal('1.0050');
+    expect(mTrailing.amountMinor).toBe(101n);
+
+    // Negative -1.005 rounds to -101n
+    const mNeg = Money.fromDecimal('-1.005');
+    expect(mNeg.amountMinor).toBe(-101n);
+    expect(mNeg.toDecimalString()).toBe('-1.01');
+
+    // DecimalQuantity 1.000000005 with scale 8 rounds up
+    const qRoundUp = DecimalQuantity.fromDecimal('1.000000005', 8);
+    expect(qRoundUp.rawUnits).toBe(100000001n);
+
+    const qRoundDown = DecimalQuantity.fromDecimal('1.000000004', 8);
+    expect(qRoundDown.rawUnits).toBe(100000000n);
+  });
+
+  test('rejects unsafe integers in fromMinor and fromCents', () => {
+    const unsafeInt = Number.MAX_SAFE_INTEGER + 10;
+    expect(() => Money.fromMinor(unsafeInt)).toThrow('requires a safe integer');
+    expect(() => Money.fromCents(unsafeInt)).toThrow('requires a safe integer');
+    expect(() => Money.fromMinor(NaN)).toThrow('requires a safe integer');
+    expect(() => Money.fromMinor(Infinity)).toThrow('requires a safe integer');
+
+    // Safe integers work
+    expect(Money.fromMinor(100).amountMinor).toBe(100n);
+    expect(Money.fromMinor(Number.MAX_SAFE_INTEGER).amountMinor).toBe(BigInt(Number.MAX_SAFE_INTEGER));
   });
 
   test('arithmetic operations preserve exact precision without IEEE-754 drift', () => {
@@ -67,7 +114,7 @@ describe('Domain: Money (BigInt Minor Units & Exact Rational Math)', () => {
     const usd = Money.fromDecimal('49.99', 'USD', 2);
     expect(usd.currency).toBe('USD');
     expect(usd.amountMinor).toBe(4999n);
-    const doubled = usd.multiply(2);
+    const doubled = usd.multiply(2n);
     expect(doubled.amountMinor).toBe(9998n);
     expect(doubled.toDecimalString()).toBe('99.98');
   });
@@ -77,7 +124,12 @@ describe('Domain: Money (BigInt Minor Units & Exact Rational Math)', () => {
     const rationalHalf = m.multiplyRational(1n, 2n);
     expect(rationalHalf.toDecimalString()).toBe('50.00');
 
-    const decimalFactor = m.multiply(0.333333);
+    // Rational one-third: 100 * 1 / 3 = 33.33 (3333 minor units)
+    const oneThird = m.multiplyRational(1n, 3n);
+    expect(oneThird.amountMinor).toBe(3333n);
+
+    // Boundary float multiplication:
+    const decimalFactor = m.multiplyBoundary(0.333333);
     expect(decimalFactor.amountMinor).toBe(3333n);
   });
 });
@@ -152,6 +204,117 @@ describe('Domain: Investment Cost Basis & Unrealized P/L', () => {
     expect(position.unitAveragePrice.toDecimalString()).toBe('25.00'); // PMP unchanged on sale!
   });
 
+  test('rejects purchase and sale with quantity less than or equal to zero', () => {
+    const position = {
+      quantity: DecimalQuantity.fromDecimal('10', 8),
+      totalCostBasis: Money.fromDecimal('200.00', 'BRL', 2),
+      unitAveragePrice: Money.fromDecimal('20.00', 'BRL', 2),
+    };
+
+    // Negative sale
+    expect(() => updateCostBasisOnSale(position, DecimalQuantity.fromDecimal('-5', 8))).toThrow(
+      'Invalid sold quantity',
+    );
+    // Zero sale
+    expect(() => updateCostBasisOnSale(position, DecimalQuantity.zero(8))).toThrow(
+      'Invalid sold quantity',
+    );
+
+    // Negative purchase
+    expect(() =>
+      updateCostBasisOnPurchase(
+        position,
+        DecimalQuantity.fromDecimal('-1', 8),
+        Money.fromDecimal('20.00', 'BRL', 2),
+      ),
+    ).toThrow('Invalid purchase quantity');
+    // Zero purchase
+    expect(() =>
+      updateCostBasisOnPurchase(position, DecimalQuantity.zero(8), Money.fromDecimal('20.00', 'BRL', 2)),
+    ).toThrow('Invalid purchase quantity');
+  });
+
+  test('rejects oversell when sold quantity exceeds current position', () => {
+    const position = {
+      quantity: DecimalQuantity.fromDecimal('10', 8),
+      totalCostBasis: Money.fromDecimal('200.00', 'BRL', 2),
+      unitAveragePrice: Money.fromDecimal('20.00', 'BRL', 2),
+    };
+
+    // Attempting to sell 15 units when holding only 10
+    expect(() => updateCostBasisOnSale(position, DecimalQuantity.fromDecimal('15', 8))).toThrow(
+      'Oversell rejected: cannot sell 15 units when current position is only 10 units',
+    );
+
+    // Attempting to sell 10.00000001 units
+    expect(() =>
+      updateCostBasisOnSale(position, DecimalQuantity.fromDecimal('10.00000001', 8)),
+    ).toThrow('Oversell rejected');
+  });
+
+  test('normalizes quantity scales across purchase and sale without IEEE-754 precision drift', () => {
+    // Current position with scale 4: 10.0000 units
+    const current = {
+      quantity: new DecimalQuantity(100000n, 4), // 10.0000
+      totalCostBasis: Money.fromDecimal('200.00', 'BRL', 2),
+      unitAveragePrice: Money.fromDecimal('20.00', 'BRL', 2),
+    };
+
+    // Purchase with scale 8: 5.50000000 units at R$ 26,00
+    const updatedPurchase = updateCostBasisOnPurchase(
+      current,
+      DecimalQuantity.fromDecimal('5.5', 8),
+      Money.fromDecimal('26.00', 'BRL', 2),
+    );
+
+    // 10 + 5.5 = 15.5 units at aligned scale 8
+    expect(updatedPurchase.quantity.scale).toBe(8);
+    expect(updatedPurchase.quantity.toCanonicalString()).toBe('15.5');
+    // Total cost = 200 + (5.5 * 26 = 143) = 343.00
+    expect(updatedPurchase.totalCostBasis.toDecimalString()).toBe('343.00');
+
+    // Sale with scale 2: sell 2.50 units
+    const updatedSale = updateCostBasisOnSale(
+      updatedPurchase,
+      DecimalQuantity.fromDecimal('2.50', 2),
+    );
+    // 15.5 - 2.5 = 13.0 units at scale 8
+    expect(updatedSale.quantity.toCanonicalString()).toBe('13');
+    expect(updatedSale.quantity.scale).toBe(8);
+    // Average price remains identical
+    expect(updatedSale.unitAveragePrice.toDecimalString()).toBe(
+      updatedPurchase.unitAveragePrice.toDecimalString(),
+    );
+  });
+
+  test('validates fees currency and scale against unitPrice before purchase', () => {
+    const position = {
+      quantity: DecimalQuantity.fromDecimal('10', 8),
+      totalCostBasis: Money.fromDecimal('200.00', 'BRL', 2),
+      unitAveragePrice: Money.fromDecimal('20.00', 'BRL', 2),
+    };
+
+    // Currency mismatch (fees in USD vs unitPrice in BRL)
+    expect(() =>
+      updateCostBasisOnPurchase(
+        position,
+        DecimalQuantity.fromDecimal('2', 8),
+        Money.fromDecimal('25.00', 'BRL', 2),
+        Money.fromDecimal('1.50', 'USD', 2),
+      ),
+    ).toThrow('Fees currency/scale mismatch');
+
+    // Scale mismatch (fees in scale 3 vs unitPrice in scale 2)
+    expect(() =>
+      updateCostBasisOnPurchase(
+        position,
+        DecimalQuantity.fromDecimal('2', 8),
+        Money.fromDecimal('25.00', 'BRL', 2),
+        Money.fromMinor(150n, 'BRL', 3),
+      ),
+    ).toThrow('Fees currency/scale mismatch');
+  });
+
   test('calculates unrealized P/L strictly as Current Market Value - Total Cost Basis', () => {
     const totalCostBasis = Money.fromDecimal('375.00', 'BRL', 2);
     const quantity = DecimalQuantity.fromDecimal('15', 8);
@@ -201,6 +364,23 @@ describe('Domain: Transaction Idempotency Key & Canonical Fingerprint', () => {
 
     expect(hashPosted).toHaveLength(64);
     expect(hashPending).not.toBe(hashPosted); // Fingerprint strictly changes on status transition!
+
+    // Transition to CANCELLED
+    const hashCancelled = calculateCanonicalFingerprint({
+      ...basePayload,
+      status: 'CANCELLED',
+    });
+    expect(hashCancelled).toHaveLength(64);
+    expect(hashCancelled).not.toBe(hashPending);
+    expect(hashCancelled).not.toBe(hashPosted);
+
+    // Transition to VOIDED
+    const hashVoided = calculateCanonicalFingerprint({
+      ...basePayload,
+      status: 'VOIDED',
+    });
+    expect(hashVoided).toHaveLength(64);
+    expect(hashVoided).not.toBe(hashCancelled);
 
     // Change amount
     const hashAmountChanged = calculateCanonicalFingerprint({
@@ -323,7 +503,30 @@ describe('Domain: Schema Contract Specification', () => {
     expect(fixedBills).toContain('lastGeneratedCompetence');
     expect(fixedBills).toContain('periodicity');
     expect(fixedBills).toContain('paymentMethod');
+    expect(fixedBills).toContain('generateObligation');
     expect(fixedBills).toContain('notes');
+
+    // Fechamentos Mensais new fields
+    expect(closings).toContain('reconciliationStatus');
+    expect(closings).toContain('dataQualityScore');
+    expect(closings).toContain('fixedBillsPaidCount');
+    expect(closings).toContain('fixedBillsPendingCount');
+    expect(closings).toContain('itemsNeedingReviewCount');
+    expect(closings).toContain('closedAt');
+
+    // Investimentos new fields
+    expect(investments).toContain('currency');
+    expect(investments).toContain('liquidity');
+    expect(investments).toContain('valuationSource');
+    expect(investments).toContain('valuationDate');
+    expect(investments).toContain('includeInNetWorth');
+    expect(investments).toContain('institution');
+    expect(investments).toContain('sourceAssetId');
+
+    // Sync Log new fields
+    expect(syncLog).toContain('syncSource');
+    expect(syncLog).toContain('errorsCount');
+    expect(syncLog).toContain('durationMs');
   });
 
   test('CardBill specifies plural payment transactions and additional components without false divergence', () => {
@@ -340,6 +543,26 @@ describe('Domain: Schema Contract Specification', () => {
     const unexplainedProp = cardBillsProps.find((p) => p.domainField === 'unexplainedDiscrepancy');
     expect(unexplainedProp).toBeDefined();
     expect(unexplainedProp?.notionProperty).toBe('Divergência Não Explicada');
+  });
+
+  test('calculateBillDiscrepancy calculates unexplained residual difference exactly', () => {
+    const billAmount = Money.fromDecimal('1500.00');
+    const purchases = Money.fromDecimal('1200.00');
+    const additional = Money.fromDecimal('300.00'); // IOF + installments + charges
+
+    // Fully explained: discrepancy is exactly 0
+    const discrepancyZero = calculateBillDiscrepancy(billAmount, purchases, additional);
+    expect(discrepancyZero.isZero()).toBe(true);
+    expect(discrepancyZero.amountMinor).toBe(0n);
+
+    // Partially explained: 1500 - 1200 - 250 = 50 unexplained
+    const discrepancyUnexplained = calculateBillDiscrepancy(
+      billAmount,
+      purchases,
+      Money.fromDecimal('250.00'),
+    );
+    expect(discrepancyUnexplained.amountMinor).toBe(5000n);
+    expect(discrepancyUnexplained.toDecimalString()).toBe('50.00');
   });
 });
 
@@ -412,6 +635,43 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     const renameMismatch = diffs.find((d) => d.notionProperty === 'Variabilidade');
     expect(renameMismatch?.status).toBe('RENAME_TYPE_MISMATCH');
     expect(renameMismatch?.candidateName).toBe('Variabilidade da Conta');
+  });
+
+  test('enforces precedence: exact name > explicit alias > heuristic suggestion', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_CATEGORIES;
+
+    const actualNotionProps = {
+      // Tier 1: exact name matches 'Nome da Categoria'
+      'Nome da Categoria': { type: 'title' },
+      // Tier 2: explicit alias 'Grupo 50/30/20' takes precedence for 'Grupo Orçamentário'
+      'Grupo 50/30/20': { type: 'select' },
+      'Grupo Orçamentário Velho': { type: 'select' },
+      // Tier 3: fuzzy suggestion for 'Natureza Padrão' (no exact match, no alias match)
+      'Natureza de Operação': { type: 'select' },
+    };
+
+    const diffs = validator.compareProperties(contract, actualNotionProps);
+
+    // Exact match
+    const exact = diffs.find((d) => d.notionProperty === 'Nome da Categoria');
+    expect(exact?.status).toBe('EXACT_MATCH');
+
+    // Explicit alias match takes precedence over any heuristic similarity:
+    const aliasCandidate = diffs.find((d) => d.notionProperty === 'Grupo Orçamentário');
+    expect(aliasCandidate?.status).toBe('RENAME_CANDIDATE');
+    expect(aliasCandidate?.candidateName).toBe('Grupo 50/30/20');
+
+    // Heuristic match is strictly non-authoritative:
+    const heuristic = diffs.find((d) => d.notionProperty === 'Natureza Padrão');
+    expect(heuristic?.status).toBe('HEURISTIC_SUGGESTION');
+    expect(heuristic?.candidateName).toBe('Natureza de Operação');
+    expect(heuristic?.description).toContain('não-autoritativa');
+
+    // Properties not consumed by exact or alias matches are preserved in EXTRA_PRESERVE:
+    const extraNames = diffs.filter((d) => d.status === 'EXTRA_PRESERVE').map((d) => d.notionProperty);
+    expect(extraNames).toContain('Grupo Orçamentário Velho');
+    expect(extraNames).toContain('Natureza de Operação');
   });
 
   test('generates clean markdown manifest without leaking tokens', async () => {
