@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T02:01:52.991Z
+> **Data da Verificação:** 2026-09-11T02:24:38.901Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 
@@ -22,11 +22,13 @@
 | :--- | :--- |
 | Correspondência Exata (EXACT_MATCH) | 0 |
 | Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | 0 |
+| Divergência Estrutural em Nome Exato (STRUCTURAL_MISMATCH) | 0 |
+| Alias com Divergência Estrutural (RENAME_STRUCTURAL_MISMATCH) | 0 |
 | Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
 | Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | 0 |
 | Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | 0 |
 | Propriedades Ausentes em Bases Verificadas (MISSING) | 0 |
-| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 173 |
+| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 178 |
 | Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | 14 |
 | Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | 0 |
 
@@ -47,7 +49,9 @@
 | Propriedade | Tipo Esperado | Tipo no Notion | Status | Autoridade | Descrição / Observação |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `Nome da Conta` | `title` | `—` | ❓ UNVERIFIED | `PIERRE` | Nome identificador da conta |
-| `ID Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | UUID da conta no Pierre Finance |
+| `Fonte` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Sistema ou conector de origem (ex: PIERRE, MANUAL) |
+| `ID da Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Identificador unívoco da conta no sistema de origem |
+| `Moeda` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Código da moeda da conta (ex: BRL, USD) |
 | `Instituição` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Nome do banco / conector (ex: Nubank, Mercado Pago) |
 | `Tipo de Conta` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | CHECKING_ACCOUNT, CREDIT_CARD, SAVINGS |
 | `Saldo Atual` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Saldo disponível em reais |
@@ -70,7 +74,9 @@
 | Propriedade | Tipo Esperado | Tipo no Notion | Status | Autoridade | Descrição / Observação |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `Descrição` | `title` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Descrição tratada da transação |
-| `ID Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | UUID unívoco da transação no Pierre |
+| `Fonte` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Sistema ou conector de origem (ex: PIERRE, MANUAL) |
+| `ID da Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Identificador unívoco da transação no sistema de origem |
+| `Moeda` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Código da moeda da transação (ex: BRL, USD) |
 | `Hash Canônico` | `rich_text` | `—` | ❓ UNVERIFIED | `DERIVADO` | Fingerprint SHA-256 (64 chars) de versão |
 | `Data` | `date` | `—` | ❓ UNVERIFIED | `PIERRE` | Data da transação (ISO-8601) |
 | `Valor` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Valor monetário absoluto (R$) |
@@ -125,7 +131,8 @@
 | `Condição: Valor Máximo` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Teto do valor |
 | `Condição: Dia Mês Início` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia inicial do mês (1 a 31) |
 | `Condição: Dia Mês Fim` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia final do mês (1 a 31) |
-| `Período de Validade` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Vigência temporal da regra |
+| `Válida de` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Início da vigência da regra |
+| `Válida até` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Término da vigência da regra |
 | `Atribuir: Natureza` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Natureza atribuída |
 | `Atribuir: Efeito Orçamento` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | INCOME, EXPENSE, REVERSAL, NEUTRAL |
 | `Atribuir: Alocação` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Finalidade da movimentação |
