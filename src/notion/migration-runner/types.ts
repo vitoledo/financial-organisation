@@ -176,6 +176,23 @@ export interface DryRunReport {
   mutationsExecuted: 0;
 }
 
+export interface RecoveryEligibilityResult {
+  eligible: boolean;
+  recoveryPhase?: 'INITIAL_RECOVERY' | 'RESUME_RECOVERY';
+  frontierStepNumber?: number;
+  frontierStepStatus?: string;
+  reasons: string[];
+  planHashMatch: boolean;
+  originalCommitMatch: boolean;
+  parentCommitMatch: boolean;
+  patchCommitConfirmed: boolean;
+  worktreeClean: boolean;
+  upstreamInSync: boolean;
+  journalStateValid: boolean;
+  liveStateMatchesProjection: boolean;
+  gatesConfigured: boolean;
+}
+
 export interface ApplyReport {
   mode: 'apply';
   timestamp: string;
@@ -186,7 +203,25 @@ export interface ApplyReport {
   plan: CompleteMigrationPlan;
 }
 
-export type MigrationReport = DryRunReport | ApplyReport;
+export interface RecoveryPreflightReport {
+  mode: 'recovery-preflight';
+  timestamp: string;
+  planHash: string;
+  originalCommitSha: string;
+  currentCommitSha: string;
+  parentCommitSha?: string;
+  eligibility: RecoveryEligibilityResult;
+  recoveryPhase: 'INITIAL_RECOVERY' | 'RESUME_RECOVERY';
+  journalStepsCompleted: number;
+  frontierStepNumber: number;
+  frontierStepOperation?: MigrationOperation;
+  frontierStepProperty?: string;
+  frontierStepStatus?: string;
+  preflight: PreflightCheckResult;
+  mutationsExecuted: 0;
+}
+
+export type MigrationReport = DryRunReport | ApplyReport | RecoveryPreflightReport;
 
 export type JournalStepStatus =
   | 'PENDING'

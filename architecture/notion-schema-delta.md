@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T14:28:53.881Z
+> **Data da Verificação:** 2026-09-11T18:41:36.187Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 
@@ -20,14 +20,14 @@
 
 | Status das Propriedades | Quantidade |
 | :--- | :--- |
-| Correspondência Exata (EXACT_MATCH) | 67 |
+| Correspondência Exata (EXACT_MATCH) | 77 |
 | Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | 68 |
-| Divergência Estrutural em Nome Exato (STRUCTURAL_MISMATCH) | 1 |
+| Divergência Estrutural em Nome Exato (STRUCTURAL_MISMATCH) | 0 |
 | Alias com Divergência Estrutural (RENAME_STRUCTURAL_MISMATCH) | 0 |
 | Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
 | Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | 0 |
 | Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | 0 |
-| Propriedades Ausentes em Bases Verificadas (MISSING) | 51 |
+| Propriedades Ausentes em Bases Verificadas (MISSING) | 42 |
 | Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 0 |
 | Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | 23 |
 | Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | 34 |
@@ -49,16 +49,16 @@
 | `Limite contratado` | `number` | `number` | ✅ EXACT_MATCH | `UPSTREAM` | Limite total concedido pelo banco (ex: R$ 2.400) |
 | `Limite personalizado` | `number` | `number` | ✅ EXACT_MATCH | `USUARIO` | Teto operacional ajustado pelo usuário no app (ex: R$ 400) |
 | `Limite disponível` | `number` | `number` | ✅ EXACT_MATCH | `UPSTREAM` | Limite de crédito livre no momento |
+| `Limite Operacional Usado` | `number` | `number` | ✅ EXACT_MATCH | `DERIVADO` | customizedCreditLimit - availableCreditLimit |
+| `Limite Usado da Fonte (Bruto)` | `number` | `number` | ✅ EXACT_MATCH | `UPSTREAM` | Valor bruto reportado pela fonte para auditoria de inconsistência |
+| `Dia de Fechamento` | `number` | `number` | ✅ EXACT_MATCH | `USUARIO` | Dia do mês do corte da fatura |
+| `Dia de Vencimento` | `number` | `number` | ✅ EXACT_MATCH | `USUARIO` | Dia do mês do vencimento da fatura |
 | `Nome da Conta` | `title` | `title` | 🔄 RENAME_CANDIDATE (`Conta`) | `UPSTREAM` | Nome identificador da conta (Mapeado via alias explícito: "Conta" com tipo compatível: title) |
 | `Tipo de Conta` | `select` | `select` | 🔄 RENAME_CANDIDATE (`Tipo`) | `UPSTREAM` | CHECKING_ACCOUNT, CREDIT_CARD, SAVINGS, CASH_WALLET, INVESTMENT_ACCOUNT, OTHER (Mapeado via alias explícito: "Tipo" com tipo compatível: select) |
 | `Saldo Atual` | `number` | `number` | 🔄 RENAME_CANDIDATE (`Saldo`) | `UPSTREAM` | Saldo disponível em reais (Mapeado via alias explícito: "Saldo" com tipo compatível: number) |
 | `Incluir no Caixa` | `checkbox` | `checkbox` | 🔄 RENAME_CANDIDATE (`Inclui no caixa`) | `USUARIO` | Indica se computa para liquidez imediata (Mapeado via alias explícito: "Inclui no caixa" com tipo compatível: checkbox) |
 | `Incluir no Patrimônio` | `checkbox` | `checkbox` | 🔄 RENAME_CANDIDATE (`Inclui no patrimônio`) | `USUARIO` | Indica se computa para o patrimônio total (Mapeado via alias explícito: "Inclui no patrimônio" com tipo compatível: checkbox) |
 | `Última Sincronização` | `date` | `date` | 🔄 RENAME_CANDIDATE (`Atualizado em`) | `DERIVADO` | Timestamp da sincronização (Mapeado via alias explícito: "Atualizado em" com tipo compatível: date) |
-| `Limite Operacional Usado` | `number` | `—` | ⚠️ MISSING | `DERIVADO` | customizedCreditLimit - availableCreditLimit |
-| `Limite Usado da Fonte (Bruto)` | `number` | `—` | ⚠️ MISSING | `UPSTREAM` | Valor bruto reportado pela fonte para auditoria de inconsistência |
-| `Dia de Fechamento` | `number` | `—` | ⚠️ MISSING | `USUARIO` | Dia do mês do corte da fatura |
-| `Dia de Vencimento` | `number` | `—` | ⚠️ MISSING | `USUARIO` | Dia do mês do vencimento da fatura |
 | `Ativa` | `—` | `checkbox` | 🛡️ EXTRA_PRESERVE | `USUARIO` | Propriedade existente no Notion (preservada integralmente) |
 | `Observações` | `—` | `rich_text` | 🛡️ EXTRA_PRESERVE | `USUARIO` | Propriedade existente no Notion (preservada integralmente) |
 
@@ -71,9 +71,14 @@
 | `Fonte` | `select` | `select` | ✅ EXACT_MATCH | `UPSTREAM` | Sistema ou conector de origem (ex: PIERRE, MANUAL, MIGRATION, OTHER) |
 | `ID da fonte` | `rich_text` | `rich_text` | ✅ EXACT_MATCH | `UPSTREAM` | Identificador unívoco da transação no sistema de origem |
 | `Moeda` | `select` | `select` | ✅ EXACT_MATCH | `UPSTREAM` | Código da moeda da transação (ex: BRL, USD) |
+| `Hash Canônico` | `rich_text` | `rich_text` | ✅ EXACT_MATCH | `DERIVADO` | Fingerprint SHA-256 (64 chars) de versão |
 | `Data` | `date` | `date` | ✅ EXACT_MATCH | `UPSTREAM` | Data da transação (ISO-8601) |
 | `Valor` | `number` | `number` | ✅ EXACT_MATCH | `UPSTREAM` | Valor monetário absoluto (R$) |
+| `Valor Bruto da Fonte` | `number` | `number` | ✅ EXACT_MATCH | `UPSTREAM` | Valor exato retornado pelo conector/banco com sinal original |
 | `Movimento` | `select` | `select` | ✅ EXACT_MATCH | `UPSTREAM` | Entrada ou Saída de caixa físico |
+| `Efeito Orçamentário` | `select` | `select` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | INCOME | EXPENSE | REVERSAL | NEUTRAL |
+| `Propósito de Alocação` | `select` | `select` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | INVESTMENT_RESERVE | OPERATIONAL_CASH | etc. |
+| `Contribuição Meta Poupança` | `number` | `number` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | Valor que pontua na meta de poupança (ex: R$ 500 aporte) |
 | `Conta` | `relation` | `relation` | ✅ EXACT_MATCH | `DERIVADO` | Relação com base Contas |
 | `Categoria` | `relation` | `relation` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | Relação com Categorias Financeiras |
 | `Categoria Pierre` | `rich_text` | `rich_text` | ✅ EXACT_MATCH | `UPSTREAM` | Categoria bruta do open-finance |
@@ -81,11 +86,6 @@
 | `Descrição` | `title` | `title` | 🔄 RENAME_CANDIDATE (`Lançamento`) | `REGRA_AUTOMATICA` | Descrição tratada da transação (Mapeado via alias explícito: "Lançamento" com tipo compatível: title) |
 | `Natureza Econômica` | `select` | `select` | 🔄 RENAME_CANDIDATE (`Natureza`) | `REGRA_AUTOMATICA` | Classificação contábil da operação (Mapeado via alias explícito: "Natureza" com tipo compatível: select) |
 | `Status Banco` | `select` | `select` | 🔄 RENAME_CANDIDATE (`Status`) | `UPSTREAM` | Pendente, Confirmado ou Cancelado (Mapeado via alias explícito: "Status" com tipo compatível: select) |
-| `Hash Canônico` | `rich_text` | `—` | ⚠️ MISSING | `DERIVADO` | Fingerprint SHA-256 (64 chars) de versão |
-| `Valor Bruto da Fonte` | `number` | `—` | ⚠️ MISSING | `UPSTREAM` | Valor exato retornado pelo conector/banco com sinal original |
-| `Efeito Orçamentário` | `select` | `—` | ⚠️ MISSING | `REGRA_AUTOMATICA` | INCOME | EXPENSE | REVERSAL | NEUTRAL |
-| `Propósito de Alocação` | `select` | `—` | ⚠️ MISSING | `REGRA_AUTOMATICA` | INVESTMENT_RESERVE | OPERATIONAL_CASH | etc. |
-| `Contribuição Meta Poupança` | `number` | `—` | ⚠️ MISSING | `REGRA_AUTOMATICA` | Valor que pontua na meta de poupança (ex: R$ 500 aporte) |
 | `Conta Destino` | `relation` | `—` | ⚠️ MISSING | `REGRA_AUTOMATICA` | Conta de destino para transferências internas entre contas |
 | `Fatura Vinculada` | `relation` | `—` | ⚠️ MISSING | `DERIVADO` | Relação com 13ª base Faturas / Ciclos |
 | `Status de Revisão` | `select` | `—` | ⚠️ MISSING | `REGRA_AUTOMATICA` | Confirmado Auto, Pendente Revisão, Validado Manualmente, Legado Não Verificado |
@@ -179,7 +179,7 @@
 | `Conta fixa` | `relation` | `relation` | ✅ EXACT_MATCH | `DERIVADO` | Relação com o cadastro permanente |
 | `Referência` | `date` | `date` | ✅ EXACT_MATCH | `DERIVADO` | Data de referência / competência para extração canônica de YYYY-MM |
 | `Valor previsto` | `number` | `number` | ✅ EXACT_MATCH | `DERIVADO` | Valor esperado herdado da conta fixa |
-| `Status` | `select` | `select` | ⚠️ STRUCTURAL_MISMATCH | `REGRA_AUTOMATICA` | Prevista, Paga, Atrasada, Revisão Necessária, Cancelada [Divergência Estrutural: Opções ausentes no Notion (2): "Revisão Necessária", "Cancelada"] |
+| `Status` | `select` | `select` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | Prevista, Paga, Atrasada, Revisão Necessária, Cancelada |
 | `Valor pago` | `number` | `number` | ✅ EXACT_MATCH | `REGRA_AUTOMATICA` | Valor efetivamente liquidado |
 | `Conta` | `relation` | `relation` | ✅ EXACT_MATCH | `USUARIO` | Conta de débito efetiva |
 | `Origem` | `select` | `select` | ✅ EXACT_MATCH | `USUARIO` | Origem do registro da obrigação (Rotina, Manual, Pierre) |

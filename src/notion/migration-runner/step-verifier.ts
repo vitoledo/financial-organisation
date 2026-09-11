@@ -215,8 +215,20 @@ export class StepStructuralVerifier {
           detail: `Relation '${propName}' aponta para data_source_id '${actualTarget || 'ausente'}', esperado '${expectedTarget}'.`,
         };
       }
-      const expectedRelType = payloadEntry.relation?.type;
-      const actualRelType = existingProp.relation?.type || existingProp.relationType;
+      const expectedRelType =
+        payloadEntry.relation?.type ??
+        (payloadEntry.relation?.dual_property
+          ? 'dual_property'
+          : payloadEntry.relation?.single_property !== undefined
+          ? 'single_property'
+          : undefined);
+      const actualRelType =
+        existingProp.relation?.type ||
+        (existingProp.relation?.dual_property
+          ? 'dual_property'
+          : existingProp.relation?.single_property !== undefined
+          ? 'single_property'
+          : existingProp.relationType);
       if (expectedRelType && (!actualRelType || expectedRelType !== actualRelType)) {
         return {
           valid: false,
