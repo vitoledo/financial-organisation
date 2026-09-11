@@ -22,7 +22,10 @@ export class Money {
   }
 
   static fromMinor(amountMinor: bigint | number, currency: string = 'BRL', scale: number = 2): Money {
-    return new Money(BigInt(Math.round(Number(amountMinor))), currency, scale);
+    if (typeof amountMinor === 'bigint') {
+      return new Money(amountMinor, currency, scale);
+    }
+    return new Money(BigInt(Math.trunc(amountMinor)), currency, scale);
   }
 
   static fromCents(cents: bigint | number, currency: string = 'BRL'): Money {
@@ -32,20 +35,17 @@ export class Money {
   static fromDecimal(value: number | string, currency: string = 'BRL', scale: number = 2): Money {
     const scaleFactor = 10n ** BigInt(scale);
 
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) throw new Error(`Invalid non-finite money amount: ${value}`);
-      const minor = Math.round(value * Number(scaleFactor));
-      return new Money(BigInt(minor), currency, scale);
-    }
-
-    const clean = value.trim().replace(',', '.');
-    const [intPart, decPart = ''] = clean.split('.');
+    const str = typeof value === 'number' ? value.toFixed(scale) : value.toString();
+    const clean = str.trim().replace(',', '.');
+    const isNeg = clean.startsWith('-');
+    const unsigned = isNeg ? clean.slice(1) : clean;
+    const [intPart, decPart = ''] = unsigned.split('.');
     const paddedDec = (decPart + '0'.repeat(scale)).slice(0, scale);
-    const sign = clean.startsWith('-') ? -1n : 1n;
-    const absInt = BigInt(intPart.replace('-', '') || '0');
+    const absInt = BigInt(intPart || '0');
     const absDec = scale > 0 ? BigInt(paddedDec) : 0n;
+    const minor = (isNeg ? -1n : 1n) * (absInt * scaleFactor + absDec);
 
-    return new Money(sign * (absInt * scaleFactor + absDec), currency, scale);
+    return new Money(minor, currency, scale);
   }
 
   static zero(currency: string = 'BRL', scale: number = 2): Money {
@@ -74,8 +74,26 @@ export class Money {
     if (typeof factor === 'bigint') {
       return new Money(this.amountMinor * factor, this.currency, this.scale);
     }
-    const result = Math.round(Number(this.amountMinor) * factor);
-    return new Money(BigInt(result), this.currency, this.scale);
+    if (Number.isInteger(factor)) {
+      return new Money(this.amountMinor * BigInt(factor), this.currency, this.scale);
+    }
+    // Rational multiplication without IEEE-754: parse decimal factor
+    const factorStr = factor.toString();
+    const isNeg = factorStr.startsWith('-');
+    const unsigned = isNeg ? factorStr.slice(1) : factorStr;
+    const [fInt, fDec = ''] = unsigned.split('.');
+    const denom = 10n ** BigInt(fDec.length);
+    const num = (isNeg ? -1n : 1n) * (BigInt(fInt || '0') * denom + BigInt(fDec || '0'));
+    return this.multiplyRational(num, denom);
+  }
+
+  multiplyRational(numerator: bigint, denominator: bigint): Money {
+    if (denominator === 0n) throw new Error('Division by zero in multiplyRational');
+    const sign = (this.amountMinor * numerator < 0n) !== (denominator < 0n) ? -1n : 1n;
+    const absProd = this.amountMinor * numerator < 0n ? -(this.amountMinor * numerator) : this.amountMinor * numerator;
+    const absDenom = denominator < 0n ? -denominator : denominator;
+    const roundedAbs = (absProd + (absDenom / 2n)) / absDenom;
+    return new Money(sign * roundedAbs, this.currency, this.scale);
   }
 
   isZero(): boolean {
@@ -141,43 +159,91 @@ export class Money {
 
 /**
  * Value Object for asset quantities requiring arbitrary high precision (e.g. BTC up to 8 decimal places).
+ * Fully exact rational/scaled representation backed by BigInt, eliminating IEEE-754 precision drift.
  */
 export class DecimalQuantity {
-  readonly rawString: string;
+  readonly rawUnits: bigint;
   readonly scale: number;
 
-  constructor(value: string | number, scale: number = 8) {
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) throw new Error(`Invalid asset quantity: ${value}`);
-      this.rawString = value.toFixed(scale);
-    } else {
-      const clean = value.trim().replace(',', '.');
-      this.rawString = clean;
-    }
+  constructor(rawUnits: bigint, scale: number = 8) {
+    this.rawUnits = rawUnits;
     this.scale = scale;
   }
 
   static fromDecimal(value: string | number, scale: number = 8): DecimalQuantity {
-    return new DecimalQuantity(value, scale);
+    const scaleFactor = 10n ** BigInt(scale);
+    const str = typeof value === 'number' ? value.toFixed(scale) : value.toString().trim();
+    const clean = str.replace(',', '.');
+    const isNeg = clean.startsWith('-');
+    const unsigned = isNeg ? clean.slice(1) : clean;
+    const [intPart, decPart = ''] = unsigned.split('.');
+    const paddedDec = (decPart + '0'.repeat(scale)).slice(0, scale);
+    const absInt = BigInt(intPart || '0');
+    const absDec = scale > 0 ? BigInt(paddedDec) : 0n;
+    const rawUnits = (isNeg ? -1n : 1n) * (absInt * scaleFactor + absDec);
+    return new DecimalQuantity(rawUnits, scale);
+  }
+
+  static fromRawUnits(rawUnits: bigint, scale: number = 8): DecimalQuantity {
+    return new DecimalQuantity(rawUnits, scale);
   }
 
   static zero(scale: number = 8): DecimalQuantity {
-    return new DecimalQuantity('0', scale);
+    return new DecimalQuantity(0n, scale);
   }
 
-  toNumber(): number {
-    return parseFloat(this.rawString);
+  add(other: DecimalQuantity): DecimalQuantity {
+    const aligned = this.alignScale(other);
+    return new DecimalQuantity(aligned.a + aligned.b, aligned.scale);
   }
 
-  toCanonicalString(): string {
-    const num = parseFloat(this.rawString);
-    if (isNaN(num)) return '0';
-    const fixed = num.toFixed(this.scale);
-    return fixed.includes('.') ? fixed.replace(/\.?0+$/, '') : fixed;
+  subtract(other: DecimalQuantity): DecimalQuantity {
+    const aligned = this.alignScale(other);
+    return new DecimalQuantity(aligned.a - aligned.b, aligned.scale);
   }
 
   isZero(): boolean {
-    return this.toNumber() === 0;
+    return this.rawUnits === 0n;
+  }
+
+  isPositive(): boolean {
+    return this.rawUnits > 0n;
+  }
+
+  isNegative(): boolean {
+    return this.rawUnits < 0n;
+  }
+
+  equals(other: DecimalQuantity): boolean {
+    const aligned = this.alignScale(other);
+    return aligned.a === aligned.b;
+  }
+
+  toCanonicalString(): string {
+    if (this.scale === 0) return this.rawUnits.toString();
+    const scaleFactor = 10n ** BigInt(this.scale);
+    const isNeg = this.rawUnits < 0n;
+    const absVal = isNeg ? -this.rawUnits : this.rawUnits;
+    const intPart = (absVal / scaleFactor).toString();
+    const decPart = (absVal % scaleFactor).toString().padStart(this.scale, '0');
+    const cleanDec = decPart.replace(/0+$/, '');
+    return `${isNeg ? '-' : ''}${intPart}${cleanDec ? '.' + cleanDec : ''}`;
+  }
+
+  // Serialization / UI display boundary only:
+  toNumber(): number {
+    const scaleFactor = Number(10n ** BigInt(this.scale));
+    return Number(this.rawUnits) / scaleFactor;
+  }
+
+  private alignScale(other: DecimalQuantity): { a: bigint; b: bigint; scale: number } {
+    if (this.scale === other.scale) {
+      return { a: this.rawUnits, b: other.rawUnits, scale: this.scale };
+    }
+    const maxScale = Math.max(this.scale, other.scale);
+    const aFactor = 10n ** BigInt(maxScale - this.scale);
+    const bFactor = 10n ** BigInt(maxScale - other.scale);
+    return { a: this.rawUnits * aFactor, b: other.rawUnits * bFactor, scale: maxScale };
   }
 }
 
@@ -422,8 +488,11 @@ export type InvestmentMovementType =
 
 export interface CostBasisTracker {
   quantity: DecimalQuantity;
-  totalCost: Money;
-  averagePrice: Money;
+  totalCostBasis: Money;     // Custo Base Total acumulado
+  unitAveragePrice: Money;   // Preço Médio Ponderado Unitário (PMP)
+  // Backwards-compatibility aliases:
+  totalCost?: Money;
+  averagePrice?: Money;
 }
 
 export function updateCostBasisOnPurchase(
@@ -432,31 +501,43 @@ export function updateCostBasisOnPurchase(
   unitPrice: Money,
   fees: Money = Money.zero(unitPrice.currency, unitPrice.scale),
 ): CostBasisTracker {
-  const currentQtyNum = current.quantity.toNumber();
-  const purchaseQtyNum = purchaseQuantity.toNumber();
-  const newQtyNum = currentQtyNum + purchaseQtyNum;
+  if (purchaseQuantity.isZero() || purchaseQuantity.isNegative()) {
+    return current;
+  }
 
-  if (newQtyNum <= 0) {
+  // Exact rational arithmetic: purchaseCost in minor units
+  // purchaseQuantity.rawUnits is in 10^purchaseQuantity.scale
+  // unitPrice.amountMinor is in 10^unitPrice.scale
+  const qtyScaleFactor = 10n ** BigInt(purchaseQuantity.scale);
+  const grossCostMinor = (purchaseQuantity.rawUnits * unitPrice.amountMinor + (qtyScaleFactor / 2n)) / qtyScaleFactor;
+  const purchaseCost = new Money(grossCostMinor + fees.amountMinor, unitPrice.currency, unitPrice.scale);
+
+  const prevTotalCost = current.totalCostBasis ?? current.totalCost ?? Money.zero(unitPrice.currency, unitPrice.scale);
+  const newTotalCostBasis = prevTotalCost.add(purchaseCost);
+  const newQuantity = current.quantity.add(purchaseQuantity);
+
+  if (newQuantity.isZero()) {
+    const zeroMoney = Money.zero(unitPrice.currency, unitPrice.scale);
     return {
-      quantity: DecimalQuantity.zero(),
-      totalCost: Money.zero(unitPrice.currency, unitPrice.scale),
-      averagePrice: Money.zero(unitPrice.currency, unitPrice.scale),
+      quantity: DecimalQuantity.zero(newQuantity.scale),
+      totalCostBasis: zeroMoney,
+      unitAveragePrice: zeroMoney,
+      totalCost: zeroMoney,
+      averagePrice: zeroMoney,
     };
   }
 
-  const scaleFactor = 10n ** BigInt(unitPrice.scale);
-  const purchaseCost = Money.fromMinor(
-    BigInt(Math.round(purchaseQtyNum * unitPrice.toDecimal() * Number(scaleFactor))) + fees.amountMinor,
-    unitPrice.currency,
-    unitPrice.scale,
-  );
-  const newTotalCost = current.totalCost.add(purchaseCost);
-  const newAvgPriceDecimal = newTotalCost.toDecimal() / newQtyNum;
+  // Preço Médio Unitário = (newTotalCostBasis.amountMinor * 10^newQuantity.scale + newQuantity.rawUnits / 2) / newQuantity.rawUnits
+  const newQtyScaleFactor = 10n ** BigInt(newQuantity.scale);
+  const unitAvgMinor = (newTotalCostBasis.amountMinor * newQtyScaleFactor + (newQuantity.rawUnits / 2n)) / newQuantity.rawUnits;
+  const newUnitAvgPrice = new Money(unitAvgMinor, unitPrice.currency, unitPrice.scale);
 
   return {
-    quantity: DecimalQuantity.fromDecimal(newQtyNum.toString()),
-    totalCost: newTotalCost,
-    averagePrice: Money.fromDecimal(newAvgPriceDecimal, unitPrice.currency, unitPrice.scale),
+    quantity: newQuantity,
+    totalCostBasis: newTotalCostBasis,
+    unitAveragePrice: newUnitAvgPrice,
+    totalCost: newTotalCostBasis,
+    averagePrice: newUnitAvgPrice,
   };
 }
 
@@ -464,26 +545,62 @@ export function updateCostBasisOnSale(
   current: CostBasisTracker,
   soldQuantity: DecimalQuantity,
 ): CostBasisTracker {
-  const currentQtyNum = current.quantity.toNumber();
-  const soldQtyNum = soldQuantity.toNumber();
-  const remainingQtyNum = Math.max(0, currentQtyNum - soldQtyNum);
+  if (soldQuantity.isZero()) {
+    return current;
+  }
 
-  if (remainingQtyNum <= 0) {
+  const remainingQuantity = current.quantity.subtract(soldQuantity);
+  const currentTotalCost = current.totalCostBasis ?? current.totalCost ?? Money.zero();
+  const currentAvgPrice = current.unitAveragePrice ?? current.averagePrice ?? Money.zero();
+
+  if (remainingQuantity.isZero() || remainingQuantity.isNegative()) {
+    const zeroCost = Money.zero(currentTotalCost.currency, currentTotalCost.scale);
     return {
-      quantity: DecimalQuantity.zero(),
-      totalCost: Money.zero(current.totalCost.currency, current.totalCost.scale),
-      averagePrice: current.averagePrice,
+      quantity: DecimalQuantity.zero(current.quantity.scale),
+      totalCostBasis: zeroCost,
+      unitAveragePrice: currentAvgPrice,
+      totalCost: zeroCost,
+      averagePrice: currentAvgPrice,
     };
   }
 
-  const remainingCost = Money.fromDecimal(
-    remainingQtyNum * current.averagePrice.toDecimal(),
-    current.totalCost.currency,
-    current.totalCost.scale,
-  );
+  // Selling does not alter unit average price; total cost basis reduces proportionally:
+  // remainingCostMinor = (currentTotalCost.amountMinor * remainingQuantity.rawUnits + current.quantity.rawUnits / 2) / current.quantity.rawUnits
+  const remainingCostMinor =
+    (currentTotalCost.amountMinor * remainingQuantity.rawUnits + (current.quantity.rawUnits / 2n)) /
+    current.quantity.rawUnits;
+  const remainingTotalCost = new Money(remainingCostMinor, currentTotalCost.currency, currentTotalCost.scale);
+
   return {
-    quantity: DecimalQuantity.fromDecimal(remainingQtyNum.toString()),
-    totalCost: remainingCost,
-    averagePrice: current.averagePrice,
+    quantity: remainingQuantity,
+    totalCostBasis: remainingTotalCost,
+    unitAveragePrice: currentAvgPrice,
+    totalCost: remainingTotalCost,
+    averagePrice: currentAvgPrice,
   };
+}
+
+/**
+ * Canonical calculation of unrealized P/L:
+ * Unrealized P/L = Current Market Value - Total Cost Basis.
+ * Strictly separates Preço Médio Unitário from Custo Base Total.
+ */
+export function calculateUnrealizedProfitLoss(
+  totalCostBasis: Money,
+  currentMarketValue: Money,
+): Money {
+  return currentMarketValue.subtract(totalCostBasis);
+}
+
+/**
+ * Calculates current market value from quantity and current unit market price using exact rational math.
+ */
+export function calculateMarketValue(
+  quantity: DecimalQuantity,
+  currentUnitPrice: Money,
+): Money {
+  const qtyScaleFactor = 10n ** BigInt(quantity.scale);
+  const marketValueMinor =
+    (quantity.rawUnits * currentUnitPrice.amountMinor + (qtyScaleFactor / 2n)) / qtyScaleFactor;
+  return new Money(marketValueMinor, currentUnitPrice.currency, currentUnitPrice.scale);
 }

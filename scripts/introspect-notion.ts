@@ -20,14 +20,21 @@ async function main() {
   console.log(`✅ Manifesto de Schema-Delta gerado com sucesso em:`);
   console.log(`   ${outputPath}\n`);
 
-  console.log('Resumo dos 12 Data Sources Inspecionados:');
+  console.log(`Resumo dos Data Sources (Canônicos: ${report.totalCanonical}, Esperados Existentes: ${report.expectedExisting}):`);
+  console.log(`  • Bases Verificadas com Sucesso na API: ${report.verifiedCount}/${report.expectedExisting}`);
+  console.log(`  • Bases com ID Configurado no Ambiente: ${report.configuredCount}/${report.expectedExisting}`);
+  console.log(`  • Bases Não Verificadas / Falhas: ${report.failedCount}`);
+  console.log(`  • Base Nova Proposta (a criar externamente): 1\n`);
+
   for (const [key, diff] of Object.entries(report.results)) {
     const icon =
       diff.status === 'CONFIGURED_AND_VERIFIED'
         ? '✅'
         : diff.status === 'PROPOSED_NEW_DATABASE'
           ? '🆕'
-          : '⚠️';
+          : diff.status === 'UNVERIFIED_NO_KEY'
+            ? '❓'
+            : '⚠️';
     console.log(`  ${icon} [${diff.status}] ${diff.title} (${diff.envKey})`);
   }
 

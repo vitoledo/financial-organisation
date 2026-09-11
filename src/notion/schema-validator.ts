@@ -6,8 +6,11 @@ import { TARGET_CONTRACT, DataSourceContract, PropertyContract } from '../domain
 export type PropertyStatus =
   | 'EXACT_MATCH'
   | 'RENAME_CANDIDATE'
+  | 'RENAME_TYPE_MISMATCH'
   | 'TYPE_MISMATCH'
   | 'MISSING'
+  | 'UNVERIFIED'
+  | 'PROPOSED_TO_CREATE'
   | 'EXTRA_PRESERVE';
 
 export interface PropertyDiff {
@@ -20,12 +23,19 @@ export interface PropertyDiff {
   candidateName?: string;
 }
 
+export type DataSourceStatus =
+  | 'CONFIGURED_AND_VERIFIED'
+  | 'MISSING_ENV_ID'
+  | 'UNVERIFIED_NO_KEY'
+  | 'API_ERROR'
+  | 'PROPOSED_NEW_DATABASE';
+
 export interface DataSourceDiff {
   envKey: string;
   title: string;
   dataSourceId?: string;
   isExisting: boolean;
-  status: 'CONFIGURED_AND_VERIFIED' | 'MISSING_ENV_ID' | 'API_ERROR' | 'PROPOSED_NEW_DATABASE';
+  status: DataSourceStatus;
   properties: PropertyDiff[];
   errorMessage?: string;
 }
@@ -33,9 +43,11 @@ export interface DataSourceDiff {
 export interface IntrospectionReport {
   timestampIso: string;
   notionApiVersion: string;
-  totalDataSources: number;
-  existingInspected: number;
-  configuredCount: number;
+  totalCanonical: number;      // 13
+  expectedExisting: number;    // 12
+  configuredCount: number;     // Number of existing bases with env var configured
+  verifiedCount: number;       // ONLY Data Sources actually retrieved with success from Notion API
+  failedCount: number;         // Existing bases that failed API or were missing token/env
   results: Record<string, DataSourceDiff>;
 }
 
@@ -63,14 +75,16 @@ export class NotionSchemaValidator {
     const report: IntrospectionReport = {
       timestampIso: new Date().toISOString(),
       notionApiVersion: this.notionVersion,
-      totalDataSources: Object.keys(TARGET_CONTRACT).length,
-      existingInspected: 0,
+      totalCanonical: Object.keys(TARGET_CONTRACT).length,
+      expectedExisting: Object.values(TARGET_CONTRACT).filter((c) => c.isExisting).length,
       configuredCount: 0,
+      verifiedCount: 0,
+      failedCount: 0,
       results: {},
     };
 
     for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
-      // If it's the 13th database, generate proposed schema without querying Notion!
+      // 13th database (Faturas / Ciclos) - proposed schema, never queried
       if (!contract.isExisting) {
         report.results[key] = {
           envKey: contract.envKey,
@@ -80,7 +94,7 @@ export class NotionSchemaValidator {
           properties: contract.properties.map((p) => ({
             notionProperty: p.notionProperty,
             expectedType: p.notionType,
-            status: 'MISSING', // Must be created in Notion externally
+            status: 'PROPOSED_TO_CREATE',
             authority: p.authority,
             description: p.description,
           })),
@@ -88,10 +102,10 @@ export class NotionSchemaValidator {
         continue;
       }
 
-      report.existingInspected++;
       const dsId = envVars[contract.envKey]?.trim();
 
       if (!dsId) {
+        report.failedCount++;
         report.results[key] = {
           envKey: contract.envKey,
           title: contract.defaultTitle,
@@ -100,7 +114,7 @@ export class NotionSchemaValidator {
           properties: contract.properties.map((p) => ({
             notionProperty: p.notionProperty,
             expectedType: p.notionType,
-            status: 'MISSING',
+            status: 'UNVERIFIED',
             authority: p.authority,
             description: p.description,
           })),
@@ -111,22 +125,23 @@ export class NotionSchemaValidator {
 
       report.configuredCount++;
 
-      // If no API key or client is available, report as unverified
+      // If no API key or client is available, report as UNVERIFIED_NO_KEY
       if (!this.client) {
+        report.failedCount++;
         report.results[key] = {
           envKey: contract.envKey,
           title: contract.defaultTitle,
           dataSourceId: maskId(dsId),
           isExisting: true,
-          status: 'API_ERROR',
+          status: 'UNVERIFIED_NO_KEY',
           properties: contract.properties.map((p) => ({
             notionProperty: p.notionProperty,
             expectedType: p.notionType,
-            status: 'MISSING',
+            status: 'UNVERIFIED',
             authority: p.authority,
             description: p.description,
           })),
-          errorMessage: 'NOTION_API_KEY ausente. Introspecção remota não executada.',
+          errorMessage: 'NOTION_API_KEY ausente no ambiente. Introspecção remota na API não executada.',
         };
         continue;
       }
@@ -136,6 +151,7 @@ export class NotionSchemaValidator {
         const actualProperties = await this.fetchDataSourceProperties(dsId);
         const diff = this.compareProperties(contract, actualProperties);
 
+        report.verifiedCount++;
         report.results[key] = {
           envKey: contract.envKey,
           title: contract.defaultTitle,
@@ -145,6 +161,7 @@ export class NotionSchemaValidator {
           properties: diff,
         };
       } catch (err) {
+        report.failedCount++;
         const errMsg = err instanceof Error ? err.message : String(err);
         report.results[key] = {
           envKey: contract.envKey,
@@ -155,7 +172,7 @@ export class NotionSchemaValidator {
           properties: contract.properties.map((p) => ({
             notionProperty: p.notionProperty,
             expectedType: p.notionType,
-            status: 'MISSING',
+            status: 'UNVERIFIED',
             authority: p.authority,
             description: p.description,
           })),
@@ -213,7 +230,7 @@ export class NotionSchemaValidator {
       }
     }
 
-    // 2. Pass 2: Rename candidates for unmatched expected properties
+    // 2. Pass 2: Rename candidates with type compatibility check
     for (const expected of unmatchedExpected) {
       let bestMatchKey: string | undefined;
       let bestSimilarity = 0;
@@ -231,15 +248,29 @@ export class NotionSchemaValidator {
       if (bestMatchKey) {
         consumedActualKeys.add(bestMatchKey);
         const actualType = actual[bestMatchKey].type;
-        diffs.push({
-          notionProperty: expected.notionProperty,
-          expectedType: expected.notionType,
-          actualType,
-          status: 'RENAME_CANDIDATE',
-          candidateName: bestMatchKey,
-          authority: expected.authority,
-          description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}")`,
-        });
+        const isTypeCompatible = actualType === expected.notionType;
+
+        if (isTypeCompatible) {
+          diffs.push({
+            notionProperty: expected.notionProperty,
+            expectedType: expected.notionType,
+            actualType,
+            status: 'RENAME_CANDIDATE',
+            candidateName: bestMatchKey,
+            authority: expected.authority,
+            description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}" com tipo compatível: ${actualType})`,
+          });
+        } else {
+          diffs.push({
+            notionProperty: expected.notionProperty,
+            expectedType: expected.notionType,
+            actualType,
+            status: 'RENAME_TYPE_MISMATCH',
+            candidateName: bestMatchKey,
+            authority: expected.authority,
+            description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}", porém com tipo incompatível: esperado "${expected.notionType}", encontrado "${actualType}")`,
+          });
+        }
       } else {
         diffs.push({
           notionProperty: expected.notionProperty,
@@ -280,46 +311,62 @@ export class NotionSchemaValidator {
     lines.push('> **Status:** Relatório Técnico de Introspecção e Conformidade de Schema');
     lines.push(`> **Data da Verificação:** ${report.timestampIso}`);
     lines.push(`> **Notion API Version:** \`${report.notionApiVersion}\``);
-    lines.push(`> **Data Sources Monitorados:** 12 existentes + 1 base proposta (Faturas / Ciclos)`);
+    lines.push(`> **Data Sources Canônicos:** ${report.totalCanonical} (${report.expectedExisting} esperados existentes + 1 base proposta)`);
     lines.push('');
     lines.push('---');
     lines.push('');
     lines.push('## 1. Resumo Executivo da Verificação');
     lines.push('');
-    lines.push('| Métrica | Valor |');
+    lines.push('| Métrica de Data Sources | Valor |');
     lines.push('| :--- | :--- |');
-    lines.push(`| Total de Data Sources Canônicos | ${report.totalDataSources} |`);
-    lines.push(`| Bases Existentes Inspecionadas | ${report.existingInspected} |`);
-    lines.push(`| Bases com ID Configurado no Ambiente | ${report.configuredCount} |`);
+    lines.push(`| Total de Data Sources Canônicos | ${report.totalCanonical} |`);
+    lines.push(`| Bases Existentes Esperadas | ${report.expectedExisting} |`);
+    lines.push(`| Bases Configuradas no Ambiente | ${report.configuredCount} |`);
+    lines.push(`| Bases Verificadas com Sucesso na API | ${report.verifiedCount} |`);
+    lines.push(`| Bases com Falha / Não Verificadas | ${report.failedCount} |`);
+    lines.push(`| Base Proposta (a criar externamente) | 1 |`);
+    lines.push('');
 
     const allProps = Object.values(report.results).flatMap((r) => r.properties);
     const totalExact = allProps.filter((p) => p.status === 'EXACT_MATCH').length;
     const totalRename = allProps.filter((p) => p.status === 'RENAME_CANDIDATE').length;
+    const totalRenameMismatch = allProps.filter((p) => p.status === 'RENAME_TYPE_MISMATCH').length;
     const totalTypeMismatch = allProps.filter((p) => p.status === 'TYPE_MISMATCH').length;
     const totalMissing = allProps.filter((p) => p.status === 'MISSING').length;
+    const totalUnverified = allProps.filter((p) => p.status === 'UNVERIFIED').length;
+    const totalProposed = allProps.filter((p) => p.status === 'PROPOSED_TO_CREATE').length;
     const totalExtra = allProps.filter((p) => p.status === 'EXTRA_PRESERVE').length;
 
-    lines.push(`| Propriedades com Correspondência Exata (EXACT_MATCH) | ${totalExact} |`);
-    lines.push(`| Candidatos a Renomeação (RENAME_CANDIDATE) | ${totalRename} |`);
-    lines.push(`| Divergências de Tipo (TYPE_MISMATCH) | ${totalTypeMismatch} |`);
-    lines.push(`| Propriedades Ausentes no Notion (MISSING) | ${totalMissing} |`);
+    lines.push('| Status das Propriedades | Quantidade |');
+    lines.push('| :--- | :--- |');
+    lines.push(`| Correspondência Exata (EXACT_MATCH) | ${totalExact} |`);
+    lines.push(`| Candidatos a Renomeação Compatíveis (RENAME_CANDIDATE) | ${totalRename} |`);
+    lines.push(`| Candidatos com Tipo Divergente (RENAME_TYPE_MISMATCH) | ${totalRenameMismatch} |`);
+    lines.push(`| Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | ${totalTypeMismatch} |`);
+    lines.push(`| Propriedades Ausentes em Bases Verificadas (MISSING) | ${totalMissing} |`);
+    lines.push(`| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | ${totalUnverified} |`);
+    lines.push(`| Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | ${totalProposed} |`);
     lines.push(`| Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | ${totalExtra} |`);
     lines.push('');
 
     // Check environment status
     const missingEnv = Object.values(report.results).filter((r) => r.status === 'MISSING_ENV_ID');
+    const noKey = Object.values(report.results).filter((r) => r.status === 'UNVERIFIED_NO_KEY');
     const apiErrors = Object.values(report.results).filter((r) => r.status === 'API_ERROR');
 
-    if (missingEnv.length > 0 || apiErrors.length > 0) {
+    if (missingEnv.length > 0 || noKey.length > 0 || apiErrors.length > 0) {
       lines.push('> [!IMPORTANT]');
-      lines.push('> **Atenção sobre Credenciais do Notion:**');
+      lines.push('> **Atenção sobre Introspecção e Credenciais:**');
       if (missingEnv.length > 0) {
         lines.push(`> Existem **${missingEnv.length}** variáveis \`NOTION_DS_*\` pendentes de preenchimento no arquivo \`.env\`.`);
       }
-      if (apiErrors.length > 0) {
-        lines.push(`> ${apiErrors[0].errorMessage}`);
+      if (noKey.length > 0) {
+        lines.push(`> A variável \`NOTION_API_KEY\` não foi encontrada no ambiente. As ${noKey.length} bases configuradas foram marcadas como \`UNVERIFIED_NO_KEY\` e suas propriedades como \`UNVERIFIED\`.`);
       }
-      lines.push('> Para executar a introspecção remota ao vivo contra sua conta, preencha as variáveis em `.env` e rode `pnpm notion:check-schema`.');
+      if (apiErrors.length > 0) {
+        lines.push(`> Ocorreram erros na API em **${apiErrors.length}** bases: ${apiErrors[0].errorMessage}`);
+      }
+      lines.push('> Para executar a introspecção remota ao vivo contra o Notion, defina `NOTION_API_KEY` em `.env` e rode `pnpm notion:check-schema`.');
       lines.push('');
     }
 
@@ -347,11 +394,20 @@ export class NotionSchemaValidator {
           case 'RENAME_CANDIDATE':
             statusBadge = `🔄 RENAME_CANDIDATE (\`${p.candidateName}\`)`;
             break;
+          case 'RENAME_TYPE_MISMATCH':
+            statusBadge = `🔄❌ RENAME_TYPE_MISMATCH (\`${p.candidateName}\`)`;
+            break;
           case 'TYPE_MISMATCH':
             statusBadge = `❌ TYPE_MISMATCH (esperado: ${p.expectedType}, no Notion: ${p.actualType})`;
             break;
           case 'MISSING':
             statusBadge = '⚠️ MISSING';
+            break;
+          case 'UNVERIFIED':
+            statusBadge = '❓ UNVERIFIED';
+            break;
+          case 'PROPOSED_TO_CREATE':
+            statusBadge = '🆕 PROPOSED_TO_CREATE';
             break;
           case 'EXTRA_PRESERVE':
             statusBadge = '🛡️ EXTRA_PRESERVE';

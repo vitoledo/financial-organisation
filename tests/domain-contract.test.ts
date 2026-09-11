@@ -7,11 +7,15 @@ import {
   calculateCanonicalFingerprint,
   calculateSensitiveHmac,
   EncryptionService,
+  updateCostBasisOnPurchase,
+  updateCostBasisOnSale,
+  calculateUnrealizedProfitLoss,
+  calculateMarketValue,
 } from '../src/domain/types';
 import { TARGET_CONTRACT } from '../src/domain/schema-contract';
 import { NotionSchemaValidator } from '../src/notion/schema-validator';
 
-describe('Domain: Money (BigInt Minor Units)', () => {
+describe('Domain: Money (BigInt Minor Units & Exact Rational Math)', () => {
   test('creates Money from cents correctly', () => {
     const m = Money.fromCents(1500n);
     expect(m.amountMinor).toBe(1500n);
@@ -35,7 +39,7 @@ describe('Domain: Money (BigInt Minor Units)', () => {
     expect(m3.toFormattedBR()).toBe('-R$ 15,00');
   });
 
-  test('arithmetic operations preserve exact precision', () => {
+  test('arithmetic operations preserve exact precision without IEEE-754 drift', () => {
     const a = Money.fromDecimal('0.10');
     const b = Money.fromDecimal('0.20');
     const sum = a.add(b);
@@ -67,13 +71,22 @@ describe('Domain: Money (BigInt Minor Units)', () => {
     expect(doubled.amountMinor).toBe(9998n);
     expect(doubled.toDecimalString()).toBe('99.98');
   });
+
+  test('supports exact rational multiplication without float drift', () => {
+    const m = Money.fromDecimal('100.00');
+    const rationalHalf = m.multiplyRational(1n, 2n);
+    expect(rationalHalf.toDecimalString()).toBe('50.00');
+
+    const decimalFactor = m.multiply(0.333333);
+    expect(decimalFactor.amountMinor).toBe(3333n);
+  });
 });
 
-describe('Domain: DecimalQuantity (Asset Fractions e.g. BTC)', () => {
-  test('preserves high decimal precision up to 8 places', () => {
+describe('Domain: DecimalQuantity (Asset Fractions e.g. BTC via Scaled BigInt)', () => {
+  test('preserves high decimal precision up to 8 places backed by BigInt', () => {
     const btc = DecimalQuantity.fromDecimal('0.00034500', 8);
     expect(btc.scale).toBe(8);
-    expect(btc.toNumber()).toBe(0.000345);
+    expect(btc.rawUnits).toBe(34500n);
     expect(btc.toCanonicalString()).toBe('0.000345');
   });
 
@@ -81,6 +94,75 @@ describe('Domain: DecimalQuantity (Asset Fractions e.g. BTC)', () => {
     const zero = DecimalQuantity.zero();
     expect(zero.isZero()).toBe(true);
     expect(zero.toCanonicalString()).toBe('0');
+  });
+
+  test('performs exact addition and subtraction without IEEE-754 precision loss', () => {
+    const q1 = DecimalQuantity.fromDecimal('0.00000001', 8);
+    const q2 = DecimalQuantity.fromDecimal('0.00000002', 8);
+    const sum = q1.add(q2);
+    expect(sum.rawUnits).toBe(3n);
+    expect(sum.toCanonicalString()).toBe('0.00000003');
+
+    const diff = sum.subtract(q1);
+    expect(diff.rawUnits).toBe(2n);
+    expect(diff.toCanonicalString()).toBe('0.00000002');
+  });
+});
+
+describe('Domain: Investment Cost Basis & Unrealized P/L', () => {
+  test('updates weighted average price (PMP) and total cost basis on purchases with pure BigInt rational math', () => {
+    let position = {
+      quantity: DecimalQuantity.zero(8),
+      totalCostBasis: Money.zero('BRL', 2),
+      unitAveragePrice: Money.zero('BRL', 2),
+    };
+
+    // Purchase 1: 10 units at R$ 20,00 each
+    position = updateCostBasisOnPurchase(
+      position,
+      DecimalQuantity.fromDecimal('10', 8),
+      Money.fromDecimal('20.00', 'BRL', 2),
+    );
+    expect(position.quantity.toCanonicalString()).toBe('10');
+    expect(position.totalCostBasis.toDecimalString()).toBe('200.00');
+    expect(position.unitAveragePrice.toDecimalString()).toBe('20.00');
+
+    // Purchase 2: 10 units at R$ 30,00 each
+    position = updateCostBasisOnPurchase(
+      position,
+      DecimalQuantity.fromDecimal('10', 8),
+      Money.fromDecimal('30.00', 'BRL', 2),
+    );
+    expect(position.quantity.toCanonicalString()).toBe('20');
+    expect(position.totalCostBasis.toDecimalString()).toBe('500.00');
+    expect(position.unitAveragePrice.toDecimalString()).toBe('25.00');
+  });
+
+  test('reduces total cost basis proportionally on sale while preserving unit average price', () => {
+    let position = {
+      quantity: DecimalQuantity.fromDecimal('20', 8),
+      totalCostBasis: Money.fromDecimal('500.00', 'BRL', 2),
+      unitAveragePrice: Money.fromDecimal('25.00', 'BRL', 2),
+    };
+
+    // Sell 5 units
+    position = updateCostBasisOnSale(position, DecimalQuantity.fromDecimal('5', 8));
+    expect(position.quantity.toCanonicalString()).toBe('15');
+    expect(position.totalCostBasis.toDecimalString()).toBe('375.00');
+    expect(position.unitAveragePrice.toDecimalString()).toBe('25.00'); // PMP unchanged on sale!
+  });
+
+  test('calculates unrealized P/L strictly as Current Market Value - Total Cost Basis', () => {
+    const totalCostBasis = Money.fromDecimal('375.00', 'BRL', 2);
+    const quantity = DecimalQuantity.fromDecimal('15', 8);
+    const currentPrice = Money.fromDecimal('35.00', 'BRL', 2);
+
+    const marketValue = calculateMarketValue(quantity, currentPrice);
+    expect(marketValue.toDecimalString()).toBe('525.00'); // 15 * 35 = 525
+
+    const pnl = calculateUnrealizedProfitLoss(totalCostBasis, marketValue);
+    expect(pnl.toDecimalString()).toBe('150.00'); // 525 - 375 = +150
+    expect(pnl.isPositive()).toBe(true);
   });
 });
 
@@ -213,12 +295,23 @@ describe('Domain: Schema Contract Specification', () => {
   test('preserves useful historical fields in Fechamentos Mensais, Log de Sincronização and Contas Fixas', () => {
     const closings = TARGET_CONTRACT.NOTION_DS_MONTHLY_CLOSINGS.properties.map((p) => p.domainField);
     expect(closings).toContain('initialNetWorth');
+    expect(closings).toContain('operatingSurplus');
+    expect(closings).toContain('savingsAndInvestments');
     expect(closings).toContain('essentialExpenses');
     expect(closings).toContain('discretionaryExpenses');
     expect(closings).toContain('investmentYield');
     expect(closings).toContain('netWorthChange');
 
+    const investments = TARGET_CONTRACT.NOTION_DS_INVESTMENTS.properties.map((p) => p.domainField);
+    expect(investments).toContain('unitAveragePrice');
+    expect(investments).toContain('totalCostBasis');
+    expect(investments).toContain('unrealizedProfitLoss');
+
     const syncLog = TARGET_CONTRACT.NOTION_DS_SYNC_LOG.properties.map((p) => p.domainField);
+    expect(syncLog).toContain('runId');
+    expect(syncLog).toContain('errorCode');
+    expect(syncLog).toContain('sanitizedErrorMessage');
+    expect(syncLog).toContain('privateLogRef');
     expect(syncLog).toContain('startedAt');
     expect(syncLog).toContain('endedAt');
     expect(syncLog).toContain('installmentsReceived');
@@ -251,30 +344,35 @@ describe('Domain: Schema Contract Specification', () => {
 });
 
 describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
-  test('handles missing environment IDs gracefully without throwing', async () => {
+  test('handles missing environment IDs gracefully and reports UNVERIFIED (never MISSING)', async () => {
     const validator = new NotionSchemaValidator(); // Offline mode
     const report = await validator.runIntrospection({});
 
-    expect(report.totalDataSources).toBe(13);
-    expect(report.existingInspected).toBe(12);
+    expect(report.totalCanonical).toBe(13);
+    expect(report.expectedExisting).toBe(12);
     expect(report.configuredCount).toBe(0);
+    expect(report.verifiedCount).toBe(0);
+    expect(report.failedCount).toBe(12);
 
-    // NOTION_DS_CARD_BILLS is marked as PROPOSED_NEW_DATABASE
+    // NOTION_DS_CARD_BILLS is marked as PROPOSED_NEW_DATABASE with PROPOSED_TO_CREATE properties
     expect(report.results.NOTION_DS_CARD_BILLS.status).toBe('PROPOSED_NEW_DATABASE');
+    expect(report.results.NOTION_DS_CARD_BILLS.properties[0].status).toBe('PROPOSED_TO_CREATE');
 
-    // Existing ones are marked as MISSING_ENV_ID
+    // Existing ones are marked as MISSING_ENV_ID with UNVERIFIED properties (never MISSING)
     expect(report.results.NOTION_DS_ACCOUNTS.status).toBe('MISSING_ENV_ID');
+    expect(report.results.NOTION_DS_ACCOUNTS.properties[0].status).toBe('UNVERIFIED');
     expect(report.results.NOTION_DS_TRANSACTIONS.status).toBe('MISSING_ENV_ID');
+    expect(report.results.NOTION_DS_TRANSACTIONS.properties[0].status).toBe('UNVERIFIED');
   });
 
-  test('classifies properties into EXACT_MATCH, RENAME_CANDIDATE, TYPE_MISMATCH, MISSING, EXTRA_PRESERVE', () => {
+  test('classifies properties into EXACT_MATCH, RENAME_CANDIDATE, RENAME_TYPE_MISMATCH, TYPE_MISMATCH, MISSING, EXTRA_PRESERVE', () => {
     const validator = new NotionSchemaValidator();
-    const contract = TARGET_CONTRACT.NOTION_DS_CATEGORIES; // expected: Nome da Categoria (title), Grupo 50/30/20 (select), Variabilidade (select), Natureza Padrão (select)
+    const contract = TARGET_CONTRACT.NOTION_DS_CATEGORIES; // expected: Nome da Categoria (title), Grupo Orçamentário (select), Variabilidade (select), Natureza Padrão (select)
 
     const actualNotionProps = {
       'Nome da Categoria': { type: 'title' },           // EXACT_MATCH
-      'Grupo 50/30/20': { type: 'multi_select' },       // TYPE_MISMATCH (expected select)
-      'Variabilidade da Despesa': { type: 'select' },   // RENAME_CANDIDATE (for Variabilidade)
+      'Grupo Orçamentário': { type: 'multi_select' },   // TYPE_MISMATCH (expected select)
+      'Variabilidade da Despesa': { type: 'select' },   // RENAME_CANDIDATE (for Variabilidade, same type)
       // Natureza Padrão is missing                     // MISSING
       'Cor da Tag': { type: 'select' },                 // EXTRA_PRESERVE
     };
@@ -284,7 +382,7 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     const exact = diffs.find((d) => d.notionProperty === 'Nome da Categoria');
     expect(exact?.status).toBe('EXACT_MATCH');
 
-    const typeMismatch = diffs.find((d) => d.notionProperty === 'Grupo 50/30/20');
+    const typeMismatch = diffs.find((d) => d.notionProperty === 'Grupo Orçamentário');
     expect(typeMismatch?.status).toBe('TYPE_MISMATCH');
 
     const renameCandidate = diffs.find((d) => d.notionProperty === 'Variabilidade');
@@ -297,6 +395,23 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     const extra = diffs.find((d) => d.notionProperty === 'Cor da Tag');
     expect(extra?.status).toBe('EXTRA_PRESERVE');
     expect(extra?.authority).toBe('USUARIO');
+  });
+
+  test('distinguishes RENAME_TYPE_MISMATCH when candidate exists but type is incompatible', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_CATEGORIES;
+
+    const actualNotionProps = {
+      'Nome da Categoria': { type: 'title' },
+      'Grupo Orçamentário': { type: 'select' },
+      // Variabilidade expected select, but Notion has rich_text
+      'Variabilidade da Conta': { type: 'rich_text' },
+    };
+
+    const diffs = validator.compareProperties(contract, actualNotionProps);
+    const renameMismatch = diffs.find((d) => d.notionProperty === 'Variabilidade');
+    expect(renameMismatch?.status).toBe('RENAME_TYPE_MISMATCH');
+    expect(renameMismatch?.candidateName).toBe('Variabilidade da Conta');
   });
 
   test('generates clean markdown manifest without leaking tokens', async () => {
