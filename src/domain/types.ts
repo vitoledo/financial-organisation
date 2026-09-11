@@ -10,6 +10,43 @@ import crypto from 'crypto';
  * Defaults to BRL with scale 2 (centavos: R$ 15,00 = 1500n).
  * Can represent any currency/scale (e.g. JPY with scale 0, BHD with scale 3).
  */
+const VALID_DECIMAL_STRING_REGEX = /^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)$/;
+
+function parseValidatedDecimalString(
+  value: string,
+  typeName: string,
+  scale: number,
+): { isNeg: boolean; absInt: bigint; decPart: string } {
+  if (typeof value !== 'string') {
+    throw new TypeError(
+      `${typeName}.fromDecimal requires an exact string representation to avoid IEEE-754 precision loss (received ${typeof value}: ${value}). For boundary float numbers, use ${typeName}.fromDecimalBoundary(number).`,
+    );
+  }
+  if (!Number.isInteger(scale) || scale < 0 || scale > 20) {
+    throw new Error(`Invalid scale: ${scale}. Scale must be an integer between 0 and 20.`);
+  }
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    throw new Error(`Invalid decimal string: empty string.`);
+  }
+  if (!VALID_DECIMAL_STRING_REGEX.test(trimmed)) {
+    throw new Error(`Invalid decimal string: "${value}". Must be a valid numeric decimal representation.`);
+  }
+
+  const clean = trimmed.replace(',', '.');
+  const isNeg = clean.startsWith('-');
+  const unsigned = clean.startsWith('-') || clean.startsWith('+') ? clean.slice(1) : clean;
+  const parts = unsigned.split('.');
+  if (parts.length > 2) {
+    throw new Error(`Invalid decimal string with multiple decimal points: "${value}"`);
+  }
+  const [intPartRaw = '', decPart = ''] = parts;
+  const intPart = intPartRaw === '' ? '0' : intPartRaw;
+  const absInt = BigInt(intPart);
+
+  return { isNeg, absInt, decPart };
+}
+
 export class Money {
   readonly amountMinor: bigint;
   readonly currency: string;
@@ -22,6 +59,12 @@ export class Money {
   }
 
   static fromMinor(amountMinor: bigint | number, currency: string = 'BRL', scale: number = 2): Money {
+    if (typeof currency !== 'string' || currency.trim() === '') {
+      throw new Error('Invalid currency: currency must be a non-empty string.');
+    }
+    if (!Number.isInteger(scale) || scale < 0 || scale > 20) {
+      throw new Error(`Invalid scale: ${scale}. Scale must be an integer between 0 and 20.`);
+    }
     if (typeof amountMinor === 'number') {
       if (!Number.isSafeInteger(amountMinor)) {
         throw new Error(
@@ -41,18 +84,13 @@ export class Money {
    * Canonical creation of Money from an exact decimal string representation (e.g. "1250.50" or "1.005").
    * Strictly requires string to prevent IEEE-754 floating point distortion.
    * Performs exact half-up rounding if decimal places exceed target scale.
+   * Validates scale and rejects invalid numeric strings (e.g. "1.2.3", empty string, non-numeric).
    */
   static fromDecimal(value: string, currency: string = 'BRL', scale: number = 2): Money {
-    if (typeof value !== 'string') {
-      throw new TypeError(
-        `Money.fromDecimal requires an exact string representation to avoid IEEE-754 precision loss (received ${typeof value}: ${value}). For boundary float numbers, use Money.fromDecimalBoundary(number).`,
-      );
+    if (typeof currency !== 'string' || currency.trim() === '') {
+      throw new Error('Invalid currency: currency must be a non-empty string.');
     }
-    const clean = value.trim().replace(',', '.');
-    const isNeg = clean.startsWith('-');
-    const unsigned = isNeg ? clean.slice(1) : clean;
-    const [intPart = '0', decPart = ''] = unsigned.split('.');
-    const absInt = BigInt(intPart || '0');
+    const { isNeg, absInt, decPart } = parseValidatedDecimalString(value, 'Money', scale);
     const targetScaleFactor = 10n ** BigInt(scale);
 
     let absDecMinor = 0n;
@@ -62,8 +100,6 @@ export class Money {
         absDecMinor = BigInt(paddedDec);
       } else {
         // More decimal places than target scale: exact half-up rounding in BigInt!
-        // E.g. '1.005' with scale 2: decPart is '005' (len 3).
-        // decVal = 5n, divisor = 10n, (5n + 5n) / 10n = 1n -> 101n (1.01).
         const decVal = BigInt(decPart);
         const excessScale = BigInt(decPart.length - scale);
         const divisor = 10n ** excessScale;
@@ -214,18 +250,10 @@ export class DecimalQuantity {
    * Canonical creation of DecimalQuantity from exact string representation.
    * Strictly requires string to prevent IEEE-754 precision loss.
    * Performs exact half-up rounding if decimal places exceed target scale.
+   * Validates scale and rejects invalid numeric strings (e.g. "1.2.3", empty string, non-numeric).
    */
   static fromDecimal(value: string, scale: number = 8): DecimalQuantity {
-    if (typeof value !== 'string') {
-      throw new TypeError(
-        `DecimalQuantity.fromDecimal requires an exact string representation to avoid IEEE-754 precision loss (received ${typeof value}: ${value}). For boundary float numbers, use DecimalQuantity.fromDecimalBoundary(number).`,
-      );
-    }
-    const clean = value.trim().replace(',', '.');
-    const isNeg = clean.startsWith('-');
-    const unsigned = isNeg ? clean.slice(1) : clean;
-    const [intPart = '0', decPart = ''] = unsigned.split('.');
-    const absInt = BigInt(intPart || '0');
+    const { isNeg, absInt, decPart } = parseValidatedDecimalString(value, 'DecimalQuantity', scale);
     const targetScaleFactor = 10n ** BigInt(scale);
 
     let absDecUnits = 0n;
@@ -255,6 +283,9 @@ export class DecimalQuantity {
   }
 
   static fromRawUnits(rawUnits: bigint, scale: number = 8): DecimalQuantity {
+    if (!Number.isInteger(scale) || scale < 0 || scale > 20) {
+      throw new Error(`Invalid scale: ${scale}. Scale must be an integer between 0 and 20.`);
+    }
     return new DecimalQuantity(rawUnits, scale);
   }
 
@@ -326,7 +357,7 @@ export class DecimalQuantity {
  * The TRUE unique key in storage: UNIQUE(source, source_account_id, source_transaction_id).
  */
 export interface TransactionIdempotencyKey {
-  source: 'PIERRE' | 'MANUAL';
+  source: string;
   sourceAccountId: string;
   sourceTransactionId: string;
 }
@@ -512,6 +543,61 @@ export type CycleType =
   | 'CICLO_REAL_BANCO'
   | 'CICLO_CONFIGURADO'
   | 'CICLO_ESTIMADO';
+
+// =============================================================================
+// DOMAIN ENTITIES: GENERIC ACCOUNT & TRANSACTION
+// Decoupled from upstream proprietary identifiers (Pierre).
+// Canonical identity: source, sourceAccountId, sourceTransactionId, currency.
+// Fully compatible with UNIQUE(source, source_account_id, source_transaction_id).
+// =============================================================================
+
+export interface AccountDomainEntity {
+  id?: string;
+  name: string;
+  source: string;                  // Generic source connector (e.g. 'PIERRE', 'MANUAL')
+  sourceAccountId: string;         // Unique account ID in source system
+  currency: string;                // ISO currency code (e.g. 'BRL', 'USD')
+  institution: string;             // Banking entity (e.g. 'Nubank', 'Mercado Pago')
+  type: string;                    // CHECKING_ACCOUNT, CREDIT_CARD, etc.
+  balance: Money;
+  contractedCreditLimit?: Money;
+  customizedCreditLimit?: Money;
+  availableCreditLimit?: Money;
+  usedOperationalLimit?: Money;
+  rawUsedCreditLimit?: Money;
+  closingDay?: number;
+  dueDay?: number;
+  includeInCash: boolean;
+  includeInNetWorth: boolean;
+  lastSyncedAt?: string;
+}
+
+export interface TransactionDomainEntity {
+  id?: string;
+  source: string;                  // Generic source connector (e.g. 'PIERRE', 'MANUAL')
+  sourceAccountId: string;         // Unique account ID in source system
+  sourceTransactionId: string;     // Unique transaction ID in source system
+  currency: string;                // ISO currency code (e.g. 'BRL', 'USD')
+  canonicalHash: string;           // SHA-256 version fingerprint
+  description: string;
+  date: string;                    // ISO-8601
+  amount: Money;
+  rawAmount?: Money;
+  flowDirection: FlowDirection;
+  economicNature: EconomicNature;
+  budgetEffect: BudgetEffect;
+  allocationPurpose?: AllocationPurpose;
+  savingsGoalContribution?: Money;
+  accountRelationId?: string;
+  categoryRelationId?: string;
+  billRelationId?: string;
+  bankStatus: TransactionBankStatus;
+  reviewStatus: ReviewStatus;
+  reviewReason?: string;
+  rawCategory?: string;
+  rawDescription?: string;
+  counterpartyHmac?: string;
+}
 
 // =============================================================================
 // CREDIT CARD BILL DOMAIN MODEL (MULTIPLE PAYMENTS & ADDITIONAL COMPONENTS)
