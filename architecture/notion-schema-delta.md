@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T01:43:27.026Z
+> **Data da Verificação:** 2026-09-11T02:01:52.991Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 
@@ -21,11 +21,12 @@
 | Status das Propriedades | Quantidade |
 | :--- | :--- |
 | Correspondência Exata (EXACT_MATCH) | 0 |
-| Candidatos a Renomeação Compatíveis (RENAME_CANDIDATE) | 0 |
-| Candidatos com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
+| Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | 0 |
+| Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
+| Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | 0 |
 | Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | 0 |
 | Propriedades Ausentes em Bases Verificadas (MISSING) | 0 |
-| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 156 |
+| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 173 |
 | Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | 14 |
 | Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | 0 |
 
@@ -149,6 +150,7 @@
 | `Categoria` | `relation` | `—` | ❓ UNVERIFIED | `USUARIO` | Categoria orçamentária |
 | `Padrão de Identificação` | `rich_text` | `—` | ❓ UNVERIFIED | `USUARIO` | Expressão / substring para conciliação automática |
 | `Ativa` | `checkbox` | `—` | ❓ UNVERIFIED | `USUARIO` | Gera obrigações no período |
+| `Gerar obrigação` | `checkbox` | `—` | ❓ UNVERIFIED | `USUARIO` | Se ativado, gera automaticamente os lançamentos em Obrigações Mensais a cada competência |
 | `Observações / Contrato` | `rich_text` | `—` | ❓ UNVERIFIED | `USUARIO` | Código do assinante, detalhes do contrato ou instruções |
 | `Data de Início` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Início da vigência do contrato |
 | `Data de Término` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Término da vigência do contrato |
@@ -182,12 +184,19 @@
 | `Ativo` | `title` | `—` | ❓ UNVERIFIED | `USUARIO` | Nome do ativo ou produto financeiro |
 | `Classe do Ativo` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Renda Fixa, Cripto, Ação, FII, ETF, Previdência Privada, Tesouro Direto (Caixa Reservado NÃO é classe de ativo) |
 | `Custódia` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Conta Pierre ou Carteira Externa |
+| `Moeda` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Código da moeda do ativo (BRL, USD, BTC, EUR) |
 | `Quantidade` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Posição atual custodiada |
 | `Preço Médio Unitário (PMP)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Preço médio ponderado unitário de aquisição |
 | `Custo Base Total` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Montante total acumulado desembolsado nas compras (base de custo contábil) |
 | `Valor de Mercado Atual` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Posição a mercado: Cotação atual x quantidade |
 | `Lucro / Prejuízo Não Realizado` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Valor de Mercado Atual - Custo Base Total |
 | `Retorno Não Realizado (%)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | ((Valor de Mercado Atual - Custo Base Total) / Custo Base Total) * 100 |
+| `Liquidez` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Prazo de liquidez (ex: D+0, D+1, D+30, No Vencimento) |
+| `Fonte da Avaliação` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Origem da cotação a mercado (ex: Pierre, B3, Manual, Cripto API) |
+| `Data da Avaliação` | `date` | `—` | ❓ UNVERIFIED | `DERIVADO` | Data/hora da última cotação de mercado capturada |
+| `Incluir no Patrimônio` | `checkbox` | `—` | ❓ UNVERIFIED | `USUARIO` | Indica se esta posição deve compor o cálculo de patrimônio líquido final |
+| `Instituição / Corretora` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Corretora ou custodiante do investimento (ex: NuInvest, Binance, XP, BTG) |
+| `ID do Ativo na Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Identificador único do ativo na API de origem para sincronização |
 | `Conta Vinculada` | `relation` | `—` | ❓ UNVERIFIED | `USUARIO` | Conta corrente ou corretora associada |
 
 ### Movimentações de Investimentos (`NOTION_DS_INVESTMENT_MOVEMENTS`)
@@ -248,6 +257,8 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `Mês de Referência` | `title` | `—` | ❓ UNVERIFIED | `DERIVADO` | Fechamento YYYY-MM |
 | `Status do Fechamento` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Aberto, Pré-fechado, Fechado Auditado |
+| `Status de Reconciliação` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Conciliado Integralmente, Divergências Pendentes, Reconciliação Manual Necessária |
+| `Qualidade dos Dados` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Nota ou classificação da confiabilidade dos lançamentos do mês |
 | `Patrimônio Inicial` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Patrimônio líquido consolidado no início do mês |
 | `Renda Consolidada` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Total de receitas operacionais líquidas |
 | `Despesas Consolidadas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Total de despesas correntes de subsistência e consumo |
@@ -260,6 +271,10 @@
 | `Rendimentos de Investimentos` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Rendimentos e dividendos auferidos no mês |
 | `Patrimônio Líquido Final` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Saldo contas + investimentos - dívidas ao fechar o mês |
 | `Variação Patrimonial` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Patrimônio Final - Patrimônio Inicial |
+| `Contas Fixas Pagas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Contagem de obrigações fixas da competência com status Paga |
+| `Contas Fixas Pendentes` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Contagem de obrigações fixas da competência ainda pendentes ou atrasadas |
+| `Itens para Revisão` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Contagem de transações ou lançamentos da competência aguardando revisão humana |
+| `Fechado Em` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Data/hora em que o fechamento mensal foi consolidado e trancado |
 | `Observações / Notas do Fechamento` | `rich_text` | `—` | ❓ UNVERIFIED | `USUARIO` | Comentários qualitativos sobre desvios e conquistas do mês |
 
 ### Log de Sincronização (`NOTION_DS_SYNC_LOG`)
@@ -271,14 +286,17 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `Execução` | `title` | `—` | ❓ UNVERIFIED | `DERIVADO` | Sync - YYYY-MM-DD HH:mm:ss |
 | `Status` | `select` | `—` | ❓ UNVERIFIED | `DERIVADO` | Sucesso, Sucesso Parcial, Erro, Bloqueado por Concorrência |
+| `Fonte de Sincronização` | `select` | `—` | ❓ UNVERIFIED | `DERIVADO` | Sistema ou conector de origem da sincronização (ex: PIERRE, MANUAL_CSV, MIGRATION) |
 | `Data Início` | `date` | `—` | ❓ UNVERIFIED | `DERIVADO` | Timestamp do início da sincronização |
 | `Data Fim` | `date` | `—` | ❓ UNVERIFIED | `DERIVADO` | Timestamp do término da sincronização |
 | `Duração (s)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Tempo total de processamento em segundos |
+| `Duração (ms)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Tempo total de processamento em milissegundos |
 | `Contas Processadas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Quantidade de contas sincronizadas |
 | `Transações Recebidas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Lançamentos retornados pelo Pierre |
 | `Transações Novas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Novas páginas criadas |
 | `Transações Atualizadas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Páginas existentes com versionHash alterado |
 | `Transações Inalteradas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Transações sem alteração ignoradas |
+| `Erros Encontrados` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Total de falhas ou exceções não fatais registradas durante o lote |
 | `Parcelas Recebidas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Parcelamentos e faturas futuras identificadas |
 | `Enviadas para Revisão` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Transações marcadas como Pendente Revisão |
 | `Obrigações Conciliadas` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Compromissos mensais liquidados com sucesso |
@@ -303,7 +321,7 @@
 | `Data de Vencimento` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `PIERRE` | Data de vencimento (balance_due_date) |
 | `Valor da Fatura (Banco)` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `PIERRE` | Valor total consolidado emitido pela instituição |
 | `Total de Compras no Ciclo` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Soma real das transações de compra dentro do ciclo corrente |
-| `Componentes Adicionais da Fatura` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Diferença entre fatura emitida e compras correntes (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
+| `Componentes Adicionais da Fatura` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Soma dos componentes adicionais identificados (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
 | `Divergência Não Explicada` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Discrepância residual caso os componentes adicionais conhecidos não expliquem a diferença |
 | `Valor Pago` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `REGRA_AUTOMATICA` | Valor total liquidado até o momento |
 | `Data de Liquidação` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `REGRA_AUTOMATICA` | Data do pagamento da fatura |
@@ -329,7 +347,7 @@ Esta base **não existe atualmente** no seu Notion. Ela deve ser criada externam
 | `Data de Vencimento` | `date` | `write` | `PIERRE` | Data de vencimento (balance_due_date) |
 | `Valor da Fatura (Banco)` | `number` | `write` | `PIERRE` | Valor total consolidado emitido pela instituição |
 | `Total de Compras no Ciclo` | `number` | `write` | `DERIVADO` | Soma real das transações de compra dentro do ciclo corrente |
-| `Componentes Adicionais da Fatura` | `number` | `write` | `DERIVADO` | Diferença entre fatura emitida e compras correntes (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
+| `Componentes Adicionais da Fatura` | `number` | `write` | `DERIVADO` | Soma dos componentes adicionais identificados (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
 | `Divergência Não Explicada` | `number` | `write` | `DERIVADO` | Discrepância residual caso os componentes adicionais conhecidos não expliquem a diferença |
 | `Valor Pago` | `number` | `both` | `REGRA_AUTOMATICA` | Valor total liquidado até o momento |
 | `Data de Liquidação` | `date` | `both` | `REGRA_AUTOMATICA` | Data do pagamento da fatura |

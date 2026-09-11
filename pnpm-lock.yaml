@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@notionhq/client':
-        specifier: ^5.26.0
+        specifier: 5.26.0
         version: 5.26.0
       better-sqlite3:
         specifier: ^11.9.0
