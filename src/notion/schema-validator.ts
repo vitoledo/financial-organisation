@@ -40,6 +40,8 @@ export interface PropertyDiff {
     expectedOptions?: string[];
     actualOptions?: string[];
     missingOptions?: string[];
+    extraOptions?: string[];
+    allowExtraOptions?: boolean;
     expectedRelationTargetEnvKey?: string;
     expectedRelationTargetId?: string;
     actualRelationTargetId?: string;
@@ -683,6 +685,31 @@ function validatePropertyStructure(
         `Opções ausentes no Notion (${missing.length}): ${missing.map((o) => `"${o}"`).join(', ')}`,
       );
       isCompatible = false;
+    }
+
+    if (expected.allowExtraOptions !== undefined) {
+      details.allowExtraOptions = expected.allowExtraOptions;
+    }
+
+    // If strictly closed enum (allowExtraOptions === false), check for unmapped options
+    if (expected.allowExtraOptions === false) {
+      const allowedNorm = new Set<string>();
+      for (const opt of targetOptions) {
+        allowedNorm.add(normalizePropName(opt));
+        if (mappings[opt]) allowedNorm.add(normalizePropName(mappings[opt]));
+      }
+      for (const [k, v] of Object.entries(mappings)) {
+        allowedNorm.add(normalizePropName(k));
+        allowedNorm.add(normalizePropName(v));
+      }
+      const extra = actual.selectOptions.filter((o) => !allowedNorm.has(normalizePropName(o)));
+      if (extra.length > 0) {
+        details.extraOptions = extra;
+        warnings.push(
+          `Opções adicionais não homologadas no Notion (${extra.length}): ${extra.map((o) => `"${o}"`).join(', ')}`,
+        );
+        isCompatible = false;
+      }
     }
   }
 

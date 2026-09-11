@@ -35,6 +35,8 @@ describe('exporter', () => {
       closingBalance: 1500,
       creditLimit: null,
       availableCredit: null,
+      automaticallyInvestedBalance: null,
+      reservedTotal: null,
       rawJson: '{}',
     });
 

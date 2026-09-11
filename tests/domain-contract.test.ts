@@ -348,6 +348,7 @@ describe('Domain: Transaction Idempotency Key & Canonical Fingerprint', () => {
       sourceTransactionId: 'tx-99',
       amountMinor: 1500n,
       currency: 'BRL',
+      scale: 2,
       dateIso: '2026-06-29T17:51:21.000Z',
       status: 'PENDING',
       description: 'Pagamento de fatura',
@@ -455,7 +456,7 @@ describe('Domain: Schema Contract Specification', () => {
       'date', 'relation', 'checkbox', 'formula', 'rollup',
       'created_time', 'last_edited_time',
     ]);
-    const validAuthorities = new Set(['PIERRE', 'REGRA_AUTOMATICA', 'USUARIO', 'DERIVADO']);
+    const validAuthorities = new Set(['PIERRE', 'UPSTREAM', 'FONTE_EXTERNA', 'REGRA_AUTOMATICA', 'USUARIO', 'DERIVADO']);
 
     for (const [dsKey, ds] of Object.entries(TARGET_CONTRACT)) {
       expect(ds.properties.length).toBeGreaterThan(0);
@@ -791,10 +792,10 @@ describe('Domain: Generic Canonical Identity (Decoupled from Pierre)', () => {
       date: '2026-03-10',
       amount: Money.fromDecimal('250.75'),
       flowDirection: 'OUTFLOW',
-      economicNature: 'EXPENSE',
-      budgetEffect: 'BUDGET_RELEVANT',
+      economicNature: 'OPERATING_EXPENSE',
+      budgetEffect: 'EXPENSE',
       bankStatus: 'POSTED',
-      reviewStatus: 'AUTO_APPROVED',
+      reviewStatus: 'AUTO_CONFIRMED',
     };
     expect(tx.source).toBe('MANUAL');
     expect(tx.sourceAccountId).toBe('acc-01');
@@ -810,10 +811,20 @@ describe('Domain: Generic Canonical Identity (Decoupled from Pierre)', () => {
     const fonteAcc = getProp(accounts, 'Fonte');
     expect(fonteAcc).toBeDefined();
     expect(fonteAcc?.notionType).toBe('select');
+    expect(fonteAcc?.authority).toBe('UPSTREAM');
+    expect(fonteAcc?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteAcc?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
+    });
+    expect(fonteAcc?.allowExtraOptions).toBe(true);
 
     const idFonteAcc = getProp(accounts, 'ID da Fonte');
     expect(idFonteAcc).toBeDefined();
     expect(idFonteAcc?.notionType).toBe('rich_text');
+    expect(idFonteAcc?.authority).toBe('UPSTREAM');
     expect(idFonteAcc?.aliases).toContain('ID Pierre');
     expect(idFonteAcc?.aliases).toContain('ID da fonte');
 
@@ -825,9 +836,19 @@ describe('Domain: Generic Canonical Identity (Decoupled from Pierre)', () => {
     const fonteTx = getProp(txs, 'Fonte');
     expect(fonteTx).toBeDefined();
     expect(fonteTx?.notionType).toBe('select');
+    expect(fonteTx?.authority).toBe('UPSTREAM');
+    expect(fonteTx?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteTx?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
+    });
+    expect(fonteTx?.allowExtraOptions).toBe(true);
 
     const idFonteTx = getProp(txs, 'ID da Fonte');
     expect(idFonteTx).toBeDefined();
+    expect(idFonteTx?.authority).toBe('UPSTREAM');
     expect(idFonteTx?.aliases).toContain('ID Pierre');
     expect(idFonteTx?.aliases).toContain('ID da fonte');
 
@@ -1025,7 +1046,7 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
           notionProperty: 'Relacao Dupla',
           notionType: 'relation' as const,
           direction: 'both' as const,
-          authority: 'PIERRE' as const,
+          authority: 'UPSTREAM' as const,
           description: 'Teste',
           isBidirectionalRelation: true,
           relationTargetEnvKey: 'NOTION_DS_ACCOUNTS',
@@ -1045,6 +1066,106 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
     const rel = diffs.find((d) => d.notionProperty === 'Relacao Dupla');
     expect(rel?.status).toBe('STRUCTURAL_MISMATCH');
     expect(rel?.description).toContain('Relação unidirecional quando esperado bidirecional');
+  });
+
+  test('respects allowExtraOptions policy for extensible vs strict select enums', () => {
+    const validator = new NotionSchemaValidator();
+
+    // 1. Extensible contract (allowExtraOptions: true, like Fonte)
+    const contractExtensible = {
+      envKey: 'NOTION_DS_TEST',
+      defaultTitle: 'Teste Extensible',
+      isExisting: true,
+      properties: [
+        {
+          domainField: 'source',
+          notionProperty: 'Fonte',
+          notionType: 'select' as const,
+          direction: 'both' as const,
+          authority: 'UPSTREAM' as const,
+          description: 'Teste',
+          expectedOptions: ['Pierre', 'Manual', 'Migração', 'Outra'],
+          optionMappings: {
+            'Pierre': 'PIERRE',
+            'Manual': 'MANUAL',
+            'Migração': 'MIGRATION',
+            'Outra': 'OTHER',
+          },
+          allowExtraOptions: true,
+        },
+      ],
+    };
+
+    const actualExtensible: Record<string, NotionPropertySnapshot> = {
+      'Fonte': {
+        type: 'select',
+        selectOptions: ['Pierre', 'Manual', 'Migração', 'Outra', 'Nova Fonte XPTO'],
+      },
+    };
+
+    const diffsExtensible = validator.compareProperties(contractExtensible, actualExtensible);
+    const fonteDiff = diffsExtensible.find((d) => d.notionProperty === 'Fonte');
+    expect(fonteDiff?.status).toBe('EXACT_MATCH');
+
+    // 2. Strict contract (allowExtraOptions: false)
+    const contractStrict = {
+      envKey: 'NOTION_DS_TEST',
+      defaultTitle: 'Teste Strict',
+      isExisting: true,
+      properties: [
+        {
+          domainField: 'status',
+          notionProperty: 'Status Fatura',
+          notionType: 'select' as const,
+          direction: 'both' as const,
+          authority: 'UPSTREAM' as const,
+          description: 'Teste',
+          expectedOptions: ['Aberta', 'Fechada'],
+          allowExtraOptions: false,
+        },
+      ],
+    };
+
+    const actualStrict: Record<string, NotionPropertySnapshot> = {
+      'Status Fatura': {
+        type: 'select',
+        selectOptions: ['Aberta', 'Fechada', 'Opção Inesperada'],
+      },
+    };
+
+    const diffsStrict = validator.compareProperties(contractStrict, actualStrict);
+    const statusDiff = diffsStrict.find((d) => d.notionProperty === 'Status Fatura');
+    expect(statusDiff?.status).toBe('STRUCTURAL_MISMATCH');
+    expect(statusDiff?.description).toContain('Opções adicionais não homologadas no Notion');
+  });
+});
+
+describe('Domain: Money & DecimalQuantity Constructor Invariant Hardening', () => {
+  test('Money constructor enforces strict invariant validation', () => {
+    const m = new Money(100n, 'BRL', 2);
+    expect(m.amountMinor).toBe(100n);
+    expect(m.currency).toBe('BRL');
+    expect(m.scale).toBe(2);
+
+    expect(() => new Money(100 as any)).toThrow(TypeError);
+    expect(() => new Money('100' as any)).toThrow(TypeError);
+    expect(() => new Money(100n, '')).toThrow('Invalid currency');
+    expect(() => new Money(100n, '   ')).toThrow('Invalid currency');
+    expect(() => new Money(100n, 'BRL', -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new Money(100n, 'BRL', 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new Money(100n, 'BRL', 1.5)).toThrow(/Scale must be an integer between 0 and 20/i);
+  });
+
+  test('DecimalQuantity constructor enforces strict invariant validation', () => {
+    const q = new DecimalQuantity(100000000n, 8);
+    expect(q.rawUnits).toBe(100000000n);
+    expect(q.scale).toBe(8);
+
+    expect(() => new DecimalQuantity(100 as any)).toThrow(TypeError);
+    expect(() => new DecimalQuantity('100' as any)).toThrow(TypeError);
+    expect(() => new DecimalQuantity(100n, -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new DecimalQuantity(100n, 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new DecimalQuantity(100n, 2.5)).toThrow(/Scale must be an integer between 0 and 20/i);
   });
 });
 

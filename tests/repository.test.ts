@@ -25,6 +25,8 @@ function makeAccount(overrides: Partial<NormalizedAccount> = {}): NormalizedAcco
     closingBalance: 9.22,
     creditLimit: null,
     availableCredit: null,
+    automaticallyInvestedBalance: null,
+    reservedTotal: null,
     rawJson: '{}',
     ...overrides,
   };

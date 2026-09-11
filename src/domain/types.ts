@@ -53,8 +53,17 @@ export class Money {
   readonly scale: number;
 
   constructor(amountMinor: bigint, currency: string = 'BRL', scale: number = 2) {
+    if (typeof amountMinor !== 'bigint') {
+      throw new TypeError(`amountMinor must be a bigint, received ${typeof amountMinor}`);
+    }
+    if (typeof currency !== 'string' || currency.trim() === '') {
+      throw new Error('Invalid currency: currency must be a non-empty string.');
+    }
+    if (!Number.isInteger(scale) || scale < 0 || scale > 20) {
+      throw new Error(`Invalid scale: ${scale}. Scale must be an integer between 0 and 20.`);
+    }
     this.amountMinor = amountMinor;
-    this.currency = currency.toUpperCase();
+    this.currency = currency.trim().toUpperCase();
     this.scale = scale;
   }
 
@@ -242,6 +251,12 @@ export class DecimalQuantity {
   readonly scale: number;
 
   constructor(rawUnits: bigint, scale: number = 8) {
+    if (typeof rawUnits !== 'bigint') {
+      throw new TypeError(`rawUnits must be a bigint, received ${typeof rawUnits}`);
+    }
+    if (!Number.isInteger(scale) || scale < 0 || scale > 20) {
+      throw new Error(`Invalid scale: ${scale}. Scale must be an integer between 0 and 20.`);
+    }
     this.rawUnits = rawUnits;
     this.scale = scale;
   }
