@@ -16,6 +16,9 @@ import {
   verifyPlanHash,
   canonicalizeJson,
   StepStructuralVerifier,
+  materializeNotionApiPayload,
+  HOMOLOGATED_RECOVERY_PLAN_HASH,
+  HOMOLOGATED_RECOVERY_FROM_COMMIT,
 } from '../src/notion/migration-runner';
 import {
   PERCENTAGE_CONVENTION,
@@ -916,7 +919,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         const rawProps = JSON.parse(JSON.stringify(initialFixtures[envKey] || {}));
         const props: Record<string, any> = {};
         for (const [pName, pDef] of Object.entries(rawProps)) {
-          const def: any = { ...pDef };
+          const def: any = { ...(pDef as any) };
           if (def.type === 'select') {
             const rawOpts = def.select?.options || def.selectOptions || [];
             def.select = {
@@ -942,9 +945,22 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         return JSON.parse(JSON.stringify(ds));
       },
       update: async ({ data_source_id, properties }: { data_source_id: string; properties: any }) => {
-        this.writeCallsCount++;
         const ds = this.dataSourcesMap.get(data_source_id);
         if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
+
+        // Validate relation payload before mutating or counting write
+        for (const [propName, propDef] of Object.entries(properties)) {
+          if ((propDef as any).relation) {
+            const rel = (propDef as any).relation;
+            if (!rel.single_property && !rel.dual_property) {
+              throw new Error(
+                `Notion API 400 Validation Error: body.properties.${propName}.relation.single_property should be defined, instead was undefined`,
+              );
+            }
+          }
+        }
+
+        this.writeCallsCount++;
 
         for (const [propName, propDef] of Object.entries(properties)) {
           this.writeCallsByProperty[propName] = (this.writeCallsByProperty[propName] || 0) + 1;
@@ -962,14 +978,17 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
               },
             };
           } else if ((propDef as any).relation) {
+            const rel = (propDef as any).relation;
+            const relType = rel.dual_property ? 'dual_property' : 'single_property';
             ds.properties[propName] = {
               id: `prop_${propName}_id`,
               name: propName,
               type: 'relation',
               relation: {
-                data_source_id: (propDef as any).relation.data_source_id,
-                type: (propDef as any).relation.type,
-                dual_property: (propDef as any).relation.dual_property,
+                data_source_id: rel.data_source_id,
+                type: relType,
+                single_property: rel.single_property ?? (relType === 'single_property' ? {} : undefined),
+                dual_property: rel.dual_property,
               },
             };
             const targetDsId = (propDef as any).relation.data_source_id;
@@ -1038,6 +1057,27 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         const initialProps = params.initial_data_source?.properties || {};
         const simulatedProps: Record<string, any> = {};
         for (const [pName, pDef] of Object.entries(initialProps)) {
+          if ((pDef as any).relation) {
+            const rel = (pDef as any).relation;
+            if (!rel.single_property && !rel.dual_property) {
+              throw new Error(
+                `Notion API 400 Validation Error: body.initial_data_source.properties.${pName}.relation.single_property should be defined, instead was undefined`,
+              );
+            }
+            const relType = rel.dual_property ? 'dual_property' : 'single_property';
+            simulatedProps[pName] = {
+              id: `prop_${pName}_id`,
+              name: pName,
+              type: 'relation',
+              relation: {
+                data_source_id: rel.data_source_id,
+                type: relType,
+                single_property: rel.single_property ?? (relType === 'single_property' ? {} : undefined),
+                dual_property: rel.dual_property,
+              },
+            };
+            continue;
+          }
           const pType = Object.keys(pDef as any)[0] || 'rich_text';
           simulatedProps[pName] = {
             id: `prop_${pName}_id`,
@@ -2932,6 +2972,794 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         const formatted = applyRunner.formatReport(report);
         expect(formatted).toContain('SCHEMA APPLY EXECUTOR');
         expect(formatted).toContain('EXECUÇÃO DDL CONCLUÍDA COM SUCESSO NO NOTION');
+      }
+    });
+  });
+
+  describe('12. Relation Wire Serialization, Plan Immutability & Safe Recovery Apply', () => {
+    const recoveryParentPageId = '3d7a3ece-fa49-81be-bc0e-dcae689d1fcd';
+    const recoveryPatchSha = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+    const recoveryEnvVars = {
+      ...REAL_DATA_SOURCE_IDS,
+      NOTION_PARENT_PAGE_ID: recoveryParentPageId,
+    };
+
+    function loadHomologatedPlan(): any {
+      const realDb = new Database(path.resolve(process.cwd(), 'data', 'financial.db'), { readonly: true });
+      try {
+        const row = realDb
+          .prepare('SELECT plan_json FROM _migration_plans WHERE plan_hash = ?')
+          .get(HOMOLOGATED_RECOVERY_PLAN_HASH) as any;
+        if (!row) {
+          throw new Error('Homologated plan not found in data/financial.db');
+        }
+        return JSON.parse(row.plan_json);
+      } finally {
+        realDb.close();
+      }
+    }
+
+    function createLiveSnapshotPostStep10(): Record<string, Record<string, any>> {
+      const snapshot: Record<string, Record<string, any>> = JSON.parse(JSON.stringify(LIVE_NOTION_FIXTURES));
+      // Step 1: Obligations Status has all 7 target options
+      snapshot.NOTION_DS_MONTHLY_OBLIGATIONS['Status'] = {
+        id: 'status_prop_id',
+        name: 'Status',
+        type: 'select',
+        select: {
+          options: [
+            { id: 'opt_1', name: 'Prevista' },
+            { id: 'opt_2', name: 'Pendente' },
+            { id: 'opt_3', name: 'Paga' },
+            { id: 'opt_4', name: 'Atrasada' },
+            { id: 'opt_5', name: 'Dispensada' },
+            { id: 'opt_6', name: 'Revisão Necessária' },
+            { id: 'opt_7', name: 'Cancelada' },
+          ],
+        },
+      };
+      // Steps 2-5 on Accounts
+      snapshot.NOTION_DS_ACCOUNTS['Limite Operacional Usado'] = {
+        id: 'prop_lim_op_id',
+        name: 'Limite Operacional Usado',
+        type: 'number',
+        number: { format: 'real' },
+      };
+      snapshot.NOTION_DS_ACCOUNTS['Limite Usado da Fonte (Bruto)'] = {
+        id: 'prop_lim_bruto_id',
+        name: 'Limite Usado da Fonte (Bruto)',
+        type: 'number',
+        number: { format: 'real' },
+      };
+      snapshot.NOTION_DS_ACCOUNTS['Dia de Fechamento'] = {
+        id: 'prop_dia_fech_id',
+        name: 'Dia de Fechamento',
+        type: 'number',
+        number: { format: 'number' },
+      };
+      snapshot.NOTION_DS_ACCOUNTS['Dia de Vencimento'] = {
+        id: 'prop_dia_venc_id',
+        name: 'Dia de Vencimento',
+        type: 'number',
+        number: { format: 'number' },
+      };
+      // Steps 6-10 on Transactions
+      snapshot.NOTION_DS_TRANSACTIONS['Hash Canônico'] = {
+        id: 'prop_hash_can_id',
+        name: 'Hash Canônico',
+        type: 'rich_text',
+        rich_text: {},
+      };
+      snapshot.NOTION_DS_TRANSACTIONS['Valor Bruto da Fonte'] = {
+        id: 'prop_val_bruto_id',
+        name: 'Valor Bruto da Fonte',
+        type: 'number',
+        number: { format: 'real' },
+      };
+      snapshot.NOTION_DS_TRANSACTIONS['Efeito Orçamentário'] = {
+        id: 'prop_ef_orc_id',
+        name: 'Efeito Orçamentário',
+        type: 'select',
+        select: {
+          options: [
+            { id: 'opt_ef_1', name: 'Receita' },
+            { id: 'opt_ef_2', name: 'Despesa' },
+            { id: 'opt_ef_3', name: 'Estorno' },
+            { id: 'opt_ef_4', name: 'Neutro' },
+          ],
+        },
+      };
+      snapshot.NOTION_DS_TRANSACTIONS['Propósito de Alocação'] = {
+        id: 'prop_prop_aloc_id',
+        name: 'Propósito de Alocação',
+        type: 'select',
+        select: {
+          options: [
+            { id: 'opt_pr_1', name: 'Caixa Operacional' },
+            { id: 'opt_pr_2', name: 'Reserva de Investimento' },
+            { id: 'opt_pr_3', name: 'Reserva de Emergência' },
+            { id: 'opt_pr_4', name: 'Poupança Geral' },
+          ],
+        },
+      };
+      snapshot.NOTION_DS_TRANSACTIONS['Contribuição Meta Poupança'] = {
+        id: 'prop_meta_poup_id',
+        name: 'Contribuição Meta Poupança',
+        type: 'number',
+        number: { format: 'real' },
+      };
+      return snapshot;
+    }
+
+    // -------------------------------------------------------------------------
+    // Sub-suite A: Wire Serialization & Immutability Proof
+    // -------------------------------------------------------------------------
+    it('materializeNotionApiPayload converte relation single { type: "single_property" } para { single_property: {} } sem type', () => {
+      const legacyPayload = {
+        'Conta Destino': {
+          relation: {
+            data_source_id: 'a17455aa-4793-4001-9570-21b7f84ff4a2',
+            type: 'single_property',
+          },
+        },
+      };
+
+      const copyBefore = JSON.stringify(legacyPayload);
+      const materialized = materializeNotionApiPayload(legacyPayload);
+
+      // Materialized output format
+      expect((materialized['Conta Destino'].relation as any).data_source_id).toBe('a17455aa-4793-4001-9570-21b7f84ff4a2');
+      expect((materialized['Conta Destino'].relation as any).single_property).toEqual({});
+      expect((materialized['Conta Destino'].relation as any).type).toBeUndefined();
+
+      // Original input remains completely untouched
+      expect(JSON.stringify(legacyPayload)).toBe(copyBefore);
+      expect((legacyPayload['Conta Destino'].relation as any).type).toBe('single_property');
+      expect((legacyPayload['Conta Destino'].relation as any).single_property).toBeUndefined();
+    });
+
+    it('materializeNotionApiPayload converte relations subsequentes do plano (Atribuir: Conta Destino, Conta Vinculada, etc)', () => {
+      const multiPayload: Record<string, any> = {
+        'Atribuir: Conta Destino': {
+          relation: {
+            data_source_id: 'ds_acc',
+            type: 'single_property',
+          },
+        },
+        'Conta Vinculada': {
+          relation: {
+            data_source_id: 'ds_acc',
+            type: 'single_property',
+          },
+        },
+        'Conta Destino / Caixa': {
+          relation: {
+            data_source_id: 'ds_acc',
+            type: 'single_property',
+          },
+        },
+      };
+
+      const materialized: Record<string, any> = materializeNotionApiPayload(multiPayload);
+      for (const key of ['Atribuir: Conta Destino', 'Conta Vinculada', 'Conta Destino / Caixa']) {
+        expect(materialized[key].relation.data_source_id).toBe('ds_acc');
+        expect(materialized[key].relation.single_property).toEqual({});
+        expect((materialized[key].relation as any).type).toBeUndefined();
+      }
+    });
+
+    it('materializeNotionApiPayload converte relations dentro de initial_data_source.properties de CREATE_DATABASE', () => {
+      const createDbPayload = {
+        parent: { type: 'page_id', page_id: 'parent_123' },
+        title: [{ type: 'text', text: { content: 'Faturas / Ciclos de Cartão' } }],
+        initial_data_source: {
+          properties: {
+            'Nome / Identificador': { title: {} },
+            'Cartão Vinculado': {
+              relation: {
+                data_source_id: 'ds_accounts_id',
+                type: 'single_property',
+              },
+            },
+            'Transações de Pagamento': {
+              relation: {
+                data_source_id: 'ds_transactions_id',
+                type: 'single_property',
+              },
+            },
+            'Valor Total Fechado': {
+              number: { format: 'real' },
+            },
+          },
+        },
+      };
+
+      const materialized = materializeNotionApiPayload(createDbPayload);
+      const props: Record<string, any> = materialized.initial_data_source.properties;
+
+      expect((props['Cartão Vinculado'].relation as any).single_property).toEqual({});
+      expect((props['Cartão Vinculado'].relation as any).type).toBeUndefined();
+      expect((props['Transações de Pagamento'].relation as any).single_property).toEqual({});
+      expect((props['Transações de Pagamento'].relation as any).type).toBeUndefined();
+      expect(props['Valor Total Fechado'].number.format).toBe('real');
+    });
+
+    it('materializeNotionApiPayload preserva dual relations intactas com dual_property', () => {
+      const dualPayload = {
+        'Fatura Vinculada': {
+          relation: {
+            data_source_id: 'ds_bills_123',
+            type: 'dual_property',
+            dual_property: {
+              synced_property_name: 'Lançamentos do Ciclo',
+            },
+          },
+        },
+      };
+
+      const materialized = materializeNotionApiPayload(dualPayload);
+      expect(materialized['Fatura Vinculada'].relation.data_source_id).toBe('ds_bills_123');
+      expect(materialized['Fatura Vinculada'].relation.dual_property).toEqual({
+        synced_property_name: 'Lançamentos do Ciclo',
+      });
+      expect((materialized['Fatura Vinculada'].relation as any).single_property).toBeUndefined();
+    });
+
+    it('materializeNotionApiPayload preserva propriedades não-relation sem alteração (select, number, rich_text, etc)', () => {
+      const mixedPayload = {
+        Status: { select: { options: [{ name: 'Ativo' }, { name: 'Inativo' }] } },
+        Valor: { number: { format: 'real' } },
+        Observações: { rich_text: {} },
+        Ativo: { checkbox: {} },
+        Data: { date: {} },
+      };
+
+      const materialized = materializeNotionApiPayload(mixedPayload);
+      expect(materialized).toEqual(mixedPayload);
+    });
+
+    it('Immutabilidade: plano persistido, canonicalizeJson e computePlanHash permanecem estritamente idênticos antes e depois da materialização', () => {
+      const plan = loadHomologatedPlan();
+      const originalJson = JSON.stringify(plan);
+      const originalCanonical = canonicalizeJson(plan);
+      const originalHash = computePlanHash(plan);
+
+      expect(originalHash).toBe(HOMOLOGATED_RECOVERY_PLAN_HASH);
+
+      // Perform wire materialization on every step in the plan
+      for (const step of plan.schemaPlan.steps) {
+        const wirePayload = materializeNotionApiPayload(step.sanitizedPayload);
+        expect(wirePayload).toBeDefined();
+      }
+
+      // Assert that plan was NOT mutated in any way
+      expect(JSON.stringify(plan)).toBe(originalJson);
+      expect(canonicalizeJson(plan)).toBe(originalCanonical);
+      expect(computePlanHash(plan)).toBe(originalHash);
+    });
+
+    it('SchemaPlanner.buildPropertyPayload produz { single_property: {} } diretamente para novos planos de relation', () => {
+      const planner = new SchemaPlanner({ envVars: recoveryEnvVars });
+      const relationContract = {
+        notionProperty: 'Nova Relação',
+        notionType: 'relation',
+        relationTargetEnvKey: 'NOTION_DS_ACCOUNTS',
+      } as any;
+
+      const payload = (planner as any).buildPropertyPayload(relationContract, recoveryEnvVars);
+      expect(payload['Nova Relação'].relation.single_property).toEqual({});
+      expect(payload['Nova Relação'].relation.data_source_id).toBe(REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS);
+      expect(payload['Nova Relação'].relation.type).toBeUndefined();
+    });
+
+    // -------------------------------------------------------------------------
+    // Sub-suite B: Stateful Fake Validation & Error Emulation
+    // -------------------------------------------------------------------------
+    it('StatefulNotionFake: payload legado de relation sem single_property lança HTTP 400 Validation Error exatamente como a API do Notion', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const legacyPayload = {
+        'Conta Destino': {
+          relation: {
+            data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
+            type: 'single_property',
+          },
+        },
+      };
+
+      await expect(
+        fakeNotion.dataSources.update({
+          data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+          properties: legacyPayload,
+        }),
+      ).rejects.toThrow(
+        'Notion API 400 Validation Error: body.properties.Conta Destino.relation.single_property should be defined, instead was undefined',
+      );
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('StatefulNotionFake: payload materializado com single_property: {} é aceito com sucesso e incrementa writeCalls', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const legacyPayload = {
+        'Conta Destino': {
+          relation: {
+            data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
+            type: 'single_property',
+          },
+        },
+      };
+
+      const materialized = materializeNotionApiPayload(legacyPayload);
+      const res = await fakeNotion.dataSources.update({
+        data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+        properties: materialized,
+      });
+
+      expect(fakeNotion.writeCallsCount).toBe(1);
+      expect(res.properties['Conta Destino']).toBeDefined();
+      expect(res.properties['Conta Destino'].type).toBe('relation');
+      expect(res.properties['Conta Destino'].relation.data_source_id).toBe(REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS);
+      expect(res.properties['Conta Destino'].relation.single_property).toEqual({});
+    });
+
+    it('StatefulNotionFake.databases.create: relation em initial_data_source sem single_property lança erro de validação, e com materialização passa', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const legacyCreateDb = {
+        parent: { type: 'page_id', page_id: recoveryParentPageId },
+        title: [{ type: 'text', text: { content: 'Faturas / Ciclos de Cartão' } }],
+        initial_data_source: {
+          properties: {
+            'Cartão Vinculado': {
+              relation: {
+                data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
+                type: 'single_property',
+              },
+            },
+          },
+        },
+      };
+
+      // Fails with legacy payload
+      await expect(fakeNotion.databases.create(legacyCreateDb)).rejects.toThrow(
+        'Notion API 400 Validation Error: body.initial_data_source.properties.Cartão Vinculado.relation.single_property should be defined, instead was undefined',
+      );
+
+      // Passes with materialized payload
+      const materializedCreateDb = materializeNotionApiPayload(legacyCreateDb);
+      const created = await fakeNotion.databases.create(materializedCreateDb);
+      expect(created.id).toBe('mock-db-id');
+    });
+
+    // -------------------------------------------------------------------------
+    // Sub-suite C: Recovery Mode Eligibility & Operational Gates
+    // -------------------------------------------------------------------------
+    it('Recovery Gate: ausência de NOTION_SCHEMA_RECOVERY_ENABLED bloqueia recuperação com 0 writes', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      const fakeNotion = new StatefulNotionFake(createLiveSnapshotPostStep10());
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            // NOTION_SCHEMA_RECOVERY_ENABLED NOT SET
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: createLiveSnapshotPostStep10(),
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      expect(runner.resolveAllowRecoveryMutations(HOMOLOGATED_RECOVERY_PLAN_HASH, recoveryPatchSha)).toBe(false);
+      await expect(runner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('RECOVERY_BLOCKED');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Recovery Gate: token ou planHash incorreto bloqueia recuperação com 0 writes', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      const fakeNotion = new StatefulNotionFake(createLiveSnapshotPostStep10());
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'INCORRECT_TOKEN',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: 'wrong_hash',
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: createLiveSnapshotPostStep10(),
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      expect(runner.resolveAllowRecoveryMutations(HOMOLOGATED_RECOVERY_PLAN_HASH, recoveryPatchSha)).toBe(false);
+      await expect(runner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('RECOVERY_BLOCKED');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Recovery Gate: NOTION_SCHEMA_RECOVERY_FROM_COMMIT divergente bloqueia com 0 writes', async () => {
+      const runner = new TestableMigrationRunner({
+        envVars: {
+          NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+          NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+          NOTION_SCHEMA_RECOVERY_FROM_COMMIT: '0000000000000000000000000000000000000000',
+          NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+        },
+      });
+      expect(runner.resolveAllowRecoveryMutations(HOMOLOGATED_RECOVERY_PLAN_HASH, recoveryPatchSha)).toBe(false);
+    });
+
+    it('Recovery Gate: NOTION_SCHEMA_RECOVERY_PATCH_SHA divergente do HEAD atual bloqueia com 0 writes', async () => {
+      const runner = new TestableMigrationRunner({
+        envVars: {
+          NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+          NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+          NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          NOTION_SCHEMA_RECOVERY_PATCH_SHA: 'divergent_patch_sha',
+        },
+      });
+      expect(runner.resolveAllowRecoveryMutations(HOMOLOGATED_RECOVERY_PLAN_HASH, recoveryPatchSha)).toBe(false);
+    });
+
+    it('Recovery Gate: parent commit (HEAD^) divergente de HOMOLOGATED_RECOVERY_FROM_COMMIT bloqueia com 0 writes', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      const fakeNotion = new StatefulNotionFake(createLiveSnapshotPostStep10());
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: 'wrong_parent_sha',
+          liveSnapshotOverride: createLiveSnapshotPostStep10(),
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      await expect(runner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('PARENT_COMMIT_MISMATCH');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Recovery Gate: working tree dirty ou upstream remoto desincronizado bloqueia recuperação com 0 writes', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+
+      const dirtyRunner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_DIRTY',
+          mockDirtyFiles: ['M src/notion/migration-runner/runner.ts'],
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+        },
+      );
+
+      await expect(dirtyRunner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('WORKTREE_DIRTY');
+
+      const unverifiedRunner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'GIT_STATE_UNVERIFIED',
+          simulateRemoteTrackingMismatch: true,
+        },
+      );
+
+      await expect(unverifiedRunner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('GIT_STATE_UNVERIFIED');
+    });
+
+    it('Recovery Gate: journal inválido (Passo 1 não verificado ou Passo 11 não PENDING) bloqueia recuperação', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      // Step 1 NOT verified
+      for (let s = 2; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      const fakeNotion = new StatefulNotionFake(createLiveSnapshotPostStep10());
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: createLiveSnapshotPostStep10(),
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      await expect(runner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('Passo 1 não está como VERIFIED');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Recovery Gate: drift live com propriedade posterior já presente no Notion bloqueia recuperação', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      // Live snapshot already has Step 11 live!
+      const driftedSnapshot = createLiveSnapshotPostStep10();
+      driftedSnapshot.NOTION_DS_TRANSACTIONS['Conta Destino'] = {
+        id: 'prop_drift_dest_id',
+        name: 'Conta Destino',
+        type: 'relation',
+        relation: { data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS, single_property: {} },
+      };
+
+      const fakeNotion = new StatefulNotionFake(driftedSnapshot);
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: driftedSnapshot,
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      await expect(runner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH)).rejects.toThrow('Transações.Conta Destino já existe ao vivo no Notion');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Recovery Preflight: runRecoveryPreflight gera relatório completo e realiza ZERO mutações', async () => {
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: s, operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY', targetDataSource: 'MOCK' });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({ planHash: HOMOLOGATED_RECOVERY_PLAN_HASH, stepNumber: 11, operation: 'CREATE_PROPERTY', targetDataSource: 'Transações' });
+
+      const fakeNotion = new StatefulNotionFake(createLiveSnapshotPostStep10());
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'recovery-preflight',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: createLiveSnapshotPostStep10(),
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      const report = await runner.runRecoveryPreflight(HOMOLOGATED_RECOVERY_PLAN_HASH);
+      expect(report.mode).toBe('recovery-preflight');
+      expect(report.mutationsExecuted).toBe(0);
+      expect(report.journalStepsCompleted).toBe(10);
+      expect(report.frontierStepNumber).toBe(11);
+      expect(report.frontierStepProperty).toBe('Conta Destino');
+      expect(report.eligibility.eligible).toBe(true);
+
+      const formatted = runner.formatReport(report);
+      expect(formatted).toContain('RECOVERY PREFLIGHT (READ-ONLY)');
+      expect(formatted).toContain('NENHUMA ALTERAÇÃO REALIZADA NO WORKSPACE DO NOTION');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    // -------------------------------------------------------------------------
+    // Sub-suite D: End-to-End Recovery Simulation
+    // -------------------------------------------------------------------------
+    it('End-to-End Recovery: executa passos 11..54 com sucesso, passos 1..10 recebem ZERO chamadas PATCH, e journal atinge 54 passos VERIFIED', async () => {
+      // 1. Setup SQLite journal with persisted plan and Steps 1..10 VERIFIED, Step 11 PENDING
+      const plan = loadHomologatedPlan();
+      const journal = new MigrationJournal(testDbPath);
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+      for (let s = 1; s <= 10; s++) {
+        journal.recordStepPending({
+          planHash: HOMOLOGATED_RECOVERY_PLAN_HASH,
+          stepNumber: s,
+          operation: s === 1 ? 'ALTER_SELECT_OPTIONS' : 'CREATE_PROPERTY',
+          targetDataSource: 'MOCK',
+        });
+        journal.recordStepVerified(HOMOLOGATED_RECOVERY_PLAN_HASH, s);
+      }
+      journal.recordStepPending({
+        planHash: HOMOLOGATED_RECOVERY_PLAN_HASH,
+        stepNumber: 11,
+        operation: 'CREATE_PROPERTY',
+        targetDataSource: 'Transações',
+        propertyName: 'Conta Destino',
+      });
+
+      // 2. Setup stateful fake Notion in exact post-Step 10 state
+      const postStep10Snapshot = createLiveSnapshotPostStep10();
+      const fakeNotion = new StatefulNotionFake(postStep10Snapshot);
+
+      // 3. Configure runner in recovery mode with exact homologated gates
+      const recoveryRunner = new TestableMigrationRunner(
+        {
+          mode: 'recovery',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...recoveryEnvVars,
+            NOTION_SCHEMA_RECOVERY_ENABLED: 'I_UNDERSTAND_RECOVERY_ONLY',
+            NOTION_SCHEMA_RECOVERY_PLAN_HASH: HOMOLOGATED_RECOVERY_PLAN_HASH,
+            NOTION_SCHEMA_RECOVERY_FROM_COMMIT: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+            NOTION_SCHEMA_RECOVERY_PATCH_SHA: recoveryPatchSha,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: recoveryPatchSha,
+          gitParentCommitShaOverride: HOMOLOGATED_RECOVERY_FROM_COMMIT,
+          liveSnapshotOverride: postStep10Snapshot,
+        },
+      );
+      recoveryRunner.setClient(fakeNotion);
+
+      // 4. Assert recovery authorization gate
+      expect(
+        recoveryRunner.resolveAllowRecoveryMutations(HOMOLOGATED_RECOVERY_PLAN_HASH, recoveryPatchSha),
+      ).toBe(true);
+
+      // 5. Execute recovery apply
+      const report = await recoveryRunner.execute(HOMOLOGATED_RECOVERY_PLAN_HASH);
+      expect(report.mode).toBe('apply');
+
+      if (report.mode === 'apply') {
+        // All 54 steps are verified in the final summary
+        expect(report.summary.totalSteps).toBe(54);
+        expect(report.summary.verifiedCount).toBe(54);
+        expect(report.summary.noOpCount).toBe(0);
+        expect(report.mutationsExecuted).toBe(54);
+
+        // Steps 1..10 MUST have received ZERO write calls!
+        expect(fakeNotion.writeCallsByProperty['Limite Operacional Usado']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Limite Usado da Fonte (Bruto)']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Dia de Fechamento']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Dia de Vencimento']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Hash Canônico']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Valor Bruto da Fonte']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Efeito Orçamentário']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Propósito de Alocação']).toBeUndefined();
+        expect(fakeNotion.writeCallsByProperty['Contribuição Meta Poupança']).toBeUndefined();
+
+        // Step 11 was executed exactly once
+        expect(fakeNotion.writeCallsByProperty['Conta Destino']).toBe(1);
+
+        // Total write calls executed on Notion is 43 property/database creations (step 53 is a read/resolution step)
+        expect(fakeNotion.writeCallsCount).toBe(43);
+
+        // Journal now contains ALL 54 steps as VERIFIED
+        const allRecorded = journal.getAllSteps(HOMOLOGATED_RECOVERY_PLAN_HASH);
+        const verifiedSteps = allRecorded.filter((s) => s.status === 'VERIFIED');
+        expect(verifiedSteps.length).toBe(54);
+
+        // Verify Faturas database was created with correct initial properties and dual relation
+        const createdDbId = journal.getCreatedDatabaseId(HOMOLOGATED_RECOVERY_PLAN_HASH);
+        expect(createdDbId).toBe('mock-db-id');
+        const resolvedBillsDsId = journal.getStepStatus(HOMOLOGATED_RECOVERY_PLAN_HASH, 53)?.createdId;
+        expect(resolvedBillsDsId).toBe('mock-ds-id');
       }
     });
   });

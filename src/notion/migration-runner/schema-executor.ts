@@ -3,6 +3,7 @@ import { CompleteMigrationPlan, DdlApplyExecutionSummary, DdlStepExecutionResult
 import { MigrationJournal } from './journal';
 import { StepStructuralVerifier } from './step-verifier';
 import { SchemaPlanner } from './schema-planner';
+import { materializeNotionApiPayload } from './materializer';
 
 export interface SchemaApplyExecutorOptions {
   client: Client;
@@ -473,10 +474,11 @@ export class SchemaApplyExecutor {
       };
     }
 
-    // 2. Perform Mutation
+    // 2. Perform Mutation with wire serialization compatibility
+    const wirePayload = materializeNotionApiPayload(step.sanitizedPayload);
     await (this.client.dataSources as any).update({
       data_source_id: dsId,
-      properties: step.sanitizedPayload,
+      properties: wirePayload,
     });
 
     this.journal.recordStepApplied(this.plan.planHash, step.stepNumber);
@@ -620,9 +622,10 @@ export class SchemaApplyExecutor {
       }
     }
 
-    // 2. Perform Creation via initial_data_source with migration marker in description
+    // 2. Perform Creation via initial_data_source with migration marker in description and wire serialization
+    const materializedStepPayload = materializeNotionApiPayload(step.sanitizedPayload);
     const creationPayload: any = {
-      ...step.sanitizedPayload,
+      ...materializedStepPayload,
       description: [
         {
           type: 'text',
@@ -822,7 +825,7 @@ export class SchemaApplyExecutor {
 
     await (this.client.dataSources as any).update({
       data_source_id: transactionsDsId,
-      properties: dualRelationPayload,
+      properties: materializeNotionApiPayload(dualRelationPayload),
     });
 
     this.journal.recordStepApplied(this.plan.planHash, step.stepNumber);

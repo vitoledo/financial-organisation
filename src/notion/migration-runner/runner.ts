@@ -13,6 +13,9 @@ import {
   MigrationReadiness,
   WorktreeStatus,
   SchemaConformanceResult,
+  RecoveryPreflightReport,
+  RecoveryEligibilityResult,
+  PreflightCheckResult,
 } from './types';
 import { SchemaPlanner } from './schema-planner';
 import { BackfillPlanner } from './backfill-planner';
@@ -23,8 +26,13 @@ import { MigrationJournal } from './journal';
 import { SchemaApplyExecutor } from './schema-executor';
 import { StepStructuralVerifier } from './step-verifier';
 
+export const HOMOLOGATED_RECOVERY_PLAN_HASH =
+  'a6687b60765477849f84f885ab914f99286a38506380daa24dc37591724608db';
+export const HOMOLOGATED_RECOVERY_FROM_COMMIT =
+  '993c55ae332ab0be8ce5ea5f1b7f0b05b47b304c';
+
 export interface MigrationRunnerOptions {
-  mode?: 'dry-run' | 'apply';
+  mode?: 'dry-run' | 'apply' | 'recovery' | 'recovery-preflight';
   planHash?: string;
   backupKey?: string;
   dbPath?: string;
@@ -41,12 +49,13 @@ export interface TestDoubles {
   liveSnapshotOverride?: Record<string, Record<string, any>>;
   gitBranchOverride?: string;
   gitCommitShaOverride?: string;
+  gitParentCommitShaOverride?: string;
   simulateGitFailure?: boolean;
   simulateRemoteTrackingMismatch?: boolean;
 }
 
 export class MigrationRunner {
-  protected mode: 'dry-run' | 'apply';
+  protected mode: 'dry-run' | 'apply' | 'recovery' | 'recovery-preflight';
   protected envVars: Record<string, string | undefined>;
   protected client?: Client;
   protected preflightValidator: PreflightValidator;
@@ -257,6 +266,40 @@ export class MigrationRunner {
         dirtyFiles: [],
         unverifiedReason: `Falha ao executar comandos git: ${err.message || String(err)}`,
       };
+    }
+  }
+
+  public getGitParentCommitSha(): string | undefined {
+    if (this.testDoubles?.gitParentCommitShaOverride) {
+      return this.testDoubles.gitParentCommitShaOverride;
+    }
+    try {
+      // Use HEAD~1 to avoid shell escaping issues with '^' on Windows cmd
+      const parent = execSync('git rev-parse HEAD~1', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return parent || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  public verifyUpstreamInSync(commitSha?: string): boolean {
+    if (this.testDoubles?.simulateRemoteTrackingMismatch) {
+      return false;
+    }
+    if (this.testDoubles?.gitCommitShaOverride) {
+      return true;
+    }
+    try {
+      const upstreamSha = execSync('git rev-parse @{u}', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return Boolean(upstreamSha && commitSha && upstreamSha === commitSha);
+    } catch {
+      return false;
     }
   }
 
@@ -520,9 +563,41 @@ export class MigrationRunner {
   }
 
   /**
+   * Resolves whether physical schema mutations in RECOVERY mode are authorized.
+   * Strictly FALSE unless:
+   * 1. NOTION_SCHEMA_RECOVERY_ENABLED === 'I_UNDERSTAND_RECOVERY_ONLY'
+   * 2. NOTION_SCHEMA_RECOVERY_PLAN_HASH === HOMOLOGATED_RECOVERY_PLAN_HASH && === providedPlanHash
+   * 3. NOTION_SCHEMA_RECOVERY_FROM_COMMIT === HOMOLOGATED_RECOVERY_FROM_COMMIT
+   * 4. NOTION_SCHEMA_RECOVERY_PATCH_SHA === currentCommit
+   */
+  public resolveAllowRecoveryMutations(providedPlanHash?: string, currentCommit?: string): boolean {
+    const recoveryToken = this.envVars.NOTION_SCHEMA_RECOVERY_ENABLED?.trim();
+    const recoveryPlanHash = this.envVars.NOTION_SCHEMA_RECOVERY_PLAN_HASH?.trim();
+    const recoveryFromCommit = this.envVars.NOTION_SCHEMA_RECOVERY_FROM_COMMIT?.trim();
+    const recoveryPatchSha = this.envVars.NOTION_SCHEMA_RECOVERY_PATCH_SHA?.trim();
+
+    const isTokenValid = recoveryToken === 'I_UNDERSTAND_RECOVERY_ONLY';
+    const isPlanHashValid =
+      recoveryPlanHash === HOMOLOGATED_RECOVERY_PLAN_HASH &&
+      Boolean(providedPlanHash) &&
+      recoveryPlanHash === providedPlanHash;
+    const isFromCommitValid = recoveryFromCommit === HOMOLOGATED_RECOVERY_FROM_COMMIT;
+    const isPatchShaValid =
+      Boolean(currentCommit) &&
+      Boolean(recoveryPatchSha) &&
+      recoveryPatchSha === currentCommit;
+
+    return isTokenValid && isPlanHashValid && isFromCommitValid && isPatchShaValid;
+  }
+
+  /**
    * Execution dispatcher.
    */
   public async execute(providedPlanHash?: string): Promise<MigrationReport> {
+    if (this.mode === 'recovery-preflight') {
+      return this.runRecoveryPreflight(providedPlanHash);
+    }
+
     if (this.mode === 'dry-run') {
       return this.runDryRun();
     }
@@ -614,12 +689,6 @@ export class MigrationRunner {
         );
       }
 
-      if (gitState.commitSha !== plan.inputFingerprint.commitSha) {
-        throw new Error(
-          `RESUME_FINGERPRINT_MISMATCH: Commit SHA atual (${gitState.commitSha}) diverge do commit SHA do plano persistido (${plan.inputFingerprint.commitSha}).`,
-        );
-      }
-
       const currentParentPageId = (this.envVars.NOTION_PARENT_PAGE_ID || '').trim();
       if (currentParentPageId !== plan.inputFingerprint.parentPageId) {
         throw new Error(
@@ -644,6 +713,28 @@ export class MigrationRunner {
       const preflight = await this.preflightValidator.runPreflight(this.envVars);
       if (this.testDoubles?.liveSnapshotOverride) {
         preflight.liveSnapshot = this.testDoubles.liveSnapshotOverride;
+      }
+
+      const isRecoveryRequested =
+        this.mode === 'recovery' ||
+        Boolean(this.envVars.NOTION_SCHEMA_RECOVERY_ENABLED);
+
+      if (isRecoveryRequested) {
+        const recoveryCheck = this.validateRecoveryEligibility(
+          providedPlanHash,
+          plan,
+          gitState,
+          preflight,
+        );
+        if (!recoveryCheck.eligible) {
+          throw new Error(
+            `RECOVERY_BLOCKED: Recovery não autorizado. Motivos:\n${recoveryCheck.reasons.join('\n')}`,
+          );
+        }
+      } else if (gitState.commitSha !== plan.inputFingerprint.commitSha) {
+        throw new Error(
+          `RESUME_FINGERPRINT_MISMATCH: Commit SHA atual (${gitState.commitSha}) diverge do commit SHA do plano persistido (${plan.inputFingerprint.commitSha}).`,
+        );
       }
 
       // Validate live state against: baseline + verified/applied steps in journal
@@ -907,7 +998,12 @@ export class MigrationRunner {
       // Create pre-resume safety backup
       await this.backupManager.createEncryptedBackup();
 
-      const allowRealMutations = this.resolveAllowRealMutations(providedPlanHash);
+      let allowRealMutations = false;
+      if (isRecoveryRequested) {
+        allowRealMutations = this.resolveAllowRecoveryMutations(providedPlanHash, gitState.commitSha);
+      } else {
+        allowRealMutations = this.resolveAllowRealMutations(providedPlanHash);
+      }
 
       const executor = new SchemaApplyExecutor({
         client: this.client,
@@ -938,9 +1034,302 @@ export class MigrationRunner {
   }
 
   /**
+   * Validates whether the environment, git repository, and live workspace qualify for RECOVERY_APPLY.
+   */
+  public validateRecoveryEligibility(
+    providedPlanHash: string,
+    plan: CompleteMigrationPlan,
+    gitState: { status: WorktreeStatus; branch?: string; commitSha?: string; dirtyFiles: string[] },
+    preflight: PreflightCheckResult,
+  ): RecoveryEligibilityResult {
+    const reasons: string[] = [];
+
+    // 1. Plan Hash Match
+    const planHashMatch =
+      providedPlanHash === HOMOLOGATED_RECOVERY_PLAN_HASH &&
+      plan.planHash === HOMOLOGATED_RECOVERY_PLAN_HASH;
+    if (!planHashMatch) {
+      reasons.push(
+        `PLAN_HASH_MISMATCH: Recovery só é autorizado para o plano homologado '${HOMOLOGATED_RECOVERY_PLAN_HASH}' (fornecido: '${providedPlanHash}', persistido: '${plan.planHash}').`,
+      );
+    }
+
+    // 2. Original Commit Match
+    const originalCommitMatch = plan.inputFingerprint.commitSha === HOMOLOGATED_RECOVERY_FROM_COMMIT;
+    if (!originalCommitMatch) {
+      reasons.push(
+        `ORIGINAL_COMMIT_MISMATCH: Commit original do plano persistido '${plan.inputFingerprint.commitSha}' diverge de '${HOMOLOGATED_RECOVERY_FROM_COMMIT}'.`,
+      );
+    }
+
+    // 3. Parent Commit of current HEAD
+    const parentSha = this.getGitParentCommitSha();
+    const parentCommitMatch = parentSha === HOMOLOGATED_RECOVERY_FROM_COMMIT;
+    if (!parentCommitMatch) {
+      reasons.push(
+        `PARENT_COMMIT_MISMATCH: HEAD atual (${gitState.commitSha}) não possui '${HOMOLOGATED_RECOVERY_FROM_COMMIT}' como parent direto (parent encontrado: '${parentSha || 'nenhum'}').`,
+      );
+    }
+
+    // 4. Working tree clean
+    const worktreeClean = gitState.status === 'WORKTREE_CLEAN';
+    if (!worktreeClean) {
+      reasons.push(
+        `WORKTREE_DIRTY: Working tree não está limpa (${gitState.dirtyFiles.join(', ')}).`,
+      );
+    }
+
+    // 5. Upstream in sync
+    const upstreamInSync = this.verifyUpstreamInSync(gitState.commitSha);
+    if (!upstreamInSync) {
+      reasons.push(
+        `UPSTREAM_OUT_OF_SYNC: HEAD local (${gitState.commitSha}) não está sincronizado com o upstream remoto.`,
+      );
+    }
+
+    // 6. Parent page ID & Data Source IDs match
+    const currentParentPageId = (this.envVars.NOTION_PARENT_PAGE_ID || '').trim();
+    if (currentParentPageId !== plan.inputFingerprint.parentPageId) {
+      reasons.push(
+        `PARENT_PAGE_MISMATCH: Parent Page ID atual ('${currentParentPageId}') diverge do plano ('${plan.inputFingerprint.parentPageId}').`,
+      );
+    }
+
+    for (const [envKey, persistedDsId] of Object.entries(plan.inputFingerprint.dataSourceIds)) {
+      const currentDsId = (this.envVars[envKey] || '').trim();
+      if (currentDsId !== persistedDsId) {
+        reasons.push(
+          `DATA_SOURCE_ID_MISMATCH: ${envKey} atual ('${currentDsId}') diverge do plano ('${persistedDsId}').`,
+        );
+      }
+    }
+
+    // 7. Journal state check: Steps 1..10 VERIFIED, Step 11 PENDING/FAILED, no steps > 11 applied
+    const recordedSteps = this.journal.getAllSteps(providedPlanHash);
+    let journalStateValid = true;
+
+    for (let s = 1; s <= 10; s++) {
+      const stepEntry = recordedSteps.find((st) => st.stepNumber === s);
+      if (!stepEntry || (stepEntry.status !== 'VERIFIED' && stepEntry.status !== 'NO_OP_VERIFIED')) {
+        journalStateValid = false;
+        reasons.push(`JOURNAL_INVALID: Passo ${s} não está como VERIFIED no journal.`);
+      }
+    }
+
+    const step11Entry = recordedSteps.find((st) => st.stepNumber === 11);
+    if (!step11Entry || (step11Entry.status !== 'PENDING' && step11Entry.status !== 'FAILED')) {
+      journalStateValid = false;
+      reasons.push(`JOURNAL_INVALID: Passo 11 deve estar como PENDING ou FAILED no journal.`);
+    }
+
+    for (const st of recordedSteps) {
+      if (st.stepNumber > 11 && (st.status === 'VERIFIED' || st.status === 'NO_OP_VERIFIED' || st.status === 'APPLIED')) {
+        journalStateValid = false;
+        reasons.push(`JOURNAL_INVALID: Passo ${st.stepNumber} (> 11) já foi aplicado no journal.`);
+      }
+    }
+
+    // 8. Live state matches post-Step 10 projection
+    let liveStateMatchesProjection = true;
+    const liveTxProps = preflight.liveSnapshot.NOTION_DS_TRANSACTIONS ?? {};
+    const liveAccountsProps = preflight.liveSnapshot.NOTION_DS_ACCOUNTS ?? {};
+    const liveObligationsProps = preflight.liveSnapshot.NOTION_DS_MONTHLY_OBLIGATIONS ?? {};
+
+    // Steps 1..10 present
+    if (!liveObligationsProps['Status']) {
+      liveStateMatchesProjection = false;
+      reasons.push('LIVE_PROJECTION_MISMATCH: Obrigações Mensais.Status ausente ao vivo.');
+    }
+    const accountsExpected = [
+      'Limite Operacional Usado',
+      'Limite Usado da Fonte (Bruto)',
+      'Dia de Fechamento',
+      'Dia de Vencimento',
+    ];
+    for (const p of accountsExpected) {
+      if (!liveAccountsProps[p]) {
+        liveStateMatchesProjection = false;
+        reasons.push(`LIVE_PROJECTION_MISMATCH: Contas.${p} ausente ao vivo.`);
+      }
+    }
+
+    const txExpected = [
+      'Hash Canônico',
+      'Valor Bruto da Fonte',
+      'Efeito Orçamentário',
+      'Propósito de Alocação',
+      'Contribuição Meta Poupança',
+    ];
+    for (const p of txExpected) {
+      if (!liveTxProps[p]) {
+        liveStateMatchesProjection = false;
+        reasons.push(`LIVE_PROJECTION_MISMATCH: Transações.${p} ausente ao vivo.`);
+      }
+    }
+
+    // Step 11 MUST be absent live
+    if (liveTxProps['Conta Destino']) {
+      liveStateMatchesProjection = false;
+      reasons.push('LIVE_PROJECTION_MISMATCH: Transações.Conta Destino já existe ao vivo no Notion.');
+    }
+
+    // Dual relation MUST be absent live
+    if (liveTxProps['Fatura Vinculada']) {
+      liveStateMatchesProjection = false;
+      reasons.push('LIVE_PROJECTION_MISMATCH: Transações.Fatura Vinculada já existe ao vivo no Notion.');
+    }
+
+    // Database Faturas MUST NOT exist in journal as created or live
+    if (this.journal.getCreatedDatabaseId(providedPlanHash)) {
+      liveStateMatchesProjection = false;
+      reasons.push('LIVE_PROJECTION_MISMATCH: Base Faturas já foi criada no journal.');
+    }
+
+    // 9. Gates configuration
+    const recoveryToken = this.envVars.NOTION_SCHEMA_RECOVERY_ENABLED?.trim();
+    const recoveryPlanHash = this.envVars.NOTION_SCHEMA_RECOVERY_PLAN_HASH?.trim();
+    const recoveryFromCommit = this.envVars.NOTION_SCHEMA_RECOVERY_FROM_COMMIT?.trim();
+    const recoveryPatchSha = this.envVars.NOTION_SCHEMA_RECOVERY_PATCH_SHA?.trim();
+
+    const patchCommitConfirmed = Boolean(
+      recoveryPatchSha && gitState.commitSha && recoveryPatchSha === gitState.commitSha,
+    );
+    if (!patchCommitConfirmed) {
+      reasons.push(
+        `PATCH_SHA_MISMATCH: NOTION_SCHEMA_RECOVERY_PATCH_SHA ('${recoveryPatchSha || 'ausente'}') não coincide com HEAD atual ('${gitState.commitSha}').`,
+      );
+    }
+
+    const gatesConfigured =
+      recoveryToken === 'I_UNDERSTAND_RECOVERY_ONLY' &&
+      recoveryPlanHash === HOMOLOGATED_RECOVERY_PLAN_HASH &&
+      recoveryFromCommit === HOMOLOGATED_RECOVERY_FROM_COMMIT &&
+      patchCommitConfirmed;
+
+    if (!gatesConfigured) {
+      if (recoveryToken !== 'I_UNDERSTAND_RECOVERY_ONLY') {
+        reasons.push('RECOVERY_GATE_INVALID: NOTION_SCHEMA_RECOVERY_ENABLED deve ser "I_UNDERSTAND_RECOVERY_ONLY".');
+      }
+      if (recoveryPlanHash !== HOMOLOGATED_RECOVERY_PLAN_HASH) {
+        reasons.push(`RECOVERY_GATE_INVALID: NOTION_SCHEMA_RECOVERY_PLAN_HASH deve ser "${HOMOLOGATED_RECOVERY_PLAN_HASH}".`);
+      }
+      if (recoveryFromCommit !== HOMOLOGATED_RECOVERY_FROM_COMMIT) {
+        reasons.push(`RECOVERY_GATE_INVALID: NOTION_SCHEMA_RECOVERY_FROM_COMMIT deve ser "${HOMOLOGATED_RECOVERY_FROM_COMMIT}".`);
+      }
+    }
+
+    const eligible =
+      planHashMatch &&
+      originalCommitMatch &&
+      parentCommitMatch &&
+      worktreeClean &&
+      upstreamInSync &&
+      journalStateValid &&
+      liveStateMatchesProjection &&
+      patchCommitConfirmed &&
+      gatesConfigured;
+
+    return {
+      eligible,
+      reasons,
+      planHashMatch,
+      originalCommitMatch,
+      parentCommitMatch,
+      patchCommitConfirmed,
+      worktreeClean,
+      upstreamInSync,
+      journalStateValid,
+      liveStateMatchesProjection,
+      gatesConfigured,
+    };
+  }
+
+  public async runRecoveryPreflight(providedPlanHash?: string): Promise<RecoveryPreflightReport> {
+    const hash = providedPlanHash ?? HOMOLOGATED_RECOVERY_PLAN_HASH;
+    const plan = this.journal.getPlan(hash);
+    if (!plan) {
+      throw new Error(`PLAN_NOT_FOUND: Plano com hash ${hash} não encontrado no journal.`);
+    }
+
+    const gitState = this.resolveGitState();
+    const parentSha = this.getGitParentCommitSha();
+
+    const preflight = await this.preflightValidator.runPreflight(this.envVars);
+    if (this.testDoubles?.liveSnapshotOverride) {
+      preflight.liveSnapshot = this.testDoubles.liveSnapshotOverride;
+    }
+
+    const eligibility = this.validateRecoveryEligibility(hash, plan, gitState, preflight);
+
+    const recordedSteps = this.journal.getAllSteps(hash);
+    const completedSteps = recordedSteps.filter(
+      (s) => s.status === 'VERIFIED' || s.status === 'NO_OP_VERIFIED',
+    );
+    const frontierStep = plan.schemaPlan.steps.find((s) => !completedSteps.some((c) => c.stepNumber === s.stepNumber));
+
+    return {
+      mode: 'recovery-preflight',
+      timestamp: new Date().toISOString(),
+      planHash: hash,
+      originalCommitSha: plan.inputFingerprint.commitSha,
+      currentCommitSha: gitState.commitSha ?? 'unknown',
+      parentCommitSha: parentSha,
+      eligibility,
+      journalStepsCompleted: completedSteps.length,
+      frontierStepNumber: frontierStep?.stepNumber ?? 11,
+      frontierStepProperty: frontierStep?.property,
+      preflight,
+      mutationsExecuted: 0,
+    };
+  }
+
+  /**
    * Formats a comprehensive dry-run or apply report for terminal display.
    */
   public formatReport(report: MigrationReport): string {
+    if (report.mode === 'recovery-preflight') {
+      const lines: string[] = [];
+      lines.push('═══════════════════════════════════════════════════════════════════════════════');
+      lines.push('  RELATÓRIO DO NOTION MIGRATION RUNNER — RECOVERY PREFLIGHT (READ-ONLY)');
+      lines.push('═══════════════════════════════════════════════════════════════════════════════\n');
+      lines.push('Modo de Execução: RECOVERY-PREFLIGHT (Estritamente Read-Only)');
+      lines.push(`Timestamp: ${report.timestamp}`);
+      lines.push(`Plan Hash Alvo: ${report.planHash}`);
+      lines.push(`Commit Original Homologado: ${report.originalCommitSha}`);
+      lines.push(`Commit Atual (HEAD): ${report.currentCommitSha}`);
+      lines.push(`Parent Commit (HEAD^): ${report.parentCommitSha ?? 'não detectado'}\n`);
+
+      const elig = report.eligibility;
+      lines.push('Status da Elegibilidade para Recovery:');
+      lines.push(`  • Plan Hash Homologado: ${elig.planHashMatch ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
+      lines.push(`  • Commit Original Homologado: ${elig.originalCommitMatch ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
+      lines.push(`  • Parent Commit Direto (HEAD^): ${elig.parentCommitMatch ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
+      lines.push(`  • Working Tree Limpa: ${elig.worktreeClean ? '✅ LIMPA' : '❌ DIRTY'}`);
+      lines.push(`  • Upstream Remoto em Sincronia: ${elig.upstreamInSync ? '✅ EM SINC' : '❌ DIVERGENTE'}`);
+      lines.push(`  • Integridade do Journal (Passos 1..10 OK, 11 PENDING): ${elig.journalStateValid ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
+      lines.push(`  • Projeção do Estado Live do Notion: ${elig.liveStateMatchesProjection ? '✅ CONFORME PÓS-STEP 10' : '❌ DIVERGENTE'}`);
+      lines.push(`  • Confirmação do Patch SHA: ${elig.patchCommitConfirmed ? '✅ CONFIRMADO' : '⚠️ NÃO CONFIRMADO'}`);
+      lines.push(`  • Gates Operacionais de Recovery: ${elig.gatesConfigured ? '🟢 HABILITADOS' : '🔒 DESABILITADOS (Segurança Ativa)'}\n`);
+
+      lines.push('Diagnóstico de Execução:');
+      lines.push(`  • Passos Concluídos no Journal: ${report.journalStepsCompleted}/54`);
+      lines.push(`  • Próximo Passo a Executar (Frontier): Passo ${report.frontierStepNumber} [${report.frontierStepProperty ?? 'desconhecido'}]`);
+      lines.push(`  • Mutações no Notion: 0 (Estritamente Read-Only)\n`);
+
+      if (elig.reasons.length > 0) {
+        lines.push('Observações / Motivos de Bloqueio Operacional:');
+        for (const reason of elig.reasons) {
+          lines.push(`  - ${reason}`);
+        }
+        lines.push('');
+      }
+
+      lines.push('═══════════════════════════════════════════════════════════════════════════════');
+      lines.push('  FIM DO RELATÓRIO — NENHUMA ALTERAÇÃO REALIZADA NO WORKSPACE DO NOTION');
+      lines.push('═══════════════════════════════════════════════════════════════════════════════');
+      return lines.join('\n');
+    }
+
     if (report.mode === 'apply') {
       const lines: string[] = [];
       lines.push('═══════════════════════════════════════════════════════════════════════════════');

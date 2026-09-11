@@ -380,7 +380,7 @@ export class SchemaPlanner {
           [name]: {
             relation: {
               data_source_id: targetId || `<TARGET_${targetEnvKey}>`,
-              type: 'single_property',
+              single_property: {},
             },
           },
         };
