@@ -667,11 +667,12 @@ describe('Domain: Schema Contract Specification', () => {
     expect(logStatus?.optionMappings?.['Executando']).toBe('RUNNING');
 
     const logFonte = logProps.find((p) => p.domainField === 'syncSource');
-    expect(logFonte?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração']);
+    expect(logFonte?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
     expect(logFonte?.optionMappings).toEqual({
       'Pierre': 'PIERRE',
       'Manual': 'MANUAL',
       'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
     });
   });
 
@@ -941,11 +942,10 @@ describe('Domain: Generic Canonical Identity (Decoupled from Pierre)', () => {
     expect(fonteAcc).toBeDefined();
     expect(fonteAcc?.notionType).toBe('select');
     expect(fonteAcc?.authority).toBe('UPSTREAM');
-    expect(fonteAcc?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteAcc?.expectedOptions).toEqual(['Pierre', 'Manual', 'Outra']);
     expect(fonteAcc?.optionMappings).toEqual({
       'Pierre': 'PIERRE',
       'Manual': 'MANUAL',
-      'Migração': 'MIGRATION',
       'Outra': 'OTHER',
     });
     expect(fonteAcc?.allowExtraOptions).toBe(true);
@@ -1057,11 +1057,12 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
       'Tipo de Conta': {
         type: 'select',
         selectOptions: [
-          'Conta Corrente',
-          'Cartão de Crédito',
-          'Conta Poupança',
-          'Conta de Investimento',
-          'Carteira Dinheiro',
+          'Conta corrente',
+          'Cartão de crédito',
+          'Carteira',
+          'Corretora',
+          'Dinheiro',
+          'Outro',
         ],
       },
     };
@@ -1082,9 +1083,9 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
         selectOptions: [
           'CHECKING_ACCOUNT',
           'CREDIT_CARD',
-          'SAVINGS_ACCOUNT',
-          'INVESTMENT_ACCOUNT',
           'CASH_WALLET',
+          'INVESTMENT_ACCOUNT',
+          'OTHER',
         ],
       },
     };
@@ -1101,7 +1102,7 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
     const actualProps: Record<string, NotionPropertySnapshot> = {
       'Tipo de Conta': {
         type: 'select',
-        selectOptions: ['Conta Corrente', 'Cartão de Crédito'], // Missing Conta Poupança, etc.
+        selectOptions: ['Conta corrente', 'Cartão de crédito'], // Missing Carteira, Corretora, Dinheiro, Outro
       },
     };
 
@@ -1109,7 +1110,7 @@ describe('Notion: Structural Property Validation (Select Options, Relation Targe
     const tipo = diffs.find((d) => d.notionProperty === 'Tipo de Conta');
     expect(tipo?.status).toBe('STRUCTURAL_MISMATCH');
     expect(tipo?.description).toContain('Opções ausentes');
-    expect(tipo?.description).toContain('Conta Poupança');
+    expect(tipo?.description).toContain('Carteira');
   });
 
   test('validates relation target data source UUID matching expected env key', () => {

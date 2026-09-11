@@ -758,7 +758,7 @@ function validatePropertyStructure(
   };
 }
 
-function normalizePropName(name: string): string {
+export function normalizePropName(name: string): string {
   return name
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '') // remove diacritics
