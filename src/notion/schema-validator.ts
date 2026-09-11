@@ -7,12 +7,26 @@ export type PropertyStatus =
   | 'EXACT_MATCH'
   | 'RENAME_CANDIDATE'
   | 'RENAME_TYPE_MISMATCH'
+  | 'RENAME_STRUCTURAL_MISMATCH'
+  | 'STRUCTURAL_MISMATCH'
   | 'HEURISTIC_SUGGESTION'
   | 'TYPE_MISMATCH'
   | 'MISSING'
   | 'UNVERIFIED'
   | 'PROPOSED_TO_CREATE'
   | 'EXTRA_PRESERVE';
+
+export interface NotionPropertySnapshot {
+  id?: string;
+  name?: string;
+  type: string;
+  selectOptions?: string[];
+  relationDataSourceId?: string;
+  relationDatabaseId?: string;
+  relationType?: 'single_property' | 'dual_property' | string;
+  syncedPropertyName?: string;
+  syncedPropertyId?: string;
+}
 
 export interface PropertyDiff {
   notionProperty: string;
@@ -22,6 +36,20 @@ export interface PropertyDiff {
   authority: string;
   description: string;
   candidateName?: string;
+  structuralDetails?: {
+    expectedOptions?: string[];
+    actualOptions?: string[];
+    missingOptions?: string[];
+    extraOptions?: string[];
+    allowExtraOptions?: boolean;
+    expectedRelationTargetEnvKey?: string;
+    expectedRelationTargetId?: string;
+    actualRelationTargetId?: string;
+    isBidirectionalExpected?: boolean;
+    actualRelationType?: string;
+    syncedPropertyName?: string;
+  };
+  structuralWarnings?: string[];
 }
 
 export type DataSourceStatus =
@@ -150,7 +178,7 @@ export class NotionSchemaValidator {
       // Query Notion Data Sources API
       try {
         const actualProperties = await this.fetchDataSourceProperties(dsId);
-        const diff = this.compareProperties(contract, actualProperties);
+        const diff = this.compareProperties(contract, actualProperties, envVars);
 
         report.verifiedCount++;
         report.results[key] = {
@@ -187,20 +215,52 @@ export class NotionSchemaValidator {
 
   private async fetchDataSourceProperties(
     dataSourceId: string,
-  ): Promise<Record<string, { type: string }>> {
+  ): Promise<Record<string, NotionPropertySnapshot>> {
     if (!this.client) throw new Error('Notion client not initialized');
 
     // Use exclusively modern data sources API (notion.dataSources.retrieve)
     const response = (await this.client.dataSources.retrieve({
       data_source_id: dataSourceId,
-    })) as { properties?: Record<string, { type: string }> };
+    })) as { properties?: Record<string, any> };
 
-    return response.properties ?? {};
+    const rawProps = response.properties ?? {};
+    const result: Record<string, NotionPropertySnapshot> = {};
+
+    for (const [name, prop] of Object.entries(rawProps)) {
+      const type = prop.type ?? 'unknown';
+      const snapshot: NotionPropertySnapshot = {
+        id: prop.id,
+        name: prop.name ?? name,
+        type,
+      };
+
+      if (type === 'select' && prop.select?.options) {
+        snapshot.selectOptions = prop.select.options.map((o: any) => o.name);
+      } else if (type === 'multi_select' && prop.multi_select?.options) {
+        snapshot.selectOptions = prop.multi_select.options.map((o: any) => o.name);
+      } else if (type === 'status' && prop.status?.options) {
+        snapshot.selectOptions = prop.status.options.map((o: any) => o.name);
+      } else if (type === 'relation' && prop.relation) {
+        snapshot.relationDataSourceId = prop.relation.data_source_id;
+        snapshot.relationDatabaseId = prop.relation.database_id;
+        snapshot.relationType =
+          prop.relation.type ?? (prop.relation.dual_property ? 'dual_property' : 'single_property');
+        if (prop.relation.dual_property) {
+          snapshot.syncedPropertyName = prop.relation.dual_property.synced_property_name;
+          snapshot.syncedPropertyId = prop.relation.dual_property.synced_property_id;
+        }
+      }
+
+      result[name] = snapshot;
+    }
+
+    return result;
   }
 
   public compareProperties(
     contract: DataSourceContract,
-    actual: Record<string, { type: string }>,
+    actual: Record<string, NotionPropertySnapshot | { type: string }>,
+    envVars: Record<string, string | undefined> = {},
   ): PropertyDiff[] {
     const diffs: PropertyDiff[] = [];
     const consumedActualKeys = new Set<string>();
@@ -219,17 +279,44 @@ export class NotionSchemaValidator {
 
       if (matchKey) {
         consumedActualKeys.add(matchKey);
-        const actualType = actual[matchKey].type;
+        const actualProp = actual[matchKey];
+        const actualType = actualProp.type;
         const isTypeMatch = actualType === expected.notionType;
 
-        diffs.push({
-          notionProperty: matchKey,
-          expectedType: expected.notionType,
-          actualType,
-          status: isTypeMatch ? 'EXACT_MATCH' : 'TYPE_MISMATCH',
-          authority: expected.authority,
-          description: expected.description,
-        });
+        if (!isTypeMatch) {
+          diffs.push({
+            notionProperty: matchKey,
+            expectedType: expected.notionType,
+            actualType,
+            status: 'TYPE_MISMATCH',
+            authority: expected.authority,
+            description: expected.description,
+          });
+        } else {
+          const struct = validatePropertyStructure(expected, actualProp as NotionPropertySnapshot, envVars);
+          if (struct.isCompatible) {
+            diffs.push({
+              notionProperty: matchKey,
+              expectedType: expected.notionType,
+              actualType,
+              status: 'EXACT_MATCH',
+              authority: expected.authority,
+              description: expected.description,
+              structuralDetails: struct.details,
+            });
+          } else {
+            diffs.push({
+              notionProperty: matchKey,
+              expectedType: expected.notionType,
+              actualType,
+              status: 'STRUCTURAL_MISMATCH',
+              authority: expected.authority,
+              description: `${expected.description} [Divergência Estrutural: ${struct.warnings.join('; ')}]`,
+              structuralDetails: struct.details,
+              structuralWarnings: struct.warnings,
+            });
+          }
+        }
       } else {
         afterTier1Expected.push(expected);
       }
@@ -253,20 +340,11 @@ export class NotionSchemaValidator {
 
       if (matchedAliasKey) {
         consumedActualKeys.add(matchedAliasKey);
-        const actualType = actual[matchedAliasKey].type;
+        const actualProp = actual[matchedAliasKey];
+        const actualType = actualProp.type;
         const isTypeCompatible = actualType === expected.notionType;
 
-        if (isTypeCompatible) {
-          diffs.push({
-            notionProperty: expected.notionProperty,
-            expectedType: expected.notionType,
-            actualType,
-            status: 'RENAME_CANDIDATE',
-            candidateName: matchedAliasKey,
-            authority: expected.authority,
-            description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}" com tipo compatível: ${actualType})`,
-          });
-        } else {
+        if (!isTypeCompatible) {
           diffs.push({
             notionProperty: expected.notionProperty,
             expectedType: expected.notionType,
@@ -276,6 +354,32 @@ export class NotionSchemaValidator {
             authority: expected.authority,
             description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}", porém com tipo incompatível: esperado "${expected.notionType}", encontrado "${actualType}")`,
           });
+        } else {
+          const struct = validatePropertyStructure(expected, actualProp as NotionPropertySnapshot, envVars);
+          if (struct.isCompatible) {
+            diffs.push({
+              notionProperty: expected.notionProperty,
+              expectedType: expected.notionType,
+              actualType,
+              status: 'RENAME_CANDIDATE',
+              candidateName: matchedAliasKey,
+              authority: expected.authority,
+              description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}" com tipo compatível: ${actualType})`,
+              structuralDetails: struct.details,
+            });
+          } else {
+            diffs.push({
+              notionProperty: expected.notionProperty,
+              expectedType: expected.notionType,
+              actualType,
+              status: 'RENAME_STRUCTURAL_MISMATCH',
+              candidateName: matchedAliasKey,
+              authority: expected.authority,
+              description: `${expected.description} (Mapeado via alias explícito: "${matchedAliasKey}", tipo compatível, mas com divergência estrutural: ${struct.warnings.join('; ')})`,
+              structuralDetails: struct.details,
+              structuralWarnings: struct.warnings,
+            });
+          }
         }
       } else {
         afterTier2Expected.push(expected);
@@ -373,6 +477,8 @@ export class NotionSchemaValidator {
     const allProps = Object.values(report.results).flatMap((r) => r.properties);
     const totalExact = allProps.filter((p) => p.status === 'EXACT_MATCH').length;
     const totalRename = allProps.filter((p) => p.status === 'RENAME_CANDIDATE').length;
+    const totalStructural = allProps.filter((p) => p.status === 'STRUCTURAL_MISMATCH').length;
+    const totalRenameStructural = allProps.filter((p) => p.status === 'RENAME_STRUCTURAL_MISMATCH').length;
     const totalRenameMismatch = allProps.filter((p) => p.status === 'RENAME_TYPE_MISMATCH').length;
     const totalHeuristic = allProps.filter((p) => p.status === 'HEURISTIC_SUGGESTION').length;
     const totalTypeMismatch = allProps.filter((p) => p.status === 'TYPE_MISMATCH').length;
@@ -385,6 +491,8 @@ export class NotionSchemaValidator {
     lines.push('| :--- | :--- |');
     lines.push(`| Correspondência Exata (EXACT_MATCH) | ${totalExact} |`);
     lines.push(`| Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | ${totalRename} |`);
+    lines.push(`| Divergência Estrutural em Nome Exato (STRUCTURAL_MISMATCH) | ${totalStructural} |`);
+    lines.push(`| Alias com Divergência Estrutural (RENAME_STRUCTURAL_MISMATCH) | ${totalRenameStructural} |`);
     lines.push(`| Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | ${totalRenameMismatch} |`);
     lines.push(`| Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | ${totalHeuristic} |`);
     lines.push(`| Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | ${totalTypeMismatch} |`);
@@ -441,6 +549,12 @@ export class NotionSchemaValidator {
             break;
           case 'RENAME_TYPE_MISMATCH':
             statusBadge = `🔄❌ RENAME_TYPE_MISMATCH (\`${p.candidateName}\`)`;
+            break;
+          case 'STRUCTURAL_MISMATCH':
+            statusBadge = '⚠️ STRUCTURAL_MISMATCH';
+            break;
+          case 'RENAME_STRUCTURAL_MISMATCH':
+            statusBadge = `🔄⚠️ RENAME_STRUCTURAL_MISMATCH (\`${p.candidateName}\`)`;
             break;
           case 'HEURISTIC_SUGGESTION':
             statusBadge = `💡 HEURISTIC_SUGGESTION (\`${p.candidateName}\`) [Não-autoritativo]`;
@@ -510,6 +624,138 @@ export class NotionSchemaValidator {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(targetPath, md, 'utf8');
   }
+}
+
+function normalizeUuid(id?: string): string {
+  if (!id) return '';
+  return id.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+}
+
+function compareUuids(id1?: string, id2?: string): boolean {
+  if (!id1 || !id2) return false;
+  return normalizeUuid(id1) === normalizeUuid(id2);
+}
+
+function validatePropertyStructure(
+  expected: PropertyContract,
+  actual: NotionPropertySnapshot,
+  envVars?: Record<string, string | undefined>,
+): {
+  isCompatible: boolean;
+  warnings: string[];
+  details?: PropertyDiff['structuralDetails'];
+} {
+  const warnings: string[] = [];
+  const details: NonNullable<PropertyDiff['structuralDetails']> = {};
+  let isCompatible = true;
+
+  // 1. Select / multi_select / status options validation (when options snapshot is provided)
+  const targetOptions =
+    expected.expectedOptions ?? (expected.optionMappings ? Object.keys(expected.optionMappings) : undefined);
+
+  if (
+    targetOptions &&
+    targetOptions.length > 0 &&
+    (actual.type === 'select' || actual.type === 'multi_select' || actual.type === 'status') &&
+    Array.isArray(actual.selectOptions)
+  ) {
+    details.expectedOptions = targetOptions;
+    details.actualOptions = actual.selectOptions;
+    const actualNorm = new Set(actual.selectOptions.map(normalizePropName));
+    const mappings = expected.optionMappings || {};
+
+    const missing = targetOptions.filter((opt) => {
+      // 1. Direct match with expected option name
+      if (actualNorm.has(normalizePropName(opt))) return false;
+      // 2. Forward mapping check (e.g. opt="Conta Corrente", mappedVal="CHECKING_ACCOUNT")
+      const mappedVal = mappings[opt];
+      if (mappedVal && actualNorm.has(normalizePropName(mappedVal))) return false;
+      // 3. Reverse mapping check (e.g. opt="CHECKING_ACCOUNT", key="Conta Corrente")
+      for (const [k, v] of Object.entries(mappings)) {
+        if (normalizePropName(v) === normalizePropName(opt) && actualNorm.has(normalizePropName(k))) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (missing.length > 0) {
+      details.missingOptions = missing;
+      warnings.push(
+        `Opções ausentes no Notion (${missing.length}): ${missing.map((o) => `"${o}"`).join(', ')}`,
+      );
+      isCompatible = false;
+    }
+
+    if (expected.allowExtraOptions !== undefined) {
+      details.allowExtraOptions = expected.allowExtraOptions;
+    }
+
+    // If strictly closed enum (allowExtraOptions === false), check for unmapped options
+    if (expected.allowExtraOptions === false) {
+      const allowedNorm = new Set<string>();
+      for (const opt of targetOptions) {
+        allowedNorm.add(normalizePropName(opt));
+        if (mappings[opt]) allowedNorm.add(normalizePropName(mappings[opt]));
+      }
+      for (const [k, v] of Object.entries(mappings)) {
+        allowedNorm.add(normalizePropName(k));
+        allowedNorm.add(normalizePropName(v));
+      }
+      const extra = actual.selectOptions.filter((o) => !allowedNorm.has(normalizePropName(o)));
+      if (extra.length > 0) {
+        details.extraOptions = extra;
+        warnings.push(
+          `Opções adicionais não homologadas no Notion (${extra.length}): ${extra.map((o) => `"${o}"`).join(', ')}`,
+        );
+        isCompatible = false;
+      }
+    }
+  }
+
+  // 2. Relation target data_source_id / database_id & bidirectional validation (when relation snapshot is provided)
+  if (expected.relationTargetEnvKey && actual.type === 'relation') {
+    const expectedTargetId = envVars ? envVars[expected.relationTargetEnvKey]?.trim() : undefined;
+    details.expectedRelationTargetEnvKey = expected.relationTargetEnvKey;
+    if (expectedTargetId) details.expectedRelationTargetId = expectedTargetId;
+    const actualTargetId = actual.relationDataSourceId ?? actual.relationDatabaseId;
+    if (actualTargetId) details.actualRelationTargetId = actualTargetId;
+
+    if (expectedTargetId && actualTargetId) {
+      if (!compareUuids(expectedTargetId, actualTargetId)) {
+        warnings.push(
+          `Alvo da relação divergente: esperado ${expected.relationTargetEnvKey} (${maskId(expectedTargetId)}), encontrado ${maskId(actualTargetId)}`,
+        );
+        isCompatible = false;
+      }
+    }
+
+    if (expected.isBidirectionalRelation && actual.relationType !== undefined) {
+      details.isBidirectionalExpected = true;
+      details.actualRelationType = actual.relationType;
+      if (actual.relationType !== 'dual_property') {
+        warnings.push(`Relação unidirecional quando esperado bidirecional (dual_property)`);
+        isCompatible = false;
+      }
+      if (expected.syncedPropertyName && actual.syncedPropertyName !== undefined) {
+        details.syncedPropertyName = expected.syncedPropertyName;
+        if (
+          normalizePropName(actual.syncedPropertyName) !== normalizePropName(expected.syncedPropertyName)
+        ) {
+          warnings.push(
+            `Propriedade espelhada divergente: esperado "${expected.syncedPropertyName}", encontrado "${actual.syncedPropertyName}"`,
+          );
+          isCompatible = false;
+        }
+      }
+    }
+  }
+
+  return {
+    isCompatible,
+    warnings,
+    details: Object.keys(details).length > 0 ? details : undefined,
+  };
 }
 
 function normalizePropName(name: string): string {

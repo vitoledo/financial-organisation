@@ -39,6 +39,7 @@ export interface TransactionRow {
   category_mapped: string | null;
   category_pierre: string | null;
   category_group: string | null;
+  category_variability: string | null;
   direction: string;
   amount: number;
   account_name: string | null;

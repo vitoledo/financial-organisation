@@ -13,9 +13,11 @@ import {
   calculateMarketValue,
   calculateBillDiscrepancy,
   TransactionBankStatus,
+  AccountDomainEntity,
+  TransactionDomainEntity,
 } from '../src/domain/types';
 import { TARGET_CONTRACT } from '../src/domain/schema-contract';
-import { NotionSchemaValidator } from '../src/notion/schema-validator';
+import { NotionSchemaValidator, NotionPropertySnapshot } from '../src/notion/schema-validator';
 
 describe('Domain: Money (BigInt Minor Units & Exact Rational Math)', () => {
   test('creates Money from cents correctly', () => {
@@ -346,6 +348,7 @@ describe('Domain: Transaction Idempotency Key & Canonical Fingerprint', () => {
       sourceTransactionId: 'tx-99',
       amountMinor: 1500n,
       currency: 'BRL',
+      scale: 2,
       dateIso: '2026-06-29T17:51:21.000Z',
       status: 'PENDING',
       description: 'Pagamento de fatura',
@@ -453,7 +456,7 @@ describe('Domain: Schema Contract Specification', () => {
       'date', 'relation', 'checkbox', 'formula', 'rollup',
       'created_time', 'last_edited_time',
     ]);
-    const validAuthorities = new Set(['PIERRE', 'REGRA_AUTOMATICA', 'USUARIO', 'DERIVADO']);
+    const validAuthorities = new Set(['PIERRE', 'UPSTREAM', 'FONTE_EXTERNA', 'REGRA_AUTOMATICA', 'USUARIO', 'DERIVADO']);
 
     for (const [dsKey, ds] of Object.entries(TARGET_CONTRACT)) {
       expect(ds.properties.length).toBeGreaterThan(0);
@@ -687,4 +690,483 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     expect(md).not.toContain('Bearer');
   });
 });
+
+describe('Domain: Money & DecimalQuantity Hardening (Parsing & Scale Validation)', () => {
+  test('rejects empty or whitespace-only decimal strings', () => {
+    expect(() => Money.fromDecimal('')).toThrow(/invalid decimal string/i);
+    expect(() => Money.fromDecimal('   ')).toThrow(/invalid decimal string/i);
+    expect(() => DecimalQuantity.fromDecimal('')).toThrow(/invalid decimal string/i);
+    expect(() => DecimalQuantity.fromDecimal(' \t ')).toThrow(/invalid decimal string/i);
+  });
+
+  test('rejects invalid decimal string formats (multiple dots, letters, isolated signs/dots)', () => {
+    const invalidStrings = [
+      '1.2.3',
+      '1,2,3',
+      'abc',
+      '12a3',
+      '.',
+      ',',
+      '+',
+      '-',
+      '+.',
+      '-.',
+      '--',
+      '++1',
+      '1..0',
+      '1 00',
+    ];
+    for (const str of invalidStrings) {
+      expect(() => Money.fromDecimal(str)).toThrow();
+      expect(() => DecimalQuantity.fromDecimal(str)).toThrow();
+    }
+  });
+
+  test('validates scale parameter (safe integer 0..20)', () => {
+    expect(() => Money.fromDecimal('10.5', 'BRL', -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => Money.fromDecimal('10.5', 'BRL', 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => Money.fromDecimal('10.5', 'BRL', 2.5)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => Money.fromDecimal('10.5', 'BRL', NaN)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => Money.fromDecimal('10.5', 'BRL', Infinity)).toThrow(/Scale must be an integer between 0 and 20/i);
+
+    expect(() => DecimalQuantity.fromDecimal('10.5', -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => DecimalQuantity.fromDecimal('10.5', 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+  });
+
+  test('validates currency parameter on Money', () => {
+    expect(() => Money.fromDecimal('10.5', '', 2)).toThrow('currency must be a non-empty string');
+    expect(() => Money.fromDecimal('10.5', '   ', 2)).toThrow('currency must be a non-empty string');
+    expect(() => Money.fromMinor(100, '', 2)).toThrow('currency must be a non-empty string');
+  });
+
+  test('correctly parses various valid decimal strings', () => {
+    expect(Money.fromDecimal('0').amountMinor).toBe(0n);
+    expect(Money.fromDecimal('0.00').amountMinor).toBe(0n);
+    expect(Money.fromDecimal('.5').amountMinor).toBe(50n);
+    expect(Money.fromDecimal('-,5').amountMinor).toBe(-50n);
+    expect(Money.fromDecimal('+100.25').amountMinor).toBe(10025n);
+    expect(Money.fromDecimal('-100,25').amountMinor).toBe(-10025n);
+  });
+});
+
+describe('Domain: Generic Canonical Identity (Decoupled from Pierre)', () => {
+  test('TransactionIdempotencyKey works with generic source and account identifiers', () => {
+    const key = buildTransactionIdempotencyKey({
+      source: 'MANUAL',
+      sourceAccountId: 'acc-uuid-1',
+      sourceTransactionId: 'tx-uuid-999',
+    });
+    expect(key).toBe('MANUAL:acc-uuid-1:tx-uuid-999');
+
+    const vendorKey = buildTransactionIdempotencyKey({
+      source: 'PIERRE',
+      sourceAccountId: 'pierre-acc-42',
+      sourceTransactionId: 'pierre-tx-100',
+    });
+    expect(vendorKey).toBe('PIERRE:pierre-acc-42:pierre-tx-100');
+  });
+
+  test('AccountDomainEntity and TransactionDomainEntity use generic canonical fields', () => {
+    const acc: AccountDomainEntity = {
+      name: 'Nubank Conta Corrente',
+      source: 'PIERRE',
+      sourceAccountId: 'nubank-cc-01',
+      currency: 'BRL',
+      institution: 'Nubank',
+      type: 'CHECKING_ACCOUNT',
+      balance: Money.fromDecimal('1500.00'),
+      includeInCash: true,
+      includeInNetWorth: true,
+    };
+    expect(acc.source).toBe('PIERRE');
+    expect(acc.sourceAccountId).toBe('nubank-cc-01');
+    expect(acc.currency).toBe('BRL');
+
+    const tx: TransactionDomainEntity = {
+      source: 'MANUAL',
+      sourceAccountId: 'acc-01',
+      sourceTransactionId: 'manual-tx-1',
+      currency: 'BRL',
+      canonicalHash: 'hash-123',
+      description: 'Supermercado',
+      date: '2026-03-10',
+      amount: Money.fromDecimal('250.75'),
+      flowDirection: 'OUTFLOW',
+      economicNature: 'OPERATING_EXPENSE',
+      budgetEffect: 'EXPENSE',
+      bankStatus: 'POSTED',
+      reviewStatus: 'AUTO_CONFIRMED',
+    };
+    expect(tx.source).toBe('MANUAL');
+    expect(tx.sourceAccountId).toBe('acc-01');
+    expect(tx.sourceTransactionId).toBe('manual-tx-1');
+    expect(tx.currency).toBe('BRL');
+  });
+
+  const getProp = (contract: { properties: any[] }, name: string) =>
+    contract.properties.find((p) => p.notionProperty === name);
+
+  test('TARGET_CONTRACT accounts and transactions define canonical generic properties', () => {
+    const accounts = TARGET_CONTRACT.NOTION_DS_ACCOUNTS;
+    const fonteAcc = getProp(accounts, 'Fonte');
+    expect(fonteAcc).toBeDefined();
+    expect(fonteAcc?.notionType).toBe('select');
+    expect(fonteAcc?.authority).toBe('UPSTREAM');
+    expect(fonteAcc?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteAcc?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
+    });
+    expect(fonteAcc?.allowExtraOptions).toBe(true);
+
+    const idFonteAcc = getProp(accounts, 'ID da Fonte');
+    expect(idFonteAcc).toBeDefined();
+    expect(idFonteAcc?.notionType).toBe('rich_text');
+    expect(idFonteAcc?.authority).toBe('UPSTREAM');
+    expect(idFonteAcc?.aliases).toContain('ID Pierre');
+    expect(idFonteAcc?.aliases).toContain('ID da fonte');
+
+    const moedaAcc = getProp(accounts, 'Moeda');
+    expect(moedaAcc).toBeDefined();
+    expect(moedaAcc?.notionType).toBe('select');
+
+    const txs = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
+    const fonteTx = getProp(txs, 'Fonte');
+    expect(fonteTx).toBeDefined();
+    expect(fonteTx?.notionType).toBe('select');
+    expect(fonteTx?.authority).toBe('UPSTREAM');
+    expect(fonteTx?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteTx?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
+    });
+    expect(fonteTx?.allowExtraOptions).toBe(true);
+
+    const idFonteTx = getProp(txs, 'ID da Fonte');
+    expect(idFonteTx).toBeDefined();
+    expect(idFonteTx?.authority).toBe('UPSTREAM');
+    expect(idFonteTx?.aliases).toContain('ID Pierre');
+    expect(idFonteTx?.aliases).toContain('ID da fonte');
+
+    const moedaTx = getProp(txs, 'Moeda');
+    expect(moedaTx).toBeDefined();
+    expect(moedaTx?.notionType).toBe('select');
+  });
+});
+
+describe('Contract: Complete Real Notion Aliases Coverage', () => {
+  const getProp = (contract: { properties: any[] }, name: string) =>
+    contract.properties.find((p) => p.notionProperty === name);
+
+  test('NOTION_DS_ACCOUNTS contains all real Notion property aliases', () => {
+    const props = TARGET_CONTRACT.NOTION_DS_ACCOUNTS;
+    expect(getProp(props, 'Nome da Conta')?.aliases).toContain('Conta');
+    expect(getProp(props, 'ID da Fonte')?.aliases).toContain('ID da fonte');
+    expect(getProp(props, 'ID da Fonte')?.aliases).toContain('ID Pierre');
+    expect(getProp(props, 'Saldo Atual')?.aliases).toContain('Saldo');
+    expect(getProp(props, 'Tipo de Conta')?.aliases).toContain('Tipo');
+    expect(getProp(props, 'Última Sincronização')?.aliases).toContain('Atualizado em');
+  });
+
+  test('NOTION_DS_TRANSACTIONS contains all real Notion property aliases', () => {
+    const props = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
+    expect(getProp(props, 'Descrição')?.aliases).toContain('Lançamento');
+    expect(getProp(props, 'ID da Fonte')?.aliases).toContain('ID da fonte');
+    expect(getProp(props, 'ID da Fonte')?.aliases).toContain('ID Pierre');
+    expect(getProp(props, 'Natureza Econômica')?.aliases).toContain('Natureza');
+    expect(getProp(props, 'Status Banco')?.aliases).toContain('Status');
+  });
+
+  test('NOTION_DS_RULES contains all 15+ real Notion property aliases', () => {
+    const props = TARGET_CONTRACT.NOTION_DS_RULES;
+    expect(getProp(props, 'Condição: Contraparte')?.aliases).toContain('Contraparte contém');
+    expect(getProp(props, 'Condição: Descrição')?.aliases).toContain('Descrição contém');
+    expect(getProp(props, 'Condição: Movimento')?.aliases).toContain('Movimento esperado');
+    expect(getProp(props, 'Condição: Conta')?.aliases).toContain('Conta origem');
+    expect(getProp(props, 'Condição: Categoria Pierre')?.aliases).toContain('Categoria Pierre');
+    expect(getProp(props, 'Condição: Valor Exato')?.aliases).toContain('Valor exato');
+    expect(getProp(props, 'Condição: Tolerância Valor')?.aliases).toContain('Tolerância');
+    expect(getProp(props, 'Condição: Valor Mínimo')?.aliases).toContain('Valor mínimo');
+    expect(getProp(props, 'Condição: Valor Máximo')?.aliases).toContain('Valor máximo');
+    expect(getProp(props, 'Condição: Dia Mês Início')?.aliases).toContain('Dia mínimo');
+    expect(getProp(props, 'Condição: Dia Mês Fim')?.aliases).toContain('Dia máximo');
+    expect(getProp(props, 'Atribuir: Natureza')?.aliases).toContain('Natureza resultante');
+    expect(getProp(props, 'Atribuir: Categoria')?.aliases).toContain('Categoria resultante');
+    expect(getProp(props, 'Válida de')?.aliases).toContain('Válida de');
+    expect(getProp(props, 'Válida até')?.aliases).toContain('Válida até');
+  });
+
+  test('NOTION_DS_INVESTMENTS contains all real Notion property aliases', () => {
+    const props = TARGET_CONTRACT.NOTION_DS_INVESTMENTS;
+    expect(getProp(props, 'Classe do Ativo')?.aliases).toContain('Classe');
+    expect(getProp(props, 'Custo Base Total')?.aliases).toContain('Custo acumulado');
+    expect(getProp(props, 'Valor de Mercado Atual')?.aliases).toContain('Valor atual');
+    expect(getProp(props, 'Fonte da Avaliação')?.aliases).toContain('Fonte do preço');
+    expect(getProp(props, 'Data da Avaliação')?.aliases).toContain('Data da avaliação');
+    expect(getProp(props, 'ID do Ativo na Fonte')?.aliases).toContain('ID da fonte');
+    expect(getProp(props, 'Instituição / Corretora')?.aliases).toContain('Instituição');
+  });
+});
+
+describe('Notion: Structural Property Validation (Select Options, Relation Targets, Dual-Property)', () => {
+  const envVars = {
+    NOTION_DS_ACCOUNTS: 'a17455aa-4793-4001-9570-21b7f84ff4a2',
+    NOTION_DS_CATEGORIES: 'eb8ef2e3-cfd3-437e-b3f5-6a47dec913b4',
+    NOTION_DS_CARD_BILLS: 'ca1db111-1111-4000-8000-000000000001',
+  };
+
+  test('validates select options and returns EXACT_MATCH when all options present (Portuguese labels)', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_ACCOUNTS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Nome da Conta': { type: 'title' },
+      'Tipo de Conta': {
+        type: 'select',
+        selectOptions: [
+          'Conta Corrente',
+          'Cartão de Crédito',
+          'Conta Poupança',
+          'Conta de Investimento',
+          'Carteira Dinheiro',
+        ],
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const tipo = diffs.find((d) => d.notionProperty === 'Tipo de Conta');
+    expect(tipo?.status).toBe('EXACT_MATCH');
+  });
+
+  test('validates select options and returns EXACT_MATCH when mapped English enum values are present', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_ACCOUNTS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Nome da Conta': { type: 'title' },
+      'Tipo de Conta': {
+        type: 'select',
+        selectOptions: [
+          'CHECKING_ACCOUNT',
+          'CREDIT_CARD',
+          'SAVINGS_ACCOUNT',
+          'INVESTMENT_ACCOUNT',
+          'CASH_WALLET',
+        ],
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const tipo = diffs.find((d) => d.notionProperty === 'Tipo de Conta');
+    expect(tipo?.status).toBe('EXACT_MATCH');
+  });
+
+  test('validates select options and returns STRUCTURAL_MISMATCH when options are missing', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_ACCOUNTS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Tipo de Conta': {
+        type: 'select',
+        selectOptions: ['Conta Corrente', 'Cartão de Crédito'], // Missing Conta Poupança, etc.
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const tipo = diffs.find((d) => d.notionProperty === 'Tipo de Conta');
+    expect(tipo?.status).toBe('STRUCTURAL_MISMATCH');
+    expect(tipo?.description).toContain('Opções ausentes');
+    expect(tipo?.description).toContain('Conta Poupança');
+  });
+
+  test('validates relation target data source UUID matching expected env key', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Conta': {
+        type: 'relation',
+        relationDataSourceId: 'a17455aa-4793-4001-9570-21b7f84ff4a2', // matches NOTION_DS_ACCOUNTS
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const conta = diffs.find((d) => d.notionProperty === 'Conta');
+    expect(conta?.status).toBe('EXACT_MATCH');
+  });
+
+  test('returns STRUCTURAL_MISMATCH when relation points to unexpected data source UUID', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Conta': {
+        type: 'relation',
+        relationDataSourceId: 'ffffffff-ffff-ffff-ffff-ffffffffffff', // Wrong target!
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const conta = diffs.find((d) => d.notionProperty === 'Conta');
+    expect(conta?.status).toBe('STRUCTURAL_MISMATCH');
+    expect(conta?.description).toContain('Alvo da relação divergente');
+  });
+
+  test('returns RENAME_STRUCTURAL_MISMATCH when alias matches name but fails structural check', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
+
+    const actualProps: Record<string, NotionPropertySnapshot> = {
+      'Natureza': { // Alias for 'Natureza Econômica'
+        type: 'select',
+        selectOptions: ['DESPESA'], // Missing RECEITA, TRANSFERENCIA, etc.
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualProps, envVars);
+    const nat = diffs.find((d) => d.notionProperty === 'Natureza Econômica');
+    expect(nat?.status).toBe('RENAME_STRUCTURAL_MISMATCH');
+    expect(nat?.candidateName).toBe('Natureza');
+    expect(nat?.description).toContain('Opções ausentes');
+  });
+
+  test('handles relation bidirectional dual_property check', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = {
+      envKey: 'NOTION_DS_TEST',
+      defaultTitle: 'Teste Dual Relation',
+      isExisting: true,
+      properties: [
+        {
+          domainField: 'testRel',
+          notionProperty: 'Relacao Dupla',
+          notionType: 'relation' as const,
+          direction: 'both' as const,
+          authority: 'UPSTREAM' as const,
+          description: 'Teste',
+          isBidirectionalRelation: true,
+          relationTargetEnvKey: 'NOTION_DS_ACCOUNTS',
+        },
+      ],
+    };
+
+    const actualPropsSingle: Record<string, NotionPropertySnapshot> = {
+      'Relacao Dupla': {
+        type: 'relation',
+        relationDataSourceId: 'a17455aa-4793-4001-9570-21b7f84ff4a2',
+        relationType: 'single_property',
+      },
+    };
+
+    const diffs = validator.compareProperties(contract, actualPropsSingle, envVars);
+    const rel = diffs.find((d) => d.notionProperty === 'Relacao Dupla');
+    expect(rel?.status).toBe('STRUCTURAL_MISMATCH');
+    expect(rel?.description).toContain('Relação unidirecional quando esperado bidirecional');
+  });
+
+  test('respects allowExtraOptions policy for extensible vs strict select enums', () => {
+    const validator = new NotionSchemaValidator();
+
+    // 1. Extensible contract (allowExtraOptions: true, like Fonte)
+    const contractExtensible = {
+      envKey: 'NOTION_DS_TEST',
+      defaultTitle: 'Teste Extensible',
+      isExisting: true,
+      properties: [
+        {
+          domainField: 'source',
+          notionProperty: 'Fonte',
+          notionType: 'select' as const,
+          direction: 'both' as const,
+          authority: 'UPSTREAM' as const,
+          description: 'Teste',
+          expectedOptions: ['Pierre', 'Manual', 'Migração', 'Outra'],
+          optionMappings: {
+            'Pierre': 'PIERRE',
+            'Manual': 'MANUAL',
+            'Migração': 'MIGRATION',
+            'Outra': 'OTHER',
+          },
+          allowExtraOptions: true,
+        },
+      ],
+    };
+
+    const actualExtensible: Record<string, NotionPropertySnapshot> = {
+      'Fonte': {
+        type: 'select',
+        selectOptions: ['Pierre', 'Manual', 'Migração', 'Outra', 'Nova Fonte XPTO'],
+      },
+    };
+
+    const diffsExtensible = validator.compareProperties(contractExtensible, actualExtensible);
+    const fonteDiff = diffsExtensible.find((d) => d.notionProperty === 'Fonte');
+    expect(fonteDiff?.status).toBe('EXACT_MATCH');
+
+    // 2. Strict contract (allowExtraOptions: false)
+    const contractStrict = {
+      envKey: 'NOTION_DS_TEST',
+      defaultTitle: 'Teste Strict',
+      isExisting: true,
+      properties: [
+        {
+          domainField: 'status',
+          notionProperty: 'Status Fatura',
+          notionType: 'select' as const,
+          direction: 'both' as const,
+          authority: 'UPSTREAM' as const,
+          description: 'Teste',
+          expectedOptions: ['Aberta', 'Fechada'],
+          allowExtraOptions: false,
+        },
+      ],
+    };
+
+    const actualStrict: Record<string, NotionPropertySnapshot> = {
+      'Status Fatura': {
+        type: 'select',
+        selectOptions: ['Aberta', 'Fechada', 'Opção Inesperada'],
+      },
+    };
+
+    const diffsStrict = validator.compareProperties(contractStrict, actualStrict);
+    const statusDiff = diffsStrict.find((d) => d.notionProperty === 'Status Fatura');
+    expect(statusDiff?.status).toBe('STRUCTURAL_MISMATCH');
+    expect(statusDiff?.description).toContain('Opções adicionais não homologadas no Notion');
+  });
+});
+
+describe('Domain: Money & DecimalQuantity Constructor Invariant Hardening', () => {
+  test('Money constructor enforces strict invariant validation', () => {
+    const m = new Money(100n, 'BRL', 2);
+    expect(m.amountMinor).toBe(100n);
+    expect(m.currency).toBe('BRL');
+    expect(m.scale).toBe(2);
+
+    expect(() => new Money(100 as any)).toThrow(TypeError);
+    expect(() => new Money('100' as any)).toThrow(TypeError);
+    expect(() => new Money(100n, '')).toThrow('Invalid currency');
+    expect(() => new Money(100n, '   ')).toThrow('Invalid currency');
+    expect(() => new Money(100n, 'BRL', -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new Money(100n, 'BRL', 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new Money(100n, 'BRL', 1.5)).toThrow(/Scale must be an integer between 0 and 20/i);
+  });
+
+  test('DecimalQuantity constructor enforces strict invariant validation', () => {
+    const q = new DecimalQuantity(100000000n, 8);
+    expect(q.rawUnits).toBe(100000000n);
+    expect(q.scale).toBe(8);
+
+    expect(() => new DecimalQuantity(100 as any)).toThrow(TypeError);
+    expect(() => new DecimalQuantity('100' as any)).toThrow(TypeError);
+    expect(() => new DecimalQuantity(100n, -1)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new DecimalQuantity(100n, 21)).toThrow(/Scale must be an integer between 0 and 20/i);
+    expect(() => new DecimalQuantity(100n, 2.5)).toThrow(/Scale must be an integer between 0 and 20/i);
+  });
+});
+
 

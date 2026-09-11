@@ -64,7 +64,7 @@ describe('SheetsRenderer.renderAll', () => {
 
     repo.upsertAccount({
       id: 'acc-1', name: 'Nubank Conta', type: 'BANK', subtype: 'CHECKING_ACCOUNT',
-      connectorName: 'Nubank', closingBalance: 9.22, creditLimit: null, availableCredit: null, rawJson: '{}',
+      connectorName: 'Nubank', closingBalance: 9.22, creditLimit: null, availableCredit: null, automaticallyInvestedBalance: null, reservedTotal: null, rawJson: '{}',
     });
     repo.upsertTransaction(
       makeTx({ id: 'a', amount: -100 }),

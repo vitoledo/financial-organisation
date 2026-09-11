@@ -164,21 +164,27 @@ describe('labels', () => {
 describe('buildBalanceRows', () => {
   const accounts = [
     {
+      id: 'acc-1',
       name: 'Nubank Conta',
       type: 'BANK',
       subtype: 'CHECKING_ACCOUNT',
       closing_balance: 9.22,
       credit_limit: null,
       available_credit: null,
+      automatically_invested_balance: null,
+      reserved_total: null,
       last_synced_at: '2026-07-06T10:00:00.000Z',
     },
     {
+      id: 'acc-2',
       name: 'Nubank Cartão',
       type: 'CREDIT',
       subtype: 'CREDIT_CARD',
       closing_balance: null,
       credit_limit: 1550,
       available_credit: 200,
+      automatically_invested_balance: null,
+      reserved_total: null,
       last_synced_at: '2026-07-06T10:00:00.000Z',
     },
   ];
@@ -219,14 +225,17 @@ describe('buildBalanceRows', () => {
 
 describe('buildTransactionRows', () => {
   const tx: TransactionRow = {
+    id: 'tx-1',
     date: '2026-06-15T12:00:00.000Z',
     description: 'Mercado',
     category_mapped: 'Alimentação',
     category_pierre: 'Supermercado',
     category_group: 'Necessidade',
+    category_variability: 'Variável',
     direction: 'EXPENSE',
     amount: -150.5,
     account_name: 'Nubank Conta',
+    account_type: 'BANK',
     status: 'POSTED',
   };
 
@@ -475,14 +484,17 @@ describe('lastMonths', () => {
 
 describe('buildCurrentBillRows', () => {
   const tx: TransactionRow = {
+    id: 'tx-2',
     date: '2026-07-02T12:00:00.000Z',
     description: '99app',
     category_mapped: 'Transporte',
     category_pierre: null,
     category_group: 'Necessidade',
+    category_variability: 'Variável',
     direction: 'EXPENSE',
     amount: -16.29,
     account_name: 'Nubank Cartão',
+    account_type: 'CREDIT',
     status: 'PENDING',
   };
 
@@ -501,11 +513,13 @@ describe('buildCurrentBillRows', () => {
 
 describe('buildCommitmentRows', () => {
   const inst = {
+    id: 'inst-1',
     purchase_description: 'TV',
     installment_number: 2,
     total_installments: 10,
     amount: 150,
     due_date: '2026-08-22',
+    is_paid: 0,
     is_projected: 1,
     account_name: 'Nubank Cartão',
   };

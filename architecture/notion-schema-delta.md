@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T02:01:52.991Z
+> **Data da Verificação:** 2026-09-11T11:03:17.432Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 
@@ -22,11 +22,13 @@
 | :--- | :--- |
 | Correspondência Exata (EXACT_MATCH) | 0 |
 | Renomeações Mapeadas por Alias (RENAME_CANDIDATE) | 0 |
+| Divergência Estrutural em Nome Exato (STRUCTURAL_MISMATCH) | 0 |
+| Alias com Divergência Estrutural (RENAME_STRUCTURAL_MISMATCH) | 0 |
 | Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
 | Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | 0 |
 | Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | 0 |
 | Propriedades Ausentes em Bases Verificadas (MISSING) | 0 |
-| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 173 |
+| Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 178 |
 | Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | 14 |
 | Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | 0 |
 
@@ -46,16 +48,18 @@
 
 | Propriedade | Tipo Esperado | Tipo no Notion | Status | Autoridade | Descrição / Observação |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `Nome da Conta` | `title` | `—` | ❓ UNVERIFIED | `PIERRE` | Nome identificador da conta |
-| `ID Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | UUID da conta no Pierre Finance |
-| `Instituição` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Nome do banco / conector (ex: Nubank, Mercado Pago) |
-| `Tipo de Conta` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | CHECKING_ACCOUNT, CREDIT_CARD, SAVINGS |
-| `Saldo Atual` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Saldo disponível em reais |
-| `Limite Contratado` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Limite total concedido pelo banco (ex: R$ 2.400) |
+| `Nome da Conta` | `title` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Nome identificador da conta |
+| `Fonte` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Sistema ou conector de origem (ex: PIERRE, MANUAL, MIGRATION, OTHER) |
+| `ID da Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Identificador unívoco da conta no sistema de origem |
+| `Moeda` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Código da moeda da conta (ex: BRL, USD) |
+| `Instituição` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Nome do banco / conector (ex: Nubank, Mercado Pago) |
+| `Tipo de Conta` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | CHECKING_ACCOUNT, CREDIT_CARD, SAVINGS |
+| `Saldo Atual` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Saldo disponível em reais |
+| `Limite Contratado` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Limite total concedido pelo banco (ex: R$ 2.400) |
 | `Limite Personalizado` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Teto operacional ajustado pelo usuário no app (ex: R$ 400) |
-| `Limite Disponível` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Limite de crédito livre no momento |
+| `Limite Disponível` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Limite de crédito livre no momento |
 | `Limite Operacional Usado` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | customizedCreditLimit - availableCreditLimit |
-| `Limite Usado (Pierre Bruto)` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Valor bruto reportado pelo Pierre para auditoria de inconsistência |
+| `Limite Usado (Pierre Bruto)` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Valor bruto reportado pelo Pierre para auditoria de inconsistência |
 | `Dia de Fechamento` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia do mês do corte da fatura |
 | `Dia de Vencimento` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia do mês do vencimento da fatura |
 | `Incluir no Caixa` | `checkbox` | `—` | ❓ UNVERIFIED | `USUARIO` | Indica se computa para liquidez imediata |
@@ -70,12 +74,14 @@
 | Propriedade | Tipo Esperado | Tipo no Notion | Status | Autoridade | Descrição / Observação |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `Descrição` | `title` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Descrição tratada da transação |
-| `ID Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | UUID unívoco da transação no Pierre |
+| `Fonte` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Sistema ou conector de origem (ex: PIERRE, MANUAL, MIGRATION, OTHER) |
+| `ID da Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Identificador unívoco da transação no sistema de origem |
+| `Moeda` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Código da moeda da transação (ex: BRL, USD) |
 | `Hash Canônico` | `rich_text` | `—` | ❓ UNVERIFIED | `DERIVADO` | Fingerprint SHA-256 (64 chars) de versão |
-| `Data` | `date` | `—` | ❓ UNVERIFIED | `PIERRE` | Data da transação (ISO-8601) |
-| `Valor` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Valor monetário absoluto (R$) |
-| `Valor Bruto Pierre` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Valor exato retornado pelo Pierre com sinal original |
-| `Movimento` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Entrada ou Saída de caixa físico |
+| `Data` | `date` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Data da transação (ISO-8601) |
+| `Valor` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Valor monetário absoluto (R$) |
+| `Valor Bruto Pierre` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Valor exato retornado pelo Pierre com sinal original |
+| `Movimento` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Entrada ou Saída de caixa físico |
 | `Natureza Econômica` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Classificação contábil da operação |
 | `Efeito Orçamentário` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | INCOME | EXPENSE | REVERSAL | NEUTRAL |
 | `Propósito de Alocação` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | INVESTMENT_RESERVE | OPERATIONAL_CASH | etc. |
@@ -83,11 +89,11 @@
 | `Conta` | `relation` | `—` | ❓ UNVERIFIED | `DERIVADO` | Relação com base Contas |
 | `Categoria` | `relation` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Relação com Categorias Financeiras |
 | `Fatura Vinculada` | `relation` | `—` | ❓ UNVERIFIED | `DERIVADO` | Relação com 13ª base Faturas / Ciclos |
-| `Status Banco` | `select` | `—` | ❓ UNVERIFIED | `PIERRE` | Pendente ou Confirmado |
+| `Status Banco` | `select` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Pendente ou Confirmado |
 | `Status de Revisão` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Confirmado Auto, Pendente Revisão, Validado Manualmente, Legado Não Verificado |
 | `Motivo da Revisão` | `rich_text` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Justificativa para intervenção humana |
-| `Categoria Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Categoria bruta do open-finance |
-| `Descrição Original` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Texto original do extrato |
+| `Categoria Pierre` | `rich_text` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Categoria bruta do open-finance |
+| `Descrição Original` | `rich_text` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Texto original do extrato |
 | `HMAC Contraparte` | `rich_text` | `—` | ❓ UNVERIFIED | `DERIVADO` | Hash seguro do CPF/CNPJ para matching sem expor PII |
 
 ### Categorias Financeiras (`NOTION_DS_CATEGORIES`)
@@ -125,7 +131,8 @@
 | `Condição: Valor Máximo` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Teto do valor |
 | `Condição: Dia Mês Início` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia inicial do mês (1 a 31) |
 | `Condição: Dia Mês Fim` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Dia final do mês (1 a 31) |
-| `Período de Validade` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Vigência temporal da regra |
+| `Válida de` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Início da vigência da regra |
+| `Válida até` | `date` | `—` | ❓ UNVERIFIED | `USUARIO` | Término da vigência da regra |
 | `Atribuir: Natureza` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Natureza atribuída |
 | `Atribuir: Efeito Orçamento` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | INCOME, EXPENSE, REVERSAL, NEUTRAL |
 | `Atribuir: Alocação` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Finalidade da movimentação |
@@ -188,7 +195,7 @@
 | `Quantidade` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Posição atual custodiada |
 | `Preço Médio Unitário (PMP)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Preço médio ponderado unitário de aquisição |
 | `Custo Base Total` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Montante total acumulado desembolsado nas compras (base de custo contábil) |
-| `Valor de Mercado Atual` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Posição a mercado: Cotação atual x quantidade |
+| `Valor de Mercado Atual` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Posição a mercado: Cotação atual x quantidade |
 | `Lucro / Prejuízo Não Realizado` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Valor de Mercado Atual - Custo Base Total |
 | `Retorno Não Realizado (%)` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | ((Valor de Mercado Atual - Custo Base Total) / Custo Base Total) * 100 |
 | `Liquidez` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Prazo de liquidez (ex: D+0, D+1, D+30, No Vencimento) |
@@ -196,7 +203,7 @@
 | `Data da Avaliação` | `date` | `—` | ❓ UNVERIFIED | `DERIVADO` | Data/hora da última cotação de mercado capturada |
 | `Incluir no Patrimônio` | `checkbox` | `—` | ❓ UNVERIFIED | `USUARIO` | Indica se esta posição deve compor o cálculo de patrimônio líquido final |
 | `Instituição / Corretora` | `select` | `—` | ❓ UNVERIFIED | `USUARIO` | Corretora ou custodiante do investimento (ex: NuInvest, Binance, XP, BTG) |
-| `ID do Ativo na Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `PIERRE` | Identificador único do ativo na API de origem para sincronização |
+| `ID do Ativo na Fonte` | `rich_text` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Identificador único do ativo na API de origem para sincronização |
 | `Conta Vinculada` | `relation` | `—` | ❓ UNVERIFIED | `USUARIO` | Conta corrente ou corretora associada |
 
 ### Movimentações de Investimentos (`NOTION_DS_INVESTMENT_MOVEMENTS`)
@@ -209,9 +216,9 @@
 | `Identificador` | `title` | `—` | ❓ UNVERIFIED | `DERIVADO` | Tipo - Ativo - Data |
 | `Ativo Vinculado` | `relation` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Relação com a posição do ativo |
 | `Tipo de Movimentação` | `select` | `—` | ❓ UNVERIFIED | `REGRA_AUTOMATICA` | Aporte de Capital, Resgate de Capital, Compra de Ativo, Venda de Ativo, Rendimento / Provento, Taxas e Impostos, Ajuste de Posição |
-| `Data da Operação` | `date` | `—` | ❓ UNVERIFIED | `PIERRE` | Data da execução |
-| `Valor Bruto` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Volume financeiro total |
-| `Valor Líquido` | `number` | `—` | ❓ UNVERIFIED | `PIERRE` | Valor líquido após custos |
+| `Data da Operação` | `date` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Data da execução |
+| `Valor Bruto` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Volume financeiro total |
+| `Valor Líquido` | `number` | `—` | ❓ UNVERIFIED | `UPSTREAM` | Valor líquido após custos |
 | `Quantidade Negociada` | `number` | `—` | ❓ UNVERIFIED | `USUARIO` | Fração ou unidades transacionadas |
 | `Preço Unitário` | `number` | `—` | ❓ UNVERIFIED | `DERIVADO` | Preço médio da ordem |
 | `Conta Origem` | `relation` | `—` | ❓ UNVERIFIED | `DERIVADO` | Conta debitada |
@@ -317,9 +324,9 @@
 | `Cartão Vinculado` | `relation` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Relação com a conta do cartão em Contas |
 | `Tipo de Ciclo` | `select` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Ciclo Real Banco, Ciclo Configurado, Ciclo Estimado |
 | `Status da Fatura` | `select` | `—` | 🆕 PROPOSED_TO_CREATE | `REGRA_AUTOMATICA` | Aberta em Curso, Fechada a Vencer, Vencida, Paga Integralmente, Paga Parcialmente |
-| `Data de Fechamento` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `PIERRE` | Data de corte (balance_close_date ou configurada) |
-| `Data de Vencimento` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `PIERRE` | Data de vencimento (balance_due_date) |
-| `Valor da Fatura (Banco)` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `PIERRE` | Valor total consolidado emitido pela instituição |
+| `Data de Fechamento` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `UPSTREAM` | Data de corte (balance_close_date ou configurada) |
+| `Data de Vencimento` | `date` | `—` | 🆕 PROPOSED_TO_CREATE | `UPSTREAM` | Data de vencimento (balance_due_date) |
+| `Valor da Fatura (Banco)` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `UPSTREAM` | Valor total consolidado emitido pela instituição |
 | `Total de Compras no Ciclo` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Soma real das transações de compra dentro do ciclo corrente |
 | `Componentes Adicionais da Fatura` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Soma dos componentes adicionais identificados (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
 | `Divergência Não Explicada` | `number` | `—` | 🆕 PROPOSED_TO_CREATE | `DERIVADO` | Discrepância residual caso os componentes adicionais conhecidos não expliquem a diferença |
@@ -343,9 +350,9 @@ Esta base **não existe atualmente** no seu Notion. Ela deve ser criada externam
 | `Cartão Vinculado` | `relation` | `write` | `DERIVADO` | Relação com a conta do cartão em Contas |
 | `Tipo de Ciclo` | `select` | `write` | `DERIVADO` | Ciclo Real Banco, Ciclo Configurado, Ciclo Estimado |
 | `Status da Fatura` | `select` | `both` | `REGRA_AUTOMATICA` | Aberta em Curso, Fechada a Vencer, Vencida, Paga Integralmente, Paga Parcialmente |
-| `Data de Fechamento` | `date` | `write` | `PIERRE` | Data de corte (balance_close_date ou configurada) |
-| `Data de Vencimento` | `date` | `write` | `PIERRE` | Data de vencimento (balance_due_date) |
-| `Valor da Fatura (Banco)` | `number` | `write` | `PIERRE` | Valor total consolidado emitido pela instituição |
+| `Data de Fechamento` | `date` | `write` | `UPSTREAM` | Data de corte (balance_close_date ou configurada) |
+| `Data de Vencimento` | `date` | `write` | `UPSTREAM` | Data de vencimento (balance_due_date) |
+| `Valor da Fatura (Banco)` | `number` | `write` | `UPSTREAM` | Valor total consolidado emitido pela instituição |
 | `Total de Compras no Ciclo` | `number` | `write` | `DERIVADO` | Soma real das transações de compra dentro do ciclo corrente |
 | `Componentes Adicionais da Fatura` | `number` | `write` | `DERIVADO` | Soma dos componentes adicionais identificados (parcelas anteriores, encargos, IOF, juros, créditos/estornos) |
 | `Divergência Não Explicada` | `number` | `write` | `DERIVADO` | Discrepância residual caso os componentes adicionais conhecidos não expliquem a diferença |

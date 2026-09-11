@@ -11,6 +11,7 @@
     "setup": "ts-node src/index.ts --setup-only",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc --project tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
