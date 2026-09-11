@@ -1,5 +1,7 @@
+import crypto from 'crypto';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
+import { canonicalizeJson } from './hasher';
 import {
   PreflightCheckResult,
   DataSourcePreflight,
@@ -20,6 +22,7 @@ export class PreflightValidator {
    * Strictly read-only preflight check.
    * Validates the 12 existing Data Sources, parent page container, relation targets,
    * API version header, and records permissions as UNVERIFIED_UNTIL_APPLY.
+   * Produces a sanitized live structural snapshot consumed directly by SchemaPlanner.
    * NEVER sends test mutations (no POST/PATCH/DELETE).
    */
   async runPreflight(envVars: Record<string, string | undefined> = process.env): Promise<PreflightCheckResult> {
@@ -27,6 +30,7 @@ export class PreflightValidator {
     const errors: string[] = [];
     const dataSources: DataSourcePreflight[] = [];
     const relationTargets: RelationTargetPreflight[] = [];
+    const liveSnapshot: Record<string, Record<string, any>> = {};
 
     // 1. Validate the 12 existing Data Sources + 1 proposed
     for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
@@ -70,7 +74,51 @@ export class PreflightValidator {
           data_source_id: dsId,
         })) as { properties?: Record<string, any> };
 
-        const propCount = Object.keys(response.properties ?? {}).length;
+        const rawProps = response.properties ?? {};
+        const propCount = Object.keys(rawProps).length;
+        const dsSnapshot: Record<string, any> = {};
+
+        for (const [propName, propDef] of Object.entries(rawProps)) {
+          const pType = propDef.type ?? 'unknown';
+          const pEntry: Record<string, any> = {
+            id: propDef.id,
+            name: propDef.name ?? propName,
+            type: pType,
+          };
+
+          if (pType === 'select' && propDef.select?.options) {
+            pEntry.selectOptions = propDef.select.options.map((o: any) => ({
+              id: o.id,
+              name: o.name,
+              color: o.color,
+            }));
+          } else if (pType === 'multi_select' && propDef.multi_select?.options) {
+            pEntry.selectOptions = propDef.multi_select.options.map((o: any) => ({
+              id: o.id,
+              name: o.name,
+              color: o.color,
+            }));
+          } else if (pType === 'status' && propDef.status?.options) {
+            pEntry.selectOptions = propDef.status.options.map((o: any) => ({
+              id: o.id,
+              name: o.name,
+              color: o.color,
+            }));
+          } else if (pType === 'relation' && propDef.relation) {
+            pEntry.relationDataSourceId = propDef.relation.data_source_id;
+            pEntry.relationType =
+              propDef.relation.type ?? (propDef.relation.dual_property ? 'dual_property' : 'single_property');
+            if (propDef.relation.dual_property) {
+              pEntry.syncedPropertyName = propDef.relation.dual_property.synced_property_name;
+              pEntry.syncedPropertyId = propDef.relation.dual_property.synced_property_id;
+            }
+          }
+
+          dsSnapshot[propName] = pEntry;
+        }
+
+        liveSnapshot[contract.envKey] = dsSnapshot;
+
         dataSources.push({
           envKey: contract.envKey,
           name: contract.defaultTitle,
@@ -176,6 +224,10 @@ export class PreflightValidator {
 
     const verifiedCount = dataSources.filter((d) => d.status === 'VERIFIED').length;
     const isValid = errors.length === 0 && verifiedCount === 12;
+    const liveSnapshotSha256 = crypto
+      .createHash('sha256')
+      .update(canonicalizeJson(liveSnapshot), 'utf8')
+      .digest('hex');
 
     return {
       valid: isValid,
@@ -183,6 +235,8 @@ export class PreflightValidator {
       dataSources,
       parentPage,
       relationTargets,
+      liveSnapshot,
+      liveSnapshotSha256,
       permissions: 'UNVERIFIED_UNTIL_APPLY',
       warnings,
       errors,

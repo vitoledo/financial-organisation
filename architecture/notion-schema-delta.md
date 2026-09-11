@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T14:16:50.210Z
+> **Data da Verificação:** 2026-09-11T14:28:53.881Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 

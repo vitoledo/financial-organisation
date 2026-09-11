@@ -62,6 +62,13 @@ export interface PropertyContract {
    * Expected synced property name in the target data source when relation is bidirectional.
    */
   syncedPropertyName?: string;
+  /**
+   * Explicit number format for 'number' properties in Notion:
+   * - 'real': currency format for BRL monetary amounts (e.g. R$ 1.250,00)
+   * - 'number': integer counts, days, priorities, durations
+   * - 'percent': percentages and rates (e.g. 20%)
+   */
+  numberFormat?: 'real' | 'number' | 'percent';
 }
 
 export interface DataSourceContract {

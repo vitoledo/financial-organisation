@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { CompleteMigrationPlan, SchemaPlan, BackfillPlan } from './types';
+import { CompleteMigrationPlan, SchemaPlan, BackfillPlan, InputFingerprint } from './types';
 
 /**
  * Deterministically serialize any JavaScript value into a canonical JSON string.
@@ -32,14 +32,18 @@ export function canonicalizeJson(value: any): string {
 
 /**
  * Computes a deterministic SHA-256 hash of the complete migration plan.
- * Hashing covers the schema plan (DDL steps and payloads) and the backfill plan (DML specs).
- * Timestamps and metadata that vary per execution run are excluded from the hash
- * to ensure that identical plans generate the exact same planHash.
+ * Hashing covers:
+ * 1. inputFingerprint (Git commit SHA, API version, parentPageId, Data Source IDs, live snapshot SHA-256)
+ * 2. schemaPlan (ordered DDL steps and sanitized payloads)
+ * 3. backfillPlan (DML pipeline specifications)
  */
 export function computePlanHash(
-  plan: { schemaPlan: SchemaPlan; backfillPlan: BackfillPlan } | CompleteMigrationPlan,
+  plan:
+    | { inputFingerprint: InputFingerprint; schemaPlan: SchemaPlan; backfillPlan: BackfillPlan }
+    | CompleteMigrationPlan,
 ): string {
   const contentToHash = {
+    inputFingerprint: plan.inputFingerprint,
     schemaPlan: plan.schemaPlan,
     backfillPlan: plan.backfillPlan,
   };
@@ -52,7 +56,9 @@ export function computePlanHash(
  * Verifies whether a provided planHash matches the computed hash of the plan.
  */
 export function verifyPlanHash(
-  plan: CompleteMigrationPlan | { schemaPlan: SchemaPlan; backfillPlan: BackfillPlan },
+  plan:
+    | CompleteMigrationPlan
+    | { inputFingerprint: InputFingerprint; schemaPlan: SchemaPlan; backfillPlan: BackfillPlan },
   expectedHash: string,
 ): boolean {
   const computed = computePlanHash(plan);

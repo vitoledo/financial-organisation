@@ -1,11 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { TARGET_CONTRACT, DataSourceContract, PropertyContract } from '../../domain/schema-contract';
+import { TARGET_CONTRACT, PropertyContract } from '../../domain/schema-contract';
 import {
   MigrationStep,
   SchemaPlan,
   SchemaPlanSummary,
-  TargetDataSource,
 } from './types';
 
 export interface SchemaPlannerOptions {
@@ -17,7 +16,7 @@ export interface SchemaPlannerOptions {
 export class SchemaPlanner {
   private envVars: Record<string, string | undefined>;
   private liveSnapshot: Record<string, Record<string, any>>;
-  private parentPageId?: string;
+  private parentPageId: string;
 
   constructor(options: SchemaPlannerOptions = {}) {
     this.envVars = options.envVars ?? process.env;
@@ -27,7 +26,7 @@ export class SchemaPlanner {
       this.envVars.NOTION_WORKSPACE_PAGE_ID?.trim() ??
       '<NOTION_PARENT_PAGE_ID_PLACEHOLDER>';
 
-    if (options.liveSnapshot) {
+    if (options.liveSnapshot && Object.keys(options.liveSnapshot).length > 0) {
       this.liveSnapshot = options.liveSnapshot;
     } else {
       const snapshotPath = path.resolve(
@@ -45,7 +44,7 @@ export class SchemaPlanner {
   }
 
   /**
-   * Generates the complete, deterministic, ordered DDL schema plan.
+   * Generates the complete, deterministic, ordered DDL schema plan (54 steps total).
    */
   public generatePlan(): SchemaPlan {
     const steps: MigrationStep[] = [];
@@ -54,7 +53,7 @@ export class SchemaPlanner {
 
     // -------------------------------------------------------------------------
     // 1. ALTER_SELECT_OPTIONS: Obrigações Mensais (Status)
-    // Read-before-write: preserve all 5 existing physical options + add 2 new ones
+    // Notion type: 'select'. Preserves existing options with IDs and appends new ones.
     // -------------------------------------------------------------------------
     const obligationsContract = TARGET_CONTRACT.NOTION_DS_MONTHLY_OBLIGATIONS;
     const obligationsDsId = this.envVars[obligationsContract.envKey]?.trim();
@@ -62,12 +61,40 @@ export class SchemaPlanner {
     const existingObligationsSnapshot = this.liveSnapshot[obligationsContract.envKey] ?? {};
     const existingStatusProp =
       existingObligationsSnapshot['Status'] ?? existingObligationsSnapshot['status'];
-    const existingOptions: string[] =
-      existingStatusProp?.selectOptions ?? ['Prevista', 'Pendente', 'Paga', 'Atrasada', 'Dispensada'];
+
+    const rawExistingOptions = existingStatusProp?.selectOptions ?? [
+      'Prevista',
+      'Pendente',
+      'Paga',
+      'Atrasada',
+      'Dispensada',
+    ];
+
+    // Preserves existing option IDs and names
+    const mergedOptionsPayload: Array<{ id?: string; name: string; color?: string }> = [];
+    const seenNames = new Set<string>();
+
+    for (const opt of rawExistingOptions) {
+      const optName = typeof opt === 'string' ? opt : opt.name;
+      const optId = typeof opt === 'object' ? opt.id : undefined;
+      const optColor = typeof opt === 'object' ? opt.color : undefined;
+      if (!seenNames.has(optName)) {
+        seenNames.add(optName);
+        mergedOptionsPayload.push({
+          ...(optId ? { id: optId } : {}),
+          name: optName,
+          ...(optColor ? { color: optColor } : {}),
+        });
+      }
+    }
 
     const newRequiredOptions = ['Revisão Necessária', 'Cancelada'];
-    const mergedOptionsSet = new Set([...existingOptions, ...newRequiredOptions]);
-    const mergedOptionsList = Array.from(mergedOptionsSet);
+    for (const newOpt of newRequiredOptions) {
+      if (!seenNames.has(newOpt)) {
+        seenNames.add(newOpt);
+        mergedOptionsPayload.push({ name: newOpt });
+      }
+    }
 
     steps.push({
       stepNumber: stepNumber++,
@@ -78,45 +105,54 @@ export class SchemaPlanner {
         id: obligationsDsId,
       },
       property: 'Status',
-      precondition: `Data Source Obrigações Mensais (${obligationsContract.envKey}) acessível; propriedade Status contém opções físicas existentes [${existingOptions.join(', ')}]`,
+      precondition: `Data Source Obrigações Mensais (${obligationsContract.envKey}) acessível; propriedade Status (select) contém opções físicas existentes [${Array.from(
+        seenNames,
+      ).join(', ')}]`,
       sanitizedPayload: {
         Status: {
-          status: {
-            options: mergedOptionsList.map((name) => ({ name })),
+          select: {
+            options: mergedOptionsPayload,
           },
         },
       },
-      postcondition: `Propriedade Status contém 7 opções homologadas preservando opções legadas: [${mergedOptionsList.join(', ')}]`,
+      postcondition: `Propriedade Status (select) contém 7 opções homologadas preservando IDs legados: [${mergedOptionsPayload
+        .map((o) => o.name)
+        .join(', ')}]`,
       risk: 'LOW',
-      rollback: `Reverter opções de Status no Notion via PATCH restaurando lista original [${existingOptions.join(', ')}]`,
+      rollback: `Reverter opções de Status no Notion via PATCH restaurando lista original de opções`,
       metadata: {
-        existingOptions,
-        addedOptions: newRequiredOptions,
+        propertyType: 'select',
+        existingOptionsCount: rawExistingOptions.length,
+        totalMergedOptionsCount: mergedOptionsPayload.length,
         readBeforeWriteVerified: true,
       },
     });
     byDataSource[obligationsContract.envKey] = (byDataSource[obligationsContract.envKey] || 0) + 1;
 
     // -------------------------------------------------------------------------
-    // 2. CREATE_PROPERTY: 51 Missing Properties across 12 existing Data Sources
-    // Evaluated in canonical deterministic order of TARGET_CONTRACT keys
+    // 2. CREATE_PROPERTY: Exactly 50 Missing Properties across the 12 existing Data Sources
+    // Note: Transações.Fatura Vinculada is strictly excluded from this generic loop
+    // and handled exclusively in the CREATE_DUAL_RELATION step.
     // -------------------------------------------------------------------------
     for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
-      if (!contract.isExisting) continue; // 13th database handled separately below
+      if (!contract.isExisting) continue;
 
       const dsId = this.envVars[contract.envKey]?.trim();
       const actualProps = this.liveSnapshot[contract.envKey] ?? {};
       const actualPropKeys = Object.keys(actualProps).map((k) => k.toLowerCase().trim());
 
       for (const prop of contract.properties) {
-        // Check if property exists under canonical name or any alias
+        // Strictly exclude Transações.Fatura Vinculada (handled in CREATE_DUAL_RELATION)
+        if (contract.envKey === 'NOTION_DS_TRANSACTIONS' && prop.notionProperty === 'Fatura Vinculada') {
+          continue;
+        }
+
         const isExactMatch = actualPropKeys.includes(prop.notionProperty.toLowerCase().trim());
         const isAliasMatch = (prop.aliases ?? []).some((alias) =>
           actualPropKeys.includes(alias.toLowerCase().trim()),
         );
 
         if (!isExactMatch && !isAliasMatch) {
-          // Property is MISSING and must be created
           const payload = this.buildPropertyPayload(prop, this.envVars);
 
           steps.push({
@@ -145,21 +181,21 @@ export class SchemaPlanner {
     }
 
     // -------------------------------------------------------------------------
-    // 3. Faturas / Ciclos de Cartão (13th Database: NOTION_DS_CARD_BILLS)
+    // 3. Faturas / Ciclos de Cartão (13ª Base: NOTION_DS_CARD_BILLS)
     // Multi-phase modeling:
-    //   Phase A: CREATE_DATABASE (with initial non-dual properties)
-    //   Phase B: RESOLVE_DATA_SOURCE_ID (from created database in runtime)
-    //   Phase C: CREATE_DUAL_RELATION (between Transações and Card Bills)
+    //   Phase A: CREATE_DATABASE (parent + title + initial_data_source: { properties })
+    //   Phase B: RESOLVE_DATA_SOURCE_ID (runtime data_source_id resolution)
+    //   Phase C: CREATE_DUAL_RELATION (Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo)
     // -------------------------------------------------------------------------
     const cardBillsContract = TARGET_CONTRACT.NOTION_DS_CARD_BILLS;
     const transactionsContract = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS;
     const transactionsDsId = this.envVars[transactionsContract.envKey]?.trim();
 
-    // Phase A: CREATE_DATABASE
+    // Phase A: CREATE_DATABASE with initial_data_source
     const initialPropertiesPayload: Record<string, any> = {};
     for (const prop of cardBillsContract.properties) {
-      if (prop.notionType === 'relation' && prop.relationTargetEnvKey === 'NOTION_DS_TRANSACTIONS') {
-        // Dual relation with Transações is deferred to Phase C
+      // Exclude dual relation with Transações from initial properties
+      if (prop.notionProperty === 'Lançamentos do Ciclo') {
         continue;
       }
       Object.assign(initialPropertiesPayload, this.buildPropertyPayload(prop, this.envVars));
@@ -185,13 +221,17 @@ export class SchemaPlanner {
             text: { content: cardBillsContract.defaultTitle },
           },
         ],
-        properties: initialPropertiesPayload,
+        initial_data_source: {
+          properties: initialPropertiesPayload,
+        },
       },
-      postcondition: `Database '${cardBillsContract.defaultTitle}' criado com schema inicial de ${Object.keys(initialPropertiesPayload).length} propriedades`,
+      postcondition: `Database '${cardBillsContract.defaultTitle}' criado com initial_data_source contendo ${
+        Object.keys(initialPropertiesPayload).length
+      } propriedades`,
       risk: 'MEDIUM',
       rollback: `Arquivar página do database criado (${cardBillsContract.defaultTitle}) via DELETE/PATCH /v1/databases/:id`,
       metadata: {
-        note: 'Criação estrutural da 13ª base. O data_source_id resultante é atribuído em tempo de execução.',
+        note: 'Criação estrutural da 13ª base via Notion API 2026-03-11 usando initial_data_source.',
       },
     });
     byDataSource[cardBillsContract.envKey] = (byDataSource[cardBillsContract.envKey] || 0) + 1;
@@ -215,11 +255,11 @@ export class SchemaPlanner {
       risk: 'LOW',
       rollback: 'N/A (operação idempotente de resolução em memória)',
       metadata: {
-        runtimePropagationTarget: `NOTION_DS_CARD_BILLS_DATA_SOURCE_ID`,
+        runtimePropagationTarget: 'NOTION_DS_CARD_BILLS_DATA_SOURCE_ID',
       },
     });
 
-    // Phase C: CREATE_DUAL_RELATION
+    // Phase C: CREATE_DUAL_RELATION (Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo)
     const dualRelStepNumber = stepNumber++;
     steps.push({
       stepNumber: dualRelStepNumber,
@@ -230,26 +270,26 @@ export class SchemaPlanner {
         id: transactionsDsId,
       },
       dependsOnStep: resolveDsStepNumber,
-      property: 'Fatura / Ciclo de Cartão',
+      property: 'Fatura Vinculada',
       precondition: `Data Source Transações (${transactionsDsId}) acessível; Data Source ID de Faturas resolvido no Step ${resolveDsStepNumber}`,
       sanitizedPayload: {
-        'Fatura / Ciclo de Cartão': {
+        'Fatura Vinculada': {
           relation: {
             data_source_id: `<RESOLVED_DATA_SOURCE_ID_STEP_${resolveDsStepNumber}>`,
             type: 'dual_property',
             dual_property: {
-              synced_property_name: 'Transações da Fatura',
+              synced_property_name: 'Lançamentos do Ciclo',
             },
           },
         },
       },
-      postcondition: `Dual relation estabelecida: Transações.Fatura / Ciclo de Cartão <-> Faturas.Transações da Fatura`,
+      postcondition: `Dual relation estabelecida: Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo`,
       risk: 'LOW',
       rollback: `Arquivar propriedade de relation em Transações via PATCH`,
       metadata: {
         bidirectional: true,
-        sourceProperty: 'Fatura / Ciclo de Cartão',
-        syncedProperty: 'Transações da Fatura',
+        sourceProperty: 'Fatura Vinculada',
+        syncedProperty: 'Lançamentos do Ciclo',
       },
     });
     byDataSource[transactionsContract.envKey] = (byDataSource[transactionsContract.envKey] || 0) + 1;
@@ -280,7 +320,7 @@ export class SchemaPlanner {
   }
 
   /**
-   * Helper to build a sanitized Notion API property creation payload based on property type.
+   * Helper to build a sanitized Notion API property creation payload based on property type and explicit numberFormat.
    */
   private buildPropertyPayload(
     prop: PropertyContract,
@@ -292,8 +332,10 @@ export class SchemaPlanner {
       case 'title':
         return { [name]: { title: {} } };
 
-      case 'number':
-        return { [name]: { number: { format: 'real' } } };
+      case 'number': {
+        const format = this.determineNumberFormat(prop);
+        return { [name]: { number: { format } } };
+      }
 
       case 'rich_text':
         return { [name]: { rich_text: {} } };
@@ -322,15 +364,6 @@ export class SchemaPlanner {
           },
         };
 
-      case 'status' as any:
-        return {
-          [name]: {
-            status: {
-              options: (prop.expectedOptions ?? []).map((opt) => ({ name: opt })),
-            },
-          },
-        };
-
       case 'relation': {
         const targetEnvKey = prop.relationTargetEnvKey;
         const targetId = targetEnvKey ? envVars[targetEnvKey]?.trim() : undefined;
@@ -348,5 +381,46 @@ export class SchemaPlanner {
       default:
         return { [name]: { [prop.notionType]: {} } };
     }
+  }
+
+  /**
+   * Determines explicit Notion number format: 'real' (BRL currency), 'percent', or 'number' (counts/days/durations).
+   * Never applies 'real' universally.
+   */
+  private determineNumberFormat(prop: PropertyContract): 'real' | 'number' | 'percent' {
+    if (prop.numberFormat) {
+      return prop.numberFormat;
+    }
+
+    const field = prop.domainField.toLowerCase();
+    const propName = prop.notionProperty.toLowerCase();
+
+    // Percentages / Rates
+    if (field.includes('rate') || field.includes('percent') || propName.includes('%') || propName.includes('taxa')) {
+      return 'percent';
+    }
+
+    // Counts, days, durations, priorities, thresholds
+    if (
+      field.includes('day') ||
+      field.includes('duration') ||
+      field.includes('count') ||
+      field.includes('quantity') ||
+      field.includes('priority') ||
+      field.includes('tolerance') ||
+      propName.includes('dia') ||
+      propName.includes('duração') ||
+      propName.includes('contas') ||
+      propName.includes('transações') ||
+      propName.includes('parcelas') ||
+      propName.includes('erros') ||
+      propName.includes('prioridade') ||
+      propName.includes('tolerância')
+    ) {
+      return 'number';
+    }
+
+    // Financial amounts, limits, balances, budgets default to BRL currency ('real')
+    return 'real';
   }
 }

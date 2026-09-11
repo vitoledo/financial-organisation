@@ -72,9 +72,18 @@ export interface BackfillPlan {
   pipelines: BackfillPipeline[];
 }
 
+export interface InputFingerprint {
+  commitSha: string;
+  notionApiVersion: string;
+  parentPageId: string;
+  dataSourceIds: Record<string, string>;
+  liveSnapshotSha256: string;
+}
+
 export interface CompleteMigrationPlan {
   version: string;
   planHash: string;
+  inputFingerprint: InputFingerprint;
   schemaPlan: SchemaPlan;
   backfillPlan: BackfillPlan;
 }
@@ -111,6 +120,8 @@ export interface PreflightCheckResult {
   dataSources: DataSourcePreflight[];
   parentPage: ParentPagePreflight;
   relationTargets: RelationTargetPreflight[];
+  liveSnapshot: Record<string, Record<string, any>>;
+  liveSnapshotSha256: string;
   permissions: 'UNVERIFIED_UNTIL_APPLY';
   warnings: string[];
   errors: string[];
@@ -118,16 +129,25 @@ export interface PreflightCheckResult {
 
 export interface BackupResult {
   backupPath: string;
+  manifestPath: string;
   encryptedHashSha256: string;
+  originalDbSha256: string;
   originalSize: number;
   encryptedSize: number;
   timestamp: string;
   verifiedRestoration: boolean;
 }
 
+export interface MigrationReadiness {
+  dryRunValid: boolean;
+  applyReady: boolean;
+  reasons: string[];
+}
+
 export interface DryRunReport {
   mode: 'dry-run';
   timestamp: string;
+  readiness: MigrationReadiness;
   preflight: PreflightCheckResult;
   backup: BackupResult;
   plan: CompleteMigrationPlan;

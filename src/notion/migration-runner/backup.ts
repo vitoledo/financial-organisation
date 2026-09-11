@@ -8,33 +8,43 @@ import { BackupResult } from './types';
 const MAGIC_HEADER = Buffer.from('FIN_ENC_V1'); // 10 bytes
 const IV_LENGTH = 12; // 12 bytes for GCM
 const TAG_LENGTH = 16; // 16 bytes auth tag
+const MIN_KEY_LENGTH = 32;
 
 export interface BackupOptions {
   dbPath?: string;
   backupDir?: string;
   key?: string;
-  allowInitializeIfMissing?: boolean;
+  allowEmptyDbForBackup?: boolean;
 }
 
 export class FinancialBackupManager {
   private dbPath: string;
   private backupDir: string;
   private backupKey?: string;
+  private allowEmptyDbForBackup: boolean;
 
   constructor(options: BackupOptions = {}) {
     this.dbPath = options.dbPath ?? path.resolve(process.cwd(), 'data', 'financial.db');
     this.backupDir = options.backupDir ?? path.resolve(process.cwd(), 'backups');
     this.backupKey = options.key ?? process.env.MIGRATION_BACKUP_KEY?.trim();
+    // allowEmptyDbForBackup is strictly FALSE by default
+    this.allowEmptyDbForBackup = options.allowEmptyDbForBackup ?? false;
   }
 
   /**
    * Derive a 32-byte AES-256 key from a passphrase or secret string using SHA-256.
+   * Strictly enforces minimum key length (32 chars) and disallows default/fallback keys.
    */
   private deriveKey(key?: string): Buffer {
     const rawKey = key ?? this.backupKey ?? process.env.MIGRATION_BACKUP_KEY?.trim();
     if (!rawKey) {
       throw new Error(
-        'Chave de backup não configurada. Defina a variável de ambiente MIGRATION_BACKUP_KEY ou passe --backup-key.',
+        'Chave de backup ausente. Configure a variável de ambiente MIGRATION_BACKUP_KEY.',
+      );
+    }
+    if (rawKey.length < MIN_KEY_LENGTH) {
+      throw new Error(
+        `Chave MIGRATION_BACKUP_KEY fraca. Exigido segredo com no mínimo ${MIN_KEY_LENGTH} caracteres.`,
       );
     }
     return crypto.createHash('sha256').update(rawKey, 'utf8').digest();
@@ -42,14 +52,17 @@ export class FinancialBackupManager {
 
   /**
    * Creates an encrypted, immutable, timestamped snapshot of the local financial database.
+   * Produces a consistent SQLite snapshot via the SQLite Backup API before encryption.
    * Performs an automated restoration test against a temporary SQLite instance to verify recuperability.
+   * Persists a sidecar manifest file alongside the encrypted snapshot.
    */
   async createEncryptedBackup(options: { key?: string; allowInitializeIfMissing?: boolean } = {}): Promise<BackupResult> {
     const keyBuffer = this.deriveKey(options.key);
+    const allowInit = options.allowInitializeIfMissing ?? this.allowEmptyDbForBackup;
 
-    // If source DB does not exist and allowInitializeIfMissing is requested, initialize minimal DB
+    // Fail if source DB is missing (allowEmptyDbForBackup is false by default)
     if (!fs.existsSync(this.dbPath)) {
-      if (options.allowInitializeIfMissing) {
+      if (allowInit) {
         const dir = path.dirname(this.dbPath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         const initDb = new Database(this.dbPath);
@@ -64,56 +77,90 @@ export class FinancialBackupManager {
       fs.mkdirSync(this.backupDir, { recursive: true });
     }
 
-    // Read original SQLite file
-    const originalBuffer = fs.readFileSync(this.dbPath);
-    const originalSize = originalBuffer.length;
+    // Step 1: Create consistent SQLite snapshot via SQLite Backup API to a temporary file
+    const tempSnapshotName = `financial-snapshot-${crypto.randomUUID()}.db`;
+    const tempSnapshotPath = path.join(os.tmpdir(), tempSnapshotName);
 
-    // Generate random 12-byte IV/nonce
-    const iv = crypto.randomBytes(IV_LENGTH);
+    try {
+      const sourceDb = new Database(this.dbPath, { readonly: true });
+      await sourceDb.backup(tempSnapshotPath);
+      sourceDb.close();
 
-    // Encrypt with AES-256-GCM
-    const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
-    const encryptedChunks = [cipher.update(originalBuffer), cipher.final()];
-    const ciphertext = Buffer.concat(encryptedChunks);
-    const authTag = cipher.getAuthTag();
+      const snapshotBuffer = fs.readFileSync(tempSnapshotPath);
+      const originalSize = snapshotBuffer.length;
+      const originalDbSha256 = crypto.createHash('sha256').update(snapshotBuffer).digest('hex');
 
-    // Construct immutable binary file payload: [MAGIC 10B][IV 12B][TAG 16B][CIPHERTEXT]
-    const backupPayload = Buffer.concat([MAGIC_HEADER, iv, authTag, ciphertext]);
-    const encryptedSize = backupPayload.length;
+      // Step 2: Encrypt snapshot with AES-256-GCM
+      const iv = crypto.randomBytes(IV_LENGTH);
+      const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
+      const encryptedChunks = [cipher.update(snapshotBuffer), cipher.final()];
+      const ciphertext = Buffer.concat(encryptedChunks);
+      const authTag = cipher.getAuthTag();
 
-    // Filename: financial-backup-YYYYMMDDTHHmmssZ-<nonce>.db.enc
-    const timestampIso = new Date().toISOString();
-    const timestampClean = timestampIso.replace(/[-:]/g, '').replace(/\..+/, '');
-    const uniqueSuffix = crypto.randomBytes(4).toString('hex');
-    const backupFileName = `financial-backup-${timestampClean}-${uniqueSuffix}.db.enc`;
-    const backupFilePath = path.join(this.backupDir, backupFileName);
+      // Binary payload: [MAGIC 10B][IV 12B][TAG 16B][CIPHERTEXT]
+      const backupPayload = Buffer.concat([MAGIC_HEADER, iv, authTag, ciphertext]);
+      const encryptedSize = backupPayload.length;
 
-    // Write file to disk
-    fs.writeFileSync(backupFilePath, backupPayload);
+      // Filename: financial-backup-YYYYMMDDTHHmmssZ-<nonce>.db.enc
+      const timestampIso = new Date().toISOString();
+      const timestampClean = timestampIso.replace(/[-:]/g, '').replace(/\..+/, '');
+      const uniqueSuffix = crypto.randomBytes(4).toString('hex');
+      const backupFileName = `financial-backup-${timestampClean}-${uniqueSuffix}.db.enc`;
+      const backupFilePath = path.join(this.backupDir, backupFileName);
 
-    // Best-effort 0o400 (read-only) for immutability on POSIX filesystems
-    if (process.platform !== 'win32') {
-      try {
-        fs.chmodSync(backupFilePath, 0o400);
-      } catch {
-        /* non-POSIX systems */
+      // Write encrypted backup to disk
+      fs.writeFileSync(backupFilePath, backupPayload);
+
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(backupFilePath, 0o400);
+        } catch {
+          /* non-POSIX systems */
+        }
+      }
+
+      // Compute SHA-256 of encrypted file
+      const encryptedHashSha256 = crypto.createHash('sha256').update(backupPayload).digest('hex');
+
+      // Step 3: Perform automated restoration test to prove recoverability
+      const verifiedRestoration = await this.testRestoration(backupFilePath, keyBuffer);
+
+      // Step 4: Write sidecar manifest file
+      const manifestPath = `${backupFilePath}.manifest.json`;
+      const manifestContent = {
+        format: 'FIN_ENC_V1',
+        keyVersion: '1',
+        algorithm: 'aes-256-gcm',
+        timestamp: timestampIso,
+        backupFileName,
+        encryptedFileSha256: encryptedHashSha256,
+        originalDbSha256,
+        originalSizeBytes: originalSize,
+        encryptedSizeBytes: encryptedSize,
+        verifiedRestoration,
+      };
+      fs.writeFileSync(manifestPath, JSON.stringify(manifestContent, null, 2), 'utf8');
+
+      return {
+        backupPath: backupFilePath,
+        manifestPath,
+        encryptedHashSha256,
+        originalDbSha256,
+        originalSize,
+        encryptedSize,
+        timestamp: timestampIso,
+        verifiedRestoration,
+      };
+    } finally {
+      // Securely delete temporary plaintext snapshot
+      if (fs.existsSync(tempSnapshotPath)) {
+        try {
+          fs.unlinkSync(tempSnapshotPath);
+        } catch {
+          /* best effort */
+        }
       }
     }
-
-    // Compute SHA-256 of the written encrypted file
-    const encryptedHashSha256 = crypto.createHash('sha256').update(backupPayload).digest('hex');
-
-    // Perform automated restoration test to prove recoverability
-    const verifiedRestoration = await this.testRestoration(backupFilePath, keyBuffer);
-
-    return {
-      backupPath: backupFilePath,
-      encryptedHashSha256,
-      originalSize,
-      encryptedSize,
-      timestamp: timestampIso,
-      verifiedRestoration,
-    };
   }
 
   /**
@@ -188,7 +235,6 @@ export class FinancialBackupManager {
 
       return true;
     } finally {
-      // Clean up temporary database file
       if (fs.existsSync(tempDbPath)) {
         try {
           fs.unlinkSync(tempDbPath);

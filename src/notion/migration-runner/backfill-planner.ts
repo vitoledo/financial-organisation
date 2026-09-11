@@ -31,22 +31,22 @@ export class BackfillPlanner {
       },
       {
         id: 'PIPELINE_2_TRANSACTIONS',
-        name: 'Backfill de Transações (Classificação Canônica e Impactos)',
+        name: 'Backfill de Transações (Classificação Canônica e Efeitos Orçamentários)',
         targetDataSource: {
           envKey: TARGET_CONTRACT.NOTION_DS_TRANSACTIONS.envKey,
           name: TARGET_CONTRACT.NOTION_DS_TRANSACTIONS.defaultTitle,
         },
         mode: 'IDEMPOTENT_CHECKPOINTED',
         description:
-          'Popula Natureza Canônica, Mês Orçamentário (YYYY-MM), Efeito Orçamentário, Impacto Caixa, Contribuição Meta Poupança e Identity Quality.',
+          'Popula Natureza Econômica, Efeito Orçamentário (INCOME | EXPENSE | REVERSAL | NEUTRAL), Propósito de Alocação e Contribuição Meta Poupança.',
         readStrategy:
-          'Cursor paged query filtrando registros com Natureza Canônica nula ou desatualizada.',
+          'Cursor paged query filtrando transações com Natureza Econômica nula ou não classificada.',
         transformStrategy:
-          'Aplicação do pipeline de normalização: mapeamento semântico da Natureza, cálculo do mês de competência orçamentária, classificação de efeito (INCOME, EXPENSE, NEUTRAL, EQUITY_TRANSFER), impacto de caixa (IMMEDIATE, STATEMENT, NONE), e atribuição de Contribuição Meta Poupança estritamente para novas contribuições líquidas (gastos subsequentes = 0). Atribuição de Identity Quality (OFFICIAL_ID ou SYNTHETIC_FALLBACK).',
+          'Aplicação das regras de classificação: mapeamento para Natureza Econômica (Receita, Despesa, Aporte, Resgate, Transferência interna, Reembolso, Pagamento de fatura, Ajuste), definição do Efeito Orçamentário estritamente entre INCOME, EXPENSE, REVERSAL ou NEUTRAL, definição de Propósito de Alocação (Caixa Operacional, Reserva de Investimento, Reserva de Emergência, Poupança Geral) e atribuição de Contribuição Meta Poupança exclusivamente quando houver aporte novo à poupança (despesas subsequentes com recursos poupados = 0).',
         writeStrategy:
           'PATCH idempotente em lotes controlados com throttle, salvando o último ID processado na tabela local de checkpoints.',
         verificationStrategy:
-          'Soma de verificação (checksum) dos totais por natureza, contagem de registros classificados vs. pendentes, conferência de ausência de campos nulos em registros confirmados.',
+          'Soma de verificação (checksum) dos totais por natureza, contagem de transações classificadas vs. pendentes, conferência de ausência de campos nulos em registros confirmados.',
         dependencies: ['PIPELINE_1_ACCOUNTS'],
       },
       {
@@ -58,11 +58,11 @@ export class BackfillPlanner {
         },
         mode: 'IDEMPOTENT_CHECKPOINTED',
         description:
-          'Agrega e totaliza Receitas Realizadas, Despesas Realizadas, Poupança Realizada e Compras Realizadas Cartão.',
+          'Agrega e totaliza Receitas Realizadas, Despesas Realizadas, Poupança Realizada (via Contribuição Meta Poupança) e Compras Realizadas Cartão.',
         readStrategy:
-          'Leitura dos registros de Planejamento Mensal existentes no Notion indexados por mês orçamentário.',
+          'Leitura dos registros de Planejamento Mensal existentes no Notion indexados pelo mês de referência.',
         transformStrategy:
-          'Agregação a partir das transações já migradas no SQLite: sum(OPERATING_REVENUE), sum(OPERATING_EXPENSE), sum(savingsGoalContribution) e sum(card purchases).',
+          'Agregação a partir das transações migradas no SQLite: soma de transações com Efeito Orçamentário INCOME (Receitas Realizadas), soma com EXPENSE (Despesas Realizadas), soma estrita de savingsGoalContribution (Poupança Realizada), e soma de transações de contas de crédito no período.',
         writeStrategy:
           'PATCH idempotente por mês orçamentário atualizando os valores agregados arredondados em duas casas decimais.',
         verificationStrategy:
@@ -78,11 +78,11 @@ export class BackfillPlanner {
         },
         mode: 'IDEMPOTENT_CHECKPOINTED',
         description:
-          'Padronização de Status para o enum homologado de 7 opções, vinculação com Conta de Pagamento e identificador externo.',
+          'Padronização do Status (select) para o conjunto homologado de 7 opções, vinculação com Conta de Pagamento e identificador externo.',
         readStrategy:
           'Leitura completa das obrigações mensais do exercício atual.',
         transformStrategy:
-          'Mapeamento semântico de status: preservação de Prevista, Pendente, Paga, Atrasada, Dispensada; classificação de inconsistências como Revisão Necessária e obrigações descartadas como Cancelada. Vinculação com a conta bancária padrão configurada.',
+          'Mapeamento de status: preservação de Prevista, Pendente, Paga, Atrasada, Dispensada; classificação de inconsistências como Revisão Necessária e obrigações descartadas como Cancelada. Vinculação com a conta bancária padrão configurada.',
         writeStrategy:
           'PATCH idempotente apenas nos registros cujos campos novos ou status divergirem do esperado.',
         verificationStrategy:
@@ -98,15 +98,15 @@ export class BackfillPlanner {
         },
         mode: 'IDEMPOTENT_CHECKPOINTED',
         description:
-          'Criação das instâncias de fatura/ciclo na base criada e vinculação bidirecional com as transações da respectiva fatura.',
+          'Criação das instâncias de Fatura / Ciclo na 13ª base e vinculação dual com Transações via Lançamentos do Ciclo <-> Fatura Vinculada.',
         readStrategy:
-          'Agrupamento das transações de cartão por conta e mês de fechamento a partir da base local de transações.',
+          'Agrupamento das transações de cartão por conta e intervalo de datas de corte a partir da base local.',
         transformStrategy:
-          'Geração de identidade unívoca da fatura: identityQuality = SOURCE_ID se bill_id fornecido pela fonte, ou PERIOD_FALLBACK baseado em conta + fechamento. Totalização de valorTotal, valorMinimo e determinação de status (ABERTA, FECHADA, PAGA, ATRASADA).',
+          'Determinação de identidade da fatura: se bill_id da fonte disponível, Qualidade da Identidade = SOURCE_ID; caso contrário, Qualidade da Identidade = PERIOD_FALLBACK com formato exato source:account:periodStart:periodEnd:currency. Atribuição de Status da Fatura estritamente conforme enums homologados (Aberta em Curso, Fechada a Vencer, Vencida, Paga Integralmente, Paga Parcialmente). Totalização de Valor da Fatura Fechada (Oficial) ou Valor Estimado da Fatura Aberta e Total de Compras no Ciclo.',
         writeStrategy:
-          'POST de novos registros na base de Faturas, seguido de PATCH em lote nas transações correspondentes para vincular a dual relation Fatura / Ciclo de Cartão.',
+          'POST de novos registros na base Faturas / Ciclos de Cartão, seguido de PATCH nas transações correspondentes para vincular a dual relation Fatura Vinculada.',
         verificationStrategy:
-          'Soma das transações associadas a cada ciclo deve bater com precisão centesimal com o valorTotal da fatura.',
+          'Soma das transações associadas a cada ciclo deve bater com precisão centesimal com o total de compras apurado no ciclo.',
         dependencies: ['PIPELINE_2_TRANSACTIONS'],
       },
     ];

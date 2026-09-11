@@ -1,9 +1,11 @@
+import { execSync } from 'child_process';
 import { Client } from '@notionhq/client';
+import { TARGET_CONTRACT } from '../../domain/schema-contract';
 import {
   CompleteMigrationPlan,
   DryRunReport,
-  PreflightCheckResult,
-  BackupResult,
+  InputFingerprint,
+  MigrationReadiness,
 } from './types';
 import { SchemaPlanner } from './schema-planner';
 import { BackfillPlanner } from './backfill-planner';
@@ -27,16 +29,12 @@ export class MigrationRunner {
   private envVars: Record<string, string | undefined>;
   private client?: Client;
   private preflightValidator: PreflightValidator;
-  private schemaPlanner: SchemaPlanner;
   private backfillPlanner: BackfillPlanner;
   private backupManager: FinancialBackupManager;
-  private allowEmptyDbForBackup: boolean;
 
   constructor(options: MigrationRunnerOptions = {}) {
-    // Mode defaults unconditionally to 'dry-run'
     this.mode = options.mode ?? 'dry-run';
     this.envVars = options.envVars ?? process.env;
-    this.allowEmptyDbForBackup = options.allowEmptyDbForBackup ?? true;
 
     const apiKey = options.notionApiKey ?? this.envVars.NOTION_API_KEY?.trim();
     if (apiKey) {
@@ -47,19 +45,33 @@ export class MigrationRunner {
     }
 
     this.preflightValidator = new PreflightValidator(this.client, '2026-03-11');
-    this.schemaPlanner = new SchemaPlanner({ envVars: this.envVars });
     this.backfillPlanner = new BackfillPlanner();
     this.backupManager = new FinancialBackupManager({
       dbPath: options.dbPath,
       backupDir: options.backupDir,
-      key: options.backupKey,
+      key: options.backupKey ?? this.envVars.MIGRATION_BACKUP_KEY?.trim(),
+      allowEmptyDbForBackup: options.allowEmptyDbForBackup ?? false,
     });
   }
 
   /**
+   * Resolves the current git commit SHA.
+   */
+  private resolveCommitSha(): string {
+    try {
+      return execSync('git rev-parse HEAD', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      return this.envVars.GIT_COMMIT_SHA?.trim() || 'unknown';
+    }
+  }
+
+  /**
    * Executes a strict, read-only dry-run migration.
-   * Performs preflight checks, generates deterministic DDL and DML plans,
-   * calculates SHA-256 planHash, creates and verifies AES-256-GCM backup.
+   * Performs preflight checks, generates live structural snapshot, generates deterministic DDL and DML plans,
+   * calculates SHA-256 planHash with inputFingerprint, creates and verifies AES-256-GCM backup.
    * ABSOLUTELY ZERO NOTION MUTATIONS.
    */
   public async runDryRun(): Promise<DryRunReport> {
@@ -68,44 +80,86 @@ export class MigrationRunner {
     // 1. Read-only Preflight Check
     const preflight = await this.preflightValidator.runPreflight(this.envVars);
 
-    // 2. Generate Deterministic Schema Plan (DDL)
-    const schemaPlan = this.schemaPlanner.generatePlan();
+    // 2. Generate Deterministic Schema Plan (DDL) directly from live preflight snapshot
+    const schemaPlanner = new SchemaPlanner({
+      envVars: this.envVars,
+      liveSnapshot: preflight.liveSnapshot,
+      parentPageId: preflight.parentPage.pageId,
+    });
+    const schemaPlan = schemaPlanner.generatePlan();
 
     // 3. Generate Deterministic Backfill Plan (DML)
     const backfillPlan = this.backfillPlanner.generatePlan();
 
-    // 4. Compute Deterministic Plan Hash
-    const planHash = computePlanHash({ schemaPlan, backfillPlan });
+    // 4. Build Input Fingerprint
+    const dataSourceIds: Record<string, string> = {};
+    for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
+      if (contract.isExisting) {
+        dataSourceIds[contract.envKey] = this.envVars[contract.envKey]?.trim() || '';
+      }
+    }
+
+    const inputFingerprint: InputFingerprint = {
+      commitSha: this.resolveCommitSha(),
+      notionApiVersion: preflight.apiVersion,
+      parentPageId: preflight.parentPage.pageId || '',
+      dataSourceIds,
+      liveSnapshotSha256: preflight.liveSnapshotSha256,
+    };
+
+    // 5. Compute Deterministic Plan Hash (incorporating inputFingerprint)
+    const planHash = computePlanHash({ inputFingerprint, schemaPlan, backfillPlan });
 
     const completePlan: CompleteMigrationPlan = {
       version: '1.0.0',
       planHash,
+      inputFingerprint,
       schemaPlan,
       backfillPlan,
     };
 
-    // 5. Create and Verify Encrypted Pre-Migration Snapshot (AES-256-GCM)
-    let backupResult: BackupResult;
-    try {
-      backupResult = await this.backupManager.createEncryptedBackup({
-        allowInitializeIfMissing: this.allowEmptyDbForBackup,
-      });
-    } catch (err: any) {
-      // If backup fails due to missing key in dry-run, generate a deterministic key for dry-run verification
-      if (err.message.includes('MIGRATION_BACKUP_KEY')) {
-        const dryRunKey = 'financial-dry-run-backup-verification-key';
-        backupResult = await this.backupManager.createEncryptedBackup({
-          key: dryRunKey,
-          allowInitializeIfMissing: this.allowEmptyDbForBackup,
-        });
-      } else {
-        throw err;
-      }
+    // 6. Create and Verify Encrypted Pre-Migration Snapshot (AES-256-GCM)
+    const backupResult = await this.backupManager.createEncryptedBackup();
+
+    // 7. Evaluate Readiness (dryRunValid vs applyReady)
+    const reasons: string[] = [];
+    const verifiedDsCount = preflight.dataSources.filter((d) => d.status === 'VERIFIED').length;
+    const parentConfigured = preflight.parentPage.status === 'CONFIGURED' && preflight.parentPage.accessible;
+
+    const dryRunValid =
+      backupResult.verifiedRestoration &&
+      schemaPlan.steps.length > 0 &&
+      backfillPlan.pipelines.length > 0;
+
+    let applyReady = dryRunValid && preflight.errors.length === 0;
+
+    if (verifiedDsCount !== 12) {
+      applyReady = false;
+      reasons.push(`Apenas ${verifiedDsCount}/12 Data Sources verificados na API do Notion.`);
     }
+
+    if (!parentConfigured) {
+      applyReady = false;
+      reasons.push(
+        'NOTION_PARENT_PAGE_ID não configurado ou inacessível. Obrigatório para a criação de Faturas em modo apply.',
+      );
+    }
+
+    if (preflight.relationTargets.some((r) => !r.valid)) {
+      applyReady = false;
+      reasons.push('Existem targets de relation pendentes ou inválidos no workspace.');
+    }
+
+    const readiness: MigrationReadiness = {
+      dryRunValid,
+      applyReady,
+      reasons,
+    };
 
     return {
       mode: 'dry-run',
       timestamp,
+      readiness,
       preflight,
       backup: backupResult,
       plan: completePlan,
@@ -129,6 +183,13 @@ export class MigrationRunner {
     }
 
     const dryRunResult = await this.runDryRun();
+
+    if (!dryRunResult.readiness.applyReady) {
+      throw new Error(
+        `APPLY_BLOCKED: O workspace não está pronto para apply. Motivos: ${dryRunResult.readiness.reasons.join(' | ')}`,
+      );
+    }
+
     if (!verifyPlanHash(dryRunResult.plan, providedPlanHash)) {
       throw new Error(
         `PLAN_HASH_MISMATCH: O hash fornecido (${providedPlanHash}) não coincide com o plano atual (${dryRunResult.plan.planHash}). A execução foi abortada por segurança.`,
@@ -153,12 +214,31 @@ export class MigrationRunner {
     lines.push(`Modo de Execução: ${report.mode.toUpperCase()}`);
     lines.push(`Timestamp: ${report.timestamp}`);
     lines.push(`Mutations no Notion: ${report.mutationsExecuted} (Estritamente Read-Only)`);
-    lines.push(`Deterministic Plan Hash (SHA-256):\n  --> ${report.plan.planHash}\n`);
+    lines.push(`Dry-Run Status: ${report.readiness.dryRunValid ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
+    lines.push(
+      `Apply Readiness: ${
+        report.readiness.applyReady ? '🟢 PRONTO PARA APPLY' : '🟡 BLOQUEADO PARA APPLY (Aguardando Pré-requisitos)'
+      }`,
+    );
+
+    if (report.readiness.reasons.length > 0) {
+      lines.push('Pendências para Apply:');
+      report.readiness.reasons.forEach((r) => lines.push(`  • ${r}`));
+    }
+
+    lines.push(`\nDeterministic Plan Hash (SHA-256):\n  --> ${report.plan.planHash}\n`);
 
     lines.push('───────────────────────────────────────────────────────────────────────────────');
-    lines.push('1. PREFLIGHT READ-ONLY CHECK');
+    lines.push('1. INPUT FINGERPRINT');
     lines.push('───────────────────────────────────────────────────────────────────────────────');
-    lines.push(`API Version Header: ${report.preflight.apiVersion}`);
+    lines.push(`Git Commit SHA: ${report.plan.inputFingerprint.commitSha}`);
+    lines.push(`Notion API Version: ${report.plan.inputFingerprint.notionApiVersion}`);
+    lines.push(`Parent Page ID: ${report.plan.inputFingerprint.parentPageId || '(não configurado)'}`);
+    lines.push(`Live Structural Snapshot SHA-256: ${report.plan.inputFingerprint.liveSnapshotSha256}`);
+
+    lines.push('\n───────────────────────────────────────────────────────────────────────────────');
+    lines.push('2. PREFLIGHT READ-ONLY CHECK');
+    lines.push('───────────────────────────────────────────────────────────────────────────────');
     lines.push(`Permissões Efetivas: ${report.preflight.permissions}`);
     lines.push(
       `Data Sources Verificados: ${
@@ -178,12 +258,14 @@ export class MigrationRunner {
     }
 
     lines.push('\n───────────────────────────────────────────────────────────────────────────────');
-    lines.push('2. SNAPSHOT PRÉ-MIGRAÇÃO (AES-256-GCM + RESTAURAÇÃO SQLite)');
+    lines.push('3. SNAPSHOT PRÉ-MIGRAÇÃO (AES-256-GCM + RESTAURAÇÃO SQLite)');
     lines.push('───────────────────────────────────────────────────────────────────────────────');
-    lines.push(`Arquivo de Backup: ${report.backup.backupPath}`);
+    lines.push(`Arquivo Cifrado: ${report.backup.backupPath}`);
+    lines.push(`Manifesto Sidecar: ${report.backup.manifestPath}`);
     lines.push(`Tamanho Original: ${report.backup.originalSize} bytes`);
     lines.push(`Tamanho Cifrado: ${report.backup.encryptedSize} bytes`);
-    lines.push(`Hash SHA-256 do Arquivo Cifrado: ${report.backup.encryptedHashSha256}`);
+    lines.push(`SHA-256 SQLite Original: ${report.backup.originalDbSha256}`);
+    lines.push(`SHA-256 Arquivo Cifrado: ${report.backup.encryptedHashSha256}`);
     lines.push(
       `Teste de Restauração SQLite: ${
         report.backup.verifiedRestoration ? '✅ APROVADO (Integridade Confirmada)' : '❌ FALHOU'
@@ -191,15 +273,15 @@ export class MigrationRunner {
     );
 
     lines.push('───────────────────────────────────────────────────────────────────────────────');
-    lines.push('3. SCHEMA PLAN (DDL DO NOTION)');
+    lines.push('4. SCHEMA PLAN (DDL DO NOTION — 54 PASSOS DETERMINÍSTICOS)');
     lines.push('───────────────────────────────────────────────────────────────────────────────');
     const summary = report.plan.schemaPlan.summary;
     lines.push(`Total de Operações Determinísticas: ${summary.totalSteps}`);
-    lines.push(`  • ALTER_SELECT_OPTIONS: ${summary.alterOptionsCount} (Obrigações.Status: preserva 5 + adiciona 2)`);
-    lines.push(`  • CREATE_PROPERTY: ${summary.createPropertyCount} (51 novas propriedades nas 12 bases)`);
-    lines.push(`  • CREATE_DATABASE: ${summary.createDatabaseCount} (Faturas / Ciclos de Cartão)`);
+    lines.push(`  • ALTER_SELECT_OPTIONS: ${summary.alterOptionsCount} (Obrigações.Status via select: preserva IDs + adiciona 2)`);
+    lines.push(`  • CREATE_PROPERTY: ${summary.createPropertyCount} (50 novas propriedades nas 12 bases)`);
+    lines.push(`  • CREATE_DATABASE: ${summary.createDatabaseCount} (Faturas / Ciclos de Cartão via initial_data_source)`);
     lines.push(`  • RESOLVE_DATA_SOURCE_ID: ${summary.resolveDataSourceCount} (Resolução de ID em runtime)`);
-    lines.push(`  • CREATE_DUAL_RELATION: ${summary.dualRelationCount} (Dual relation Transações <-> Faturas)\n`);
+    lines.push(`  • CREATE_DUAL_RELATION: ${summary.dualRelationCount} (Dual relation Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo)\n`);
 
     lines.push('Operações Ordenadas do Plano DDL:');
     for (const step of report.plan.schemaPlan.steps) {
@@ -210,7 +292,7 @@ export class MigrationRunner {
     }
 
     lines.push('\n───────────────────────────────────────────────────────────────────────────────');
-    lines.push('4. DATA BACKFILL PLAN (DML IDEMPOTENTE)');
+    lines.push('5. DATA BACKFILL PLAN (DML IDEMPOTENTE)');
     lines.push('───────────────────────────────────────────────────────────────────────────────');
     lines.push(`Total de Pipelines Planejados: ${report.plan.backfillPlan.totalPipelines}`);
     for (const pipeline of report.plan.backfillPlan.pipelines) {
