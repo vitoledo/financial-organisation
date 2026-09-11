@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "notion:check-schema": "ts-node scripts/introspect-notion.ts"
   },
   "keywords": [
     "finance",
@@ -35,6 +36,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "@notionhq/client": "^5.26.0",
     "better-sqlite3": "^11.9.0",
     "commander": "^13.1.0",
     "dotenv": "^16.5.0",
