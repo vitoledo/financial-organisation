@@ -213,12 +213,18 @@ export class SchemaApplyExecutor {
       if (step.operation === 'CREATE_DUAL_RELATION') {
         const dsId = step.targetDataSource.id;
         if (!dsId || !resolvedCardBillsDsId) return false;
-        const txDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-        let billsDs: any = undefined;
+        let txDs: any;
+        let billsDs: any;
         try {
+          txDs = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
           billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
-        } catch {
-          // Graceful fallback if permission or lookup differs
+        } catch (readErr: any) {
+          this.journal.recordRevalidationFailed(
+            this.plan.planHash,
+            step.stepNumber,
+            `Falha ao ler Data Sources para dual relation: ${readErr?.message || String(readErr)}`,
+          );
+          return false;
         }
         const verif = StepStructuralVerifier.verifyDualRelation(txDs, billsDs, resolvedCardBillsDsId, dsId);
         if (!verif.valid) {
@@ -290,7 +296,10 @@ export class SchemaApplyExecutor {
     }
 
     // Build merged payload preserving existing IDs without color
-    const liveOptions: Array<{ id?: string; name: string }> = statusProp.select?.options || [];
+    const rawOptions = statusProp.select?.options || statusProp.selectOptions || [];
+    const liveOptions: Array<{ id?: string; name: string }> = Array.isArray(rawOptions)
+      ? rawOptions.map((o: any) => (typeof o === 'string' ? { name: o } : o))
+      : [];
     const liveNames = new Set(liveOptions.map((o) => o.name));
     const mergedPayloadOptions: Array<{ id?: string; name: string }> = [];
     for (const opt of liveOptions) {
@@ -484,12 +493,18 @@ export class SchemaApplyExecutor {
 
           const normDbParent = (candidateDb.parent?.page_id || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
           const normTargetParent = parentPageId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-          const title = (candidateDb.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
-          const isTitleMatch = title.includes('Faturas') && title.includes('Ciclos de Cartão');
+          const title = (candidateDb.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('').trim();
+          const isTitleMatch = title === 'Faturas / Ciclos de Cartão';
 
           if (normDbParent === normTargetParent && isTitleMatch) {
             const desc = (candidateDb.description || []).map((d: any) => d.plain_text || d.text?.content || '').join(' ');
-            const hasMarker = desc.includes(migrationMarker) || desc.includes('CARD_BILLS_V1');
+            const expectedMarker = `MIGRATION_MARKER:${this.plan.planHash}:CARD_BILLS_V1`;
+            if (desc.includes('CARD_BILLS_V1') && !desc.includes(expectedMarker)) {
+              throw new Error(
+                `FOREIGN_MIGRATION_PLAN_DATABASE: Database '${candidateDb.id}' possui marker de migração para CARD_BILLS_V1 com outro planHash. Abortando.`,
+              );
+            }
+            const hasMarker = desc.includes(expectedMarker);
             matchingDbs.push({ db: candidateDb, hasMarker });
           }
         }
@@ -641,12 +656,15 @@ export class SchemaApplyExecutor {
     if (!resolvedCardBillsDsId) throw new Error('Data Source ID de Faturas não resolvido para vincular dual relation.');
 
     // 1. Live Precondition Read
-    const txDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
-    let billsDs: any = undefined;
+    let txDs: any;
+    let billsDs: any;
     try {
+      txDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
       billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
-    } catch {
-      // If billsDs not found yet, that is expected before relation exists or in testing
+    } catch (readErr: any) {
+      const err = `PRECONDITION_FAILED: Falha na leitura obrigatória dos Data Sources para dual relation: ${readErr?.message || String(readErr)}`;
+      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+      throw new Error(err);
     }
 
     const existingRelProp = txDs.properties?.['Fatura Vinculada'];
@@ -707,12 +725,15 @@ export class SchemaApplyExecutor {
     this.journal.recordStepApplied(this.plan.planHash, step.stepNumber);
 
     // 3. Postcondition Verification (validates BOTH Transações and Faturas sides)
-    const verifiedTxDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
-    let verifiedBillsDs: any = undefined;
+    let verifiedTxDs: any;
+    let verifiedBillsDs: any;
     try {
+      verifiedTxDs = (await this.client.dataSources.retrieve({ data_source_id: transactionsDsId })) as any;
       verifiedBillsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
-    } catch {
-      // Graceful fallback if permission/lookup differs
+    } catch (readErr: any) {
+      const err = `POSTCONDITION_FAILED: Falha na leitura obrigatória dos Data Sources para pós-verificação de dual relation: ${readErr?.message || String(readErr)}`;
+      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+      throw new Error(err);
     }
 
     const postVerif = StepStructuralVerifier.verifyDualRelation(

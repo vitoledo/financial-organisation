@@ -56,7 +56,10 @@ export class StepStructuralVerifier {
       };
     }
 
-    const liveOptions: Array<{ id?: string; name: string }> = prop.select?.options || [];
+    const rawOptions = prop.select?.options || prop.selectOptions || [];
+    const liveOptions: Array<{ id?: string; name: string }> = Array.isArray(rawOptions)
+      ? rawOptions.map((o: any) => (typeof o === 'string' ? { name: o } : o))
+      : [];
     const liveNames = new Set(liveOptions.map((o) => o.name));
 
     if (options.requireBaselineOptions) {
@@ -81,6 +84,18 @@ export class StepStructuralVerifier {
           };
         }
       }
+
+      // Exact set of 7 options: no extra options permitted
+      const targetSet = new Set<string>(OBLIGATIONS_STATUS_TARGET_OPTIONS);
+      for (const opt of liveOptions) {
+        if (!targetSet.has(opt.name)) {
+          return {
+            valid: false,
+            reason: 'UNEXPECTED_STATUS_OPTION',
+            detail: `Opção inesperada '${opt.name}' encontrada em Obrigações.Status pós-Step 1`,
+          };
+        }
+      }
     }
 
     return { valid: true };
@@ -95,6 +110,7 @@ export class StepStructuralVerifier {
     existingProp: any,
     expectedPayload: Record<string, any>,
     propName: string,
+    options: { allowExtraOptions?: boolean } = {},
   ): VerificationResult {
     if (!existingProp) {
       return { valid: false, isCompatible: false, reason: 'PROPERTY_MISSING', detail: `Propriedade '${propName}' ausente` };
@@ -119,18 +135,21 @@ export class StepStructuralVerifier {
     if (expectedType === 'number') {
       const expectedFormat = payloadEntry.number?.format;
       const actualFormat = existingProp.number?.format;
-      if (expectedFormat && actualFormat && actualFormat !== expectedFormat) {
+      if (expectedFormat && (!actualFormat || actualFormat !== expectedFormat)) {
         return {
           valid: false,
           isCompatible: false,
           reason: 'FORMAT_MISMATCH',
-          detail: `Propriedade de número '${propName}' possui format '${actualFormat}', mas o plano exige '${expectedFormat}'.`,
+          detail: `Propriedade de número '${propName}' possui format '${actualFormat || 'ausente'}', mas o plano exige '${expectedFormat}'.`,
         };
       }
     } else if (expectedType === 'select') {
       const expectedOptions: Array<{ name: string }> = payloadEntry.select?.options || [];
-      const actualOptions: Array<{ name: string }> = existingProp.select?.options || [];
+      const actualOptions: Array<{ name: string }> =
+        existingProp.select?.options || existingProp.selectOptions || [];
       const actualNames = new Set(actualOptions.map((o) => o.name));
+      const expectedNames = new Set(expectedOptions.map((o) => o.name));
+
       for (const expOpt of expectedOptions) {
         if (!actualNames.has(expOpt.name)) {
           return {
@@ -141,10 +160,26 @@ export class StepStructuralVerifier {
           };
         }
       }
+
+      if (!options.allowExtraOptions) {
+        for (const actOpt of actualOptions) {
+          if (!expectedNames.has(actOpt.name)) {
+            return {
+              valid: false,
+              isCompatible: false,
+              reason: 'SELECT_OPTIONS_DIVERGENT',
+              detail: `Propriedade select '${propName}' contém opção inesperada '${actOpt.name}'.`,
+            };
+          }
+        }
+      }
     } else if (expectedType === 'multi_select') {
       const expectedOptions: Array<{ name: string }> = payloadEntry.multi_select?.options || [];
-      const actualOptions: Array<{ name: string }> = existingProp.multi_select?.options || [];
+      const actualOptions: Array<{ name: string }> =
+        existingProp.multi_select?.options || existingProp.selectOptions || [];
       const actualNames = new Set(actualOptions.map((o) => o.name));
+      const expectedNames = new Set(expectedOptions.map((o) => o.name));
+
       for (const expOpt of expectedOptions) {
         if (!actualNames.has(expOpt.name)) {
           return {
@@ -155,25 +190,38 @@ export class StepStructuralVerifier {
           };
         }
       }
+
+      if (!options.allowExtraOptions) {
+        for (const actOpt of actualOptions) {
+          if (!expectedNames.has(actOpt.name)) {
+            return {
+              valid: false,
+              isCompatible: false,
+              reason: 'MULTI_SELECT_OPTIONS_DIVERGENT',
+              detail: `Propriedade multi_select '${propName}' contém opção inesperada '${actOpt.name}'.`,
+            };
+          }
+        }
+      }
     } else if (expectedType === 'relation') {
       const expectedTarget = payloadEntry.relation?.data_source_id;
-      const actualTarget = existingProp.relation?.data_source_id;
-      if (expectedTarget && actualTarget && expectedTarget !== actualTarget) {
+      const actualTarget = existingProp.relation?.data_source_id || existingProp.relationDataSourceId;
+      if (expectedTarget && (!actualTarget || expectedTarget !== actualTarget)) {
         return {
           valid: false,
           isCompatible: false,
           reason: 'RELATION_TARGET_MISMATCH',
-          detail: `Relation '${propName}' aponta para data_source_id '${actualTarget}', esperado '${expectedTarget}'.`,
+          detail: `Relation '${propName}' aponta para data_source_id '${actualTarget || 'ausente'}', esperado '${expectedTarget}'.`,
         };
       }
       const expectedRelType = payloadEntry.relation?.type;
-      const actualRelType = existingProp.relation?.type;
-      if (expectedRelType && actualRelType && expectedRelType !== actualRelType) {
+      const actualRelType = existingProp.relation?.type || existingProp.relationType;
+      if (expectedRelType && (!actualRelType || expectedRelType !== actualRelType)) {
         return {
           valid: false,
           isCompatible: false,
           reason: 'RELATION_TYPE_MISMATCH',
-          detail: `Relation '${propName}' possui tipo '${actualRelType}', esperado '${expectedRelType}'.`,
+          detail: `Relation '${propName}' possui tipo '${actualRelType || 'ausente'}', esperado '${expectedRelType}'.`,
         };
       }
     }
@@ -183,20 +231,20 @@ export class StepStructuralVerifier {
 
   /**
    * Verifies CREATE_DATABASE (13ª Base: Faturas / Ciclos de Cartão).
-   * Validates: active database, parent page match, title match, migration marker.
+   * Validates: active database, exact parent page match, normalized title match, exact migration marker.
    */
   public static verifyDatabase(
     db: any,
     expectedParentPageId: string,
     planHash: string,
   ): VerificationResult {
-    if (!db || db.archived) {
-      return { valid: false, reason: 'DATABASE_ARCHIVED_OR_MISSING', detail: 'Database arquivada ou não encontrada' };
+    if (!db || db.archived || db.in_trash) {
+      return { valid: false, reason: 'DATABASE_ARCHIVED_OR_MISSING', detail: 'Database arquivada, na lixeira ou não encontrada' };
     }
 
     const normActualParent = (db.parent?.page_id || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
     const normExpectedParent = expectedParentPageId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    if (normActualParent !== normExpectedParent) {
+    if (!normActualParent || normActualParent !== normExpectedParent) {
       return {
         valid: false,
         reason: 'PARENT_PAGE_MISMATCH',
@@ -204,18 +252,25 @@ export class StepStructuralVerifier {
       };
     }
 
-    const title = (db.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
-    if (!title.includes('Faturas') && !title.includes('Ciclos de Cartão')) {
+    const title = (db.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('').trim();
+    if (title !== 'Faturas / Ciclos de Cartão') {
       return {
         valid: false,
         reason: 'TITLE_MISMATCH',
-        detail: `Título da database '${title}' não corresponde a 'Faturas / Ciclos de Cartão'`,
+        detail: `Título da database '${title}' não corresponde exatamente a 'Faturas / Ciclos de Cartão'`,
       };
     }
 
     const desc = (db.description || []).map((d: any) => d.plain_text || d.text?.content || '').join(' ');
     const expectedMarker = `MIGRATION_MARKER:${planHash}:CARD_BILLS_V1`;
-    if (!desc.includes(expectedMarker) && !desc.includes('CARD_BILLS_V1')) {
+    if (!desc.includes(expectedMarker)) {
+      if (desc.includes('CARD_BILLS_V1')) {
+        return {
+          valid: false,
+          reason: 'FOREIGN_MIGRATION_PLAN_DATABASE',
+          detail: `Database possui marker de migração CARD_BILLS_V1 com outro planHash diferente de '${planHash}'`,
+        };
+      }
       return {
         valid: false,
         reason: 'MIGRATION_MARKER_MISSING',
@@ -281,7 +336,10 @@ export class StepStructuralVerifier {
     expectedTxDsId: string,
   ): VerificationResult {
     if (!transactionsDs) {
-      return { valid: false, reason: 'TRANSACTIONS_DS_MISSING', detail: 'Data Source Transações não encontrado' };
+      return { valid: false, reason: 'TRANSACTIONS_DS_MISSING', detail: 'Data Source Transações não encontrado ou leitura falhou' };
+    }
+    if (!billsDs) {
+      return { valid: false, reason: 'BILLS_DS_MISSING', detail: 'Data Source Faturas não encontrado ou leitura falhou' };
     }
 
     // 1. Check Transações side
@@ -302,66 +360,76 @@ export class StepStructuralVerifier {
       };
     }
 
-    if (txProp.relation?.data_source_id !== expectedBillsDsId) {
+    const txRelTarget = txProp.relation?.data_source_id || txProp.relationDataSourceId;
+    if (!txRelTarget || txRelTarget !== expectedBillsDsId) {
       return {
         valid: false,
         reason: 'TRANSACTIONS_RELATION_TARGET_MISMATCH',
-        detail: `'Fatura Vinculada' aponta para '${txProp.relation?.data_source_id}', esperado '${expectedBillsDsId}'`,
+        detail: `'Fatura Vinculada' aponta para '${txRelTarget || 'ausente'}', esperado '${expectedBillsDsId}'`,
       };
     }
 
-    if (txProp.relation?.type !== 'dual_property') {
+    const txRelType = txProp.relation?.type || txProp.relationType;
+    if (!txRelType || txRelType !== 'dual_property') {
       return {
         valid: false,
         reason: 'TRANSACTIONS_RELATION_NOT_DUAL',
-        detail: `'Fatura Vinculada' possui tipo de relation '${txProp.relation?.type}', esperado 'dual_property'`,
+        detail: `'Fatura Vinculada' possui tipo de relation '${txRelType || 'ausente'}', esperado 'dual_property'`,
       };
     }
 
-    const txSyncName = txProp.relation?.dual_property?.synced_property_name;
+    const txSyncName = txProp.relation?.dual_property?.synced_property_name || txProp.syncedPropertyName;
     if (txSyncName !== 'Lançamentos do Ciclo') {
       return {
         valid: false,
         reason: 'TRANSACTIONS_SYNC_PROPERTY_NAME_MISMATCH',
-        detail: `'Fatura Vinculada' sincroniza com '${txSyncName}', esperado 'Lançamentos do Ciclo'`,
+        detail: `'Fatura Vinculada' sincroniza com '${txSyncName || 'ausente'}', esperado 'Lançamentos do Ciclo'`,
       };
     }
 
-    // 2. Check Faturas side (if billsDs provided)
-    if (billsDs) {
-      const billsProp = billsDs.properties?.['Lançamentos do Ciclo'];
-      if (!billsProp) {
-        return {
-          valid: false,
-          reason: 'BILLS_SYNC_PROPERTY_MISSING',
-          detail: "Propriedade sincronizada 'Lançamentos do Ciclo' ausente no Data Source Faturas",
-        };
-      }
+    // 2. Check Faturas side
+    const billsProp = billsDs.properties?.['Lançamentos do Ciclo'];
+    if (!billsProp) {
+      return {
+        valid: false,
+        reason: 'BILLS_SYNC_PROPERTY_MISSING',
+        detail: "Propriedade sincronizada 'Lançamentos do Ciclo' ausente no Data Source Faturas",
+      };
+    }
 
-      if (billsProp.type !== 'relation') {
-        return {
-          valid: false,
-          reason: 'BILLS_SYNC_PROPERTY_TYPE_MISMATCH',
-          detail: `'Lançamentos do Ciclo' possui tipo '${billsProp.type}', esperado 'relation'`,
-        };
-      }
+    if (billsProp.type !== 'relation') {
+      return {
+        valid: false,
+        reason: 'BILLS_SYNC_PROPERTY_TYPE_MISMATCH',
+        detail: `'Lançamentos do Ciclo' possui tipo '${billsProp.type}', esperado 'relation'`,
+      };
+    }
 
-      if (billsProp.relation?.data_source_id && billsProp.relation.data_source_id !== expectedTxDsId) {
-        return {
-          valid: false,
-          reason: 'BILLS_RELATION_TARGET_MISMATCH',
-          detail: `'Lançamentos do Ciclo' aponta para '${billsProp.relation?.data_source_id}', esperado '${expectedTxDsId}'`,
-        };
-      }
+    const billsRelTarget = billsProp.relation?.data_source_id || billsProp.relationDataSourceId;
+    if (!billsRelTarget || billsRelTarget !== expectedTxDsId) {
+      return {
+        valid: false,
+        reason: 'BILLS_RELATION_TARGET_MISMATCH',
+        detail: `'Lançamentos do Ciclo' aponta para '${billsRelTarget || 'ausente'}', esperado '${expectedTxDsId}'`,
+      };
+    }
 
-      const billsSyncName = billsProp.relation?.dual_property?.synced_property_name;
-      if (billsSyncName && billsSyncName !== 'Fatura Vinculada') {
-        return {
-          valid: false,
-          reason: 'BILLS_SYNC_PROPERTY_NAME_MISMATCH',
-          detail: `'Lançamentos do Ciclo' sincroniza com '${billsSyncName}', esperado 'Fatura Vinculada'`,
-        };
-      }
+    const billsRelType = billsProp.relation?.type || billsProp.relationType;
+    if (!billsRelType || billsRelType !== 'dual_property') {
+      return {
+        valid: false,
+        reason: 'BILLS_RELATION_NOT_DUAL',
+        detail: `'Lançamentos do Ciclo' possui tipo de relation '${billsRelType || 'ausente'}', esperado 'dual_property'`,
+      };
+    }
+
+    const billsSyncName = billsProp.relation?.dual_property?.synced_property_name || billsProp.syncedPropertyName;
+    if (billsSyncName !== 'Fatura Vinculada') {
+      return {
+        valid: false,
+        reason: 'BILLS_SYNC_PROPERTY_NAME_MISMATCH',
+        detail: `'Lançamentos do Ciclo' sincroniza com '${billsSyncName || 'ausente'}', esperado 'Fatura Vinculada'`,
+      };
     }
 
     return { valid: true };

@@ -19,6 +19,7 @@ import { PreflightValidator } from './preflight';
 import { FinancialBackupManager } from './backup';
 import { MigrationJournal } from './journal';
 import { SchemaApplyExecutor } from './schema-executor';
+import { StepStructuralVerifier } from './step-verifier';
 
 export interface MigrationRunnerOptions {
   mode?: 'dry-run' | 'apply';
@@ -572,6 +573,35 @@ export class MigrationRunner {
         );
       }
 
+      // Verificações obrigatórias de integridade e fingerprint
+      if (!verifyPlanHash(plan, providedPlanHash)) {
+        throw new Error(
+          `RESUME_FINGERPRINT_MISMATCH: O hash do plano persistido não coincide com o planHash fornecido (${providedPlanHash}).`,
+        );
+      }
+
+      if (gitState.commitSha !== plan.inputFingerprint.commitSha) {
+        throw new Error(
+          `RESUME_FINGERPRINT_MISMATCH: Commit SHA atual (${gitState.commitSha}) diverge do commit SHA do plano persistido (${plan.inputFingerprint.commitSha}).`,
+        );
+      }
+
+      const currentParentPageId = (this.envVars.NOTION_PARENT_PAGE_ID || '').trim();
+      if (currentParentPageId !== plan.inputFingerprint.parentPageId) {
+        throw new Error(
+          `RESUME_FINGERPRINT_MISMATCH: Parent Page ID atual ('${currentParentPageId}') diverge do parentPageId do plano persistido ('${plan.inputFingerprint.parentPageId}').`,
+        );
+      }
+
+      for (const [envKey, persistedDsId] of Object.entries(plan.inputFingerprint.dataSourceIds)) {
+        const currentDsId = (this.envVars[envKey] || '').trim();
+        if (currentDsId !== persistedDsId) {
+          throw new Error(
+            `RESUME_FINGERPRINT_MISMATCH: Data Source ID para '${envKey}' diverge (atual: '${currentDsId}', persistido: '${persistedDsId}').`,
+          );
+        }
+      }
+
       if (!this.client) {
         throw new Error('APPLY_BLOCKED: Client do Notion não inicializado. NOTION_API_KEY obrigatória.');
       }
@@ -585,21 +615,136 @@ export class MigrationRunner {
       // Validate live state against: baseline + verified/applied steps in journal
       const recordedSteps = this.journal.getAllSteps(providedPlanHash);
       const completedSteps = recordedSteps.filter(
-        (s) => s.status === 'VERIFIED' || s.status === 'NO_OP_VERIFIED' || s.status === 'APPLIED',
+        (s) => s.status === 'VERIFIED' || s.status === 'NO_OP_VERIFIED',
       );
-      const createdPropsByEnvKey = new Set<string>();
-      let isStep1Completed = false;
+      const completedStepNumbers = new Set(completedSteps.map((s) => s.stepNumber));
 
-      for (const s of completedSteps) {
-        if (s.stepNumber === 1 || s.operation === 'ALTER_SELECT_OPTIONS') {
-          isStep1Completed = true;
-        }
-        if (s.operation === 'CREATE_PROPERTY' && s.propertyName) {
-          const stepDef = plan.schemaPlan.steps.find((st) => st.stepNumber === s.stepNumber);
-          const envKey = stepDef?.targetDataSource.envKey;
-          if (envKey) {
-            createdPropsByEnvKey.add(`${envKey}.${s.propertyName}`);
+      // Identify the first non-terminal step in the ordered plan: the frontier step
+      const sortedPlanSteps = [...plan.schemaPlan.steps].sort((a, b) => a.stepNumber - b.stepNumber);
+      const frontierStep = sortedPlanSteps.find((s) => !completedStepNumbers.has(s.stepNumber));
+
+      // Uncertain-write recovery on frontier step ONLY
+      if (frontierStep) {
+        if (frontierStep.operation === 'CREATE_PROPERTY' && frontierStep.property) {
+          const liveProp = preflight.liveSnapshot[frontierStep.targetDataSource.envKey]?.[frontierStep.property];
+          if (liveProp) {
+            const verif = StepStructuralVerifier.verifyCreateProperty(
+              liveProp,
+              frontierStep.sanitizedPayload,
+              frontierStep.property,
+            );
+            if (!verif.valid || !verif.isCompatible) {
+              throw new Error(
+                `EXTERNAL_DRIFT_DETECTED: Pós-condição do frontier step ${frontierStep.stepNumber} ('${frontierStep.property}') não satisfeita (${verif.detail}).`,
+              );
+            }
+
+            this.journal.recordStepNoOp(providedPlanHash, frontierStep.stepNumber, {
+              operation: frontierStep.operation,
+              targetDataSource: frontierStep.targetDataSource.name,
+              targetDataSourceId: frontierStep.targetDataSource.id,
+              propertyName: frontierStep.property,
+              existingId: liveProp.id,
+              metadata: {
+                recoveryReason: 'RECOVERED_AFTER_UNCERTAIN_WRITE',
+                recoveredFromUncertainWrite: true,
+              },
+            });
+            completedStepNumbers.add(frontierStep.stepNumber);
           }
+        } else if (frontierStep.operation === 'ALTER_SELECT_OPTIONS') {
+          const statusProp = preflight.liveSnapshot.NOTION_DS_MONTHLY_OBLIGATIONS?.['Status'];
+          if (statusProp) {
+            const verif = StepStructuralVerifier.verifyAlterSelectOptions(statusProp, {
+              requireAllTargetOptions: true,
+            });
+            if (verif.valid) {
+              this.journal.recordStepNoOp(providedPlanHash, frontierStep.stepNumber, {
+                operation: frontierStep.operation,
+                targetDataSource: frontierStep.targetDataSource.name,
+                targetDataSourceId: frontierStep.targetDataSource.id,
+                propertyName: 'Status',
+                metadata: {
+                  recoveryReason: 'RECOVERED_AFTER_UNCERTAIN_WRITE',
+                  recoveredFromUncertainWrite: true,
+                },
+              });
+              completedStepNumbers.add(frontierStep.stepNumber);
+            }
+          }
+        } else if (frontierStep.operation === 'CREATE_DUAL_RELATION') {
+          const existingTxRel = preflight.liveSnapshot.NOTION_DS_TRANSACTIONS?.['Fatura Vinculada'];
+          if (existingTxRel) {
+            const resolvedBillsDsId = this.journal.getStepStatus(providedPlanHash, 53)?.createdId;
+            if (resolvedBillsDsId && this.client) {
+              let txDs: any;
+              let billsDs: any;
+              try {
+                txDs = await this.client.dataSources.retrieve({ data_source_id: frontierStep.targetDataSource.id! });
+                billsDs = await this.client.dataSources.retrieve({ data_source_id: resolvedBillsDsId });
+              } catch (err: any) {
+                throw new Error(
+                  `EXTERNAL_DRIFT_DETECTED: Falha ao ler Data Sources para verificar dual relation do frontier: ${err?.message || String(err)}`,
+                );
+              }
+              const verif = StepStructuralVerifier.verifyDualRelation(
+                txDs,
+                billsDs,
+                resolvedBillsDsId,
+                frontierStep.targetDataSource.id!,
+              );
+              if (!verif.valid) {
+                throw new Error(
+                  `EXTERNAL_DRIFT_DETECTED: Dual relation do frontier não atende pós-condição (${verif.detail}).`,
+                );
+              }
+              this.journal.recordStepNoOp(providedPlanHash, frontierStep.stepNumber, {
+                operation: frontierStep.operation,
+                targetDataSource: frontierStep.targetDataSource.name,
+                targetDataSourceId: frontierStep.targetDataSource.id,
+                propertyName: 'Fatura Vinculada',
+                metadata: {
+                  recoveryReason: 'RECOVERED_AFTER_UNCERTAIN_WRITE',
+                  recoveredFromUncertainWrite: true,
+                },
+              });
+              completedStepNumbers.add(frontierStep.stepNumber);
+            }
+          }
+        }
+      }
+
+      // Check posterior step modifications: any step with stepNumber >= activeFrontierNumber CANNOT already exist
+      const activeFrontierNumber =
+        sortedPlanSteps.find((s) => !completedStepNumbers.has(s.stepNumber))?.stepNumber ?? Infinity;
+
+      for (const s of sortedPlanSteps) {
+        if (s.stepNumber >= activeFrontierNumber) {
+          if (s.operation === 'CREATE_PROPERTY' && s.property) {
+            if (preflight.liveSnapshot[s.targetDataSource.envKey]?.[s.property]) {
+              throw new Error(
+                `EXTERNAL_DRIFT_DETECTED: Propriedade posterior ao frontier '${s.targetDataSource.envKey}.${s.property}' (Passo ${s.stepNumber}, frontier atual: ${activeFrontierNumber}) apareceu no Notion sem execução no journal.`,
+              );
+            }
+          }
+          if (s.operation === 'CREATE_DUAL_RELATION') {
+            if (preflight.liveSnapshot.NOTION_DS_TRANSACTIONS?.['Fatura Vinculada']) {
+              throw new Error(
+                `EXTERNAL_DRIFT_DETECTED: Dual relation 'Fatura Vinculada' correspondente ao passo posterior 54 apareceu no Notion sem execução no journal.`,
+              );
+            }
+          }
+        }
+      }
+
+      // Check schema conformance against TARGET_CONTRACT
+      const createdPropsByEnvKey = new Set<string>();
+      let isStep1Completed = completedStepNumbers.has(1);
+
+      for (const stepNum of completedStepNumbers) {
+        const stepDef = plan.schemaPlan.steps.find((st) => st.stepNumber === stepNum);
+        if (stepDef?.operation === 'CREATE_PROPERTY' && stepDef.property) {
+          createdPropsByEnvKey.add(`${stepDef.targetDataSource.envKey}.${stepDef.property}`);
         }
       }
 

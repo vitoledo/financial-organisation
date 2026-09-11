@@ -86,7 +86,11 @@ export class PreflightValidator {
             type: pType,
           };
 
-          if (pType === 'select' && propDef.select?.options) {
+          if (pType === 'number' && propDef.number) {
+            pEntry.number = {
+              format: propDef.number.format,
+            };
+          } else if (pType === 'select' && propDef.select?.options) {
             pEntry.selectOptions = propDef.select.options.map((o: any) => ({
               id: o.id,
               name: o.name,

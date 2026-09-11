@@ -992,7 +992,11 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
             if (propertyCreated) {
               return {
                 properties: {
-                  'Limite Operacional Usado': { id: 'prop-limite-id', type: 'number' },
+                  'Limite Operacional Usado': {
+                    id: 'prop-limite-id',
+                    type: 'number',
+                    number: { format: 'real' },
+                  },
                 },
               };
             }
@@ -1707,8 +1711,186 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       expect(journal.getStepStatus(planHash, 52)?.status).toBe('NO_OP_VERIFIED');
     });
 
-    it('CRASH RECOVERY OBRIGATÓRIO: aplica passos 1..N, simula crash, instancia novo runner com mesmo planHash, retoma em N+1 sem exigir 51 missing e sem reescrever passos verificados', async () => {
-      // 1. Setup preflight and baseline plan
+    it('StepStructuralVerifier: number sem format esperado ou relation sem target/type gera falha', () => {
+      // 1. Number expecting format 'real', but format is missing
+      const numberWithoutFormat = {
+        type: 'number',
+        number: {},
+      };
+      const expectedNumberPayload = {
+        'Valor Previsto': {
+          number: { format: 'real' },
+        },
+      };
+      const resNum = StepStructuralVerifier.verifyCreateProperty(
+        numberWithoutFormat,
+        expectedNumberPayload,
+        'Valor Previsto',
+      );
+      expect(resNum.isCompatible).toBe(false);
+      expect(resNum.reason).toBe('FORMAT_MISMATCH');
+
+      // 2. Relation without data_source_id
+      const relWithoutTarget = {
+        type: 'relation',
+        relation: { type: 'dual_property' },
+      };
+      const expectedRelPayload = {
+        'Conta Bancária': {
+          relation: { data_source_id: 'ds_accounts_target', type: 'single_property' },
+        },
+      };
+      const resRel = StepStructuralVerifier.verifyCreateProperty(
+        relWithoutTarget,
+        expectedRelPayload,
+        'Conta Bancária',
+      );
+      expect(resRel.isCompatible).toBe(false);
+      expect(resRel.reason).toBe('RELATION_TARGET_MISMATCH');
+
+      // 3. Relation without type
+      const relWithoutType = {
+        type: 'relation',
+        relation: { data_source_id: 'ds_accounts_target' },
+      };
+      const resRelType = StepStructuralVerifier.verifyCreateProperty(
+        relWithoutType,
+        expectedRelPayload,
+        'Conta Bancária',
+      );
+      expect(resRelType.isCompatible).toBe(false);
+      expect(resRelType.reason).toBe('RELATION_TYPE_MISMATCH');
+    });
+
+    it('StepStructuralVerifier: select/multi_select novos exigem igualdade exata de opções, salvo allowExtraOptions=true', () => {
+      const expectedSelectPayload = {
+        'Tipo de Conta': {
+          select: {
+            options: [{ name: 'Corrente' }, { name: 'Poupança' }],
+          },
+        },
+      };
+      const existingSelectWithExtra = {
+        type: 'select',
+        select: {
+          options: [{ name: 'Corrente' }, { name: 'Poupança' }, { name: 'Investimento Extra' }],
+        },
+      };
+
+      // By default (!allowExtraOptions): extra option causes mismatch
+      const strictCheck = StepStructuralVerifier.verifyCreateProperty(
+        existingSelectWithExtra,
+        expectedSelectPayload,
+        'Tipo de Conta',
+        { allowExtraOptions: false },
+      );
+      expect(strictCheck.isCompatible).toBe(false);
+      expect(strictCheck.reason).toBe('SELECT_OPTIONS_DIVERGENT');
+      expect(strictCheck.detail).toContain('Investimento Extra');
+
+      // With allowExtraOptions: true
+      const permissiveCheck = StepStructuralVerifier.verifyCreateProperty(
+        existingSelectWithExtra,
+        expectedSelectPayload,
+        'Tipo de Conta',
+        { allowExtraOptions: true },
+      );
+      expect(permissiveCheck.isCompatible).toBe(true);
+      expect(permissiveCheck.valid).toBe(true);
+    });
+
+    it('StepStructuralVerifier: Obrigações.Status pós-Step 1 exige conjunto exato das 7 opções homologadas', () => {
+      // 8 options (has unexpected 'Outro Status')
+      const propWith8Options = {
+        type: 'select',
+        select: {
+          options: [
+            { name: 'Prevista' },
+            { name: 'Pendente' },
+            { name: 'Paga' },
+            { name: 'Atrasada' },
+            { name: 'Dispensada' },
+            { name: 'Revisão Necessária' },
+            { name: 'Cancelada' },
+            { name: 'Outro Status' },
+          ],
+        },
+      };
+      const check8 = StepStructuralVerifier.verifyAlterSelectOptions(propWith8Options, {
+        requireAllTargetOptions: true,
+      });
+      expect(check8.valid).toBe(false);
+      expect(check8.reason).toBe('UNEXPECTED_STATUS_OPTION');
+      expect(check8.detail).toContain('Outro Status');
+    });
+
+    it('Recovery de Faturas: rejeita CARD_BILLS_V1 de outro plano com FOREIGN_MIGRATION_PLAN_DATABASE e exige campos exatos', () => {
+      const planHash = '1111111111111111111111111111111111111111111111111111111111111111';
+      const foreignHash = '2222222222222222222222222222222222222222222222222222222222222222';
+
+      // Foreign plan hash database
+      const foreignDb = {
+        id: 'db-foreign-plan',
+        archived: false,
+        parent: { page_id: 'parent-123' },
+        title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+        description: [{ plain_text: `Base oficial. [MIGRATION_MARKER:${foreignHash}:CARD_BILLS_V1]` }],
+      };
+      const foreignCheck = StepStructuralVerifier.verifyDatabase(foreignDb, 'parent-123', planHash);
+      expect(foreignCheck.valid).toBe(false);
+      expect(foreignCheck.reason).toBe('FOREIGN_MIGRATION_PLAN_DATABASE');
+
+      // Mismatched normalized title
+      const wrongTitleDb = {
+        id: 'db-wrong-title',
+        archived: false,
+        parent: { page_id: 'parent-123' },
+        title: [{ plain_text: 'Faturas de Cartão de Crédito' }],
+        description: [{ plain_text: `Base oficial. [MIGRATION_MARKER:${planHash}:CARD_BILLS_V1]` }],
+      };
+      const titleCheck = StepStructuralVerifier.verifyDatabase(wrongTitleDb, 'parent-123', planHash);
+      expect(titleCheck.valid).toBe(false);
+      expect(titleCheck.reason).toBe('TITLE_MISMATCH');
+
+      // Valid exact database
+      const validDb = {
+        id: 'db-valid',
+        archived: false,
+        in_trash: false,
+        parent: { page_id: 'parent-123' },
+        title: [{ plain_text: 'Faturas / Ciclos de Cartão' }],
+        description: [{ plain_text: `Base oficial. [MIGRATION_MARKER:${planHash}:CARD_BILLS_V1]` }],
+      };
+      const validCheck = StepStructuralVerifier.verifyDatabase(validDb, 'parent-123', planHash);
+      expect(validCheck.valid).toBe(true);
+    });
+
+    it('dual relation: erro de leitura em qualquer dos Data Sources reprova verificação', () => {
+      const validTxDs = {
+        properties: {
+          'Fatura Vinculada': {
+            type: 'relation',
+            relation: {
+              data_source_id: 'ds_bills',
+              type: 'dual_property',
+              dual_property: { synced_property_name: 'Lançamentos do Ciclo' },
+            },
+          },
+        },
+      };
+
+      // billsDs is missing/undefined
+      const missingBillsCheck = StepStructuralVerifier.verifyDualRelation(validTxDs, undefined, 'ds_bills', 'ds_tx');
+      expect(missingBillsCheck.valid).toBe(false);
+      expect(missingBillsCheck.reason).toBe('BILLS_DS_MISSING');
+
+      // txDs is missing/undefined
+      const missingTxCheck = StepStructuralVerifier.verifyDualRelation(undefined, {}, 'ds_bills', 'ds_tx');
+      expect(missingTxCheck.valid).toBe(false);
+      expect(missingTxCheck.reason).toBe('TRANSACTIONS_DS_MISSING');
+    });
+
+    it('RESUME_APPLY: divergência de fingerprint (commit, parentPageId, dataSourceIds, planHash) aborta com RESUME_FINGERPRINT_MISMATCH', async () => {
       const journal = new MigrationJournal(testDbPath);
       const snapshot: Record<string, Record<string, any>> = JSON.parse(
         JSON.stringify(LIVE_NOTION_FIXTURES),
@@ -1727,30 +1909,248 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         },
         {
           worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_original_123',
           liveSnapshotOverride: snapshot,
         },
       );
 
       const dryRunReport = await runner.runDryRun();
       const planHash = dryRunReport.plan.planHash;
-      expect(planHash).toMatch(/^[a-f0-9]{64}$/);
-
-      // Save plan into journal as INITIAL_APPLY would do
       journal.savePlan(dryRunReport.plan, 'feat/phase-1-schema-apply-executor');
-      expect(journal.hasPlan(planHash)).toBe(true);
 
-      // 2. Simulate execution of Steps 1 to 3 in mock
-      // Step 1: ALTER_SELECT_OPTIONS on Obrigações Mensais.Status
-      journal.recordStepPending({
-        planHash,
-        stepNumber: 1,
-        operation: 'ALTER_SELECT_OPTIONS',
-        targetDataSource: 'Obrigações Mensais',
-        propertyName: 'Status',
+      const mockClient: any = {
+        dataSources: { retrieve: async () => ({ properties: {} }) },
+      };
+
+      // 1. Commit SHA mismatch
+      const commitMismatchRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_divergente_999',
+          liveSnapshotOverride: snapshot,
+        },
+      );
+      commitMismatchRunner.setClient(mockClient);
+      await expect(commitMismatchRunner.execute(planHash)).rejects.toThrow('RESUME_FINGERPRINT_MISMATCH');
+
+      // 2. Parent Page ID mismatch
+      const parentMismatchRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: 'divergent-parent-page-id-999',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_original_123',
+          liveSnapshotOverride: snapshot,
+        },
+      );
+      parentMismatchRunner.setClient(mockClient);
+      await expect(parentMismatchRunner.execute(planHash)).rejects.toThrow('RESUME_FINGERPRINT_MISMATCH');
+
+      // 3. Data Source ID mismatch
+      const dsMismatchRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_DS_ACCOUNTS: '00000000-0000-0000-0000-000000009999',
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_original_123',
+          liveSnapshotOverride: snapshot,
+        },
+      );
+      dsMismatchRunner.setClient(mockClient);
+      await expect(dsMismatchRunner.execute(planHash)).rejects.toThrow('RESUME_FINGERPRINT_MISMATCH');
+    });
+
+    it('CRASH RECOVERY OBRIGATÓRIO NA JANELA CRÍTICA: PATCH de CREATE_PROPERTY retorna sucesso, simula crash antes de recordStepApplied, novo runner reconhece frontier step, recupera com NO_OP_VERIFIED e continua N+1 sem novo PATCH', async () => {
+      // 1. In-memory stateful Notion fake
+      class StatefulNotionFake {
+        public writeCallsCount = 0;
+        public writeCallsByProperty: Record<string, number> = {};
+        public dataSourcesMap: Map<string, any> = new Map();
+        public databasesMap: Map<string, any> = new Map();
+
+        constructor(initialFixtures: Record<string, Record<string, any>>) {
+          for (const [envKey, dsId] of Object.entries(REAL_DATA_SOURCE_IDS)) {
+            const rawProps = JSON.parse(JSON.stringify(initialFixtures[envKey] || {}));
+            const props: Record<string, any> = {};
+            for (const [pName, pDef] of Object.entries(rawProps)) {
+              const def: any = { ...pDef };
+              if (def.type === 'select') {
+                const rawOpts = def.select?.options || def.selectOptions || [];
+                def.select = {
+                  options: rawOpts.map((o: any, idx: number) => ({
+                    id: o.id || `opt_${idx}`,
+                    name: typeof o === 'string' ? o : o.name,
+                  })),
+                };
+              }
+              props[pName] = def;
+            }
+            this.dataSourcesMap.set(dsId, {
+              id: dsId,
+              properties: props,
+            });
+          }
+        }
+
+        public dataSources = {
+          retrieve: async ({ data_source_id }: { data_source_id: string }) => {
+            const ds = this.dataSourcesMap.get(data_source_id);
+            if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
+            return JSON.parse(JSON.stringify(ds));
+          },
+          update: async ({ data_source_id, properties }: { data_source_id: string; properties: any }) => {
+            this.writeCallsCount++;
+            const ds = this.dataSourcesMap.get(data_source_id);
+            if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
+            if (!ds.properties) ds.properties = {};
+
+            for (const [propName, propDef] of Object.entries(properties)) {
+              this.writeCallsByProperty[propName] = (this.writeCallsByProperty[propName] || 0) + 1;
+
+              if ((propDef as any).select) {
+                ds.properties[propName] = {
+                  id: `prop_${propName}_id`,
+                  name: propName,
+                  type: 'select',
+                  select: {
+                    options: (propDef as any).select.options.map((o: any, idx: number) => ({
+                      id: o.id || `opt_${idx}`,
+                      name: o.name,
+                    })),
+                  },
+                };
+              } else if ((propDef as any).number) {
+                ds.properties[propName] = {
+                  id: `prop_${propName}_id`,
+                  name: propName,
+                  type: 'number',
+                  number: (propDef as any).number,
+                };
+              } else if ((propDef as any).rich_text) {
+                ds.properties[propName] = {
+                  id: `prop_${propName}_id`,
+                  name: propName,
+                  type: 'rich_text',
+                  rich_text: {},
+                };
+              } else {
+                const pType = Object.keys(propDef as any)[0] || 'rich_text';
+                ds.properties[propName] = {
+                  id: `prop_${propName}_id`,
+                  name: propName,
+                  type: pType,
+                  [pType]: (propDef as any)[pType],
+                };
+              }
+            }
+
+            return JSON.parse(JSON.stringify(ds));
+          },
+        };
+
+        public databases = {
+          retrieve: async ({ database_id }: { database_id: string }) => {
+            const db = this.databasesMap.get(database_id);
+            if (!db) throw new Error(`Database '${database_id}' not found`);
+            return JSON.parse(JSON.stringify(db));
+          },
+          create: async (params: any) => {
+            this.writeCallsCount++;
+            const dbId = 'mock-db-id';
+            const dsId = 'mock-ds-id';
+            const newDb = { id: dbId, parent: params.parent, title: params.title, archived: false, data_sources: [{ id: dsId }] };
+            this.databasesMap.set(dbId, newDb);
+            this.dataSourcesMap.set(dsId, { id: dsId, properties: {} });
+            return newDb;
+          },
+        };
+
+        public search = async () => ({ results: [] });
+      }
+
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const journal = new MigrationJournal(testDbPath);
+
+      // Compute initial plan
+      const runner1 = new TestableMigrationRunner(
+        {
+          mode: 'dry-run',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_recovery_test',
+        },
+      );
+      runner1.setClient(fakeNotion);
+
+      const dryRunReport = await runner1.runDryRun();
+      const plan = dryRunReport.plan;
+      const planHash = plan.planHash;
+      journal.savePlan(plan, 'feat/phase-1-schema-apply-executor');
+
+      // 2. Execute Step 1 via SchemaApplyExecutor against fake Notion
+      const executor1 = new SchemaApplyExecutor({
+        client: fakeNotion as any,
+        journal,
+        plan,
+        parentPageId: '00000000-0000-0000-0000-000000000001',
+        allowRealMutations: true,
       });
-      journal.recordStepVerified(planHash, 1);
 
-      // Step 2 & 3: CREATE_PROPERTY on Contas and Categorias
+      // Execute Step 1
+      const step1Result = await (executor1 as any).executeAlterSelectOptions(plan.schemaPlan.steps[0], Date.now());
+      expect(step1Result.status).toBe('VERIFIED');
+      expect(fakeNotion.writeCallsCount).toBe(1);
+      expect(journal.getStepStatus(planHash, 1)?.status).toBe('VERIFIED');
+
+      // 3. Step 2 (Contas: 'Limite Operacional Usado'):
+      // Mutation succeeds on fake Notion:
+      await fakeNotion.dataSources.update({
+        data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
+        properties: plan.schemaPlan.steps[1].sanitizedPayload,
+      });
+      expect(fakeNotion.writeCallsCount).toBe(2);
+      expect(fakeNotion.writeCallsByProperty['Limite Operacional Usado']).toBe(1);
+
+      // SIMULATE CRASH: Process was terminated BEFORE recordStepApplied was executed!
+      // In journal: Step 2 was marked PENDING when step started, but NEVER APPLIED or VERIFIED.
       journal.recordStepPending({
         planHash,
         stepNumber: 2,
@@ -1758,56 +2158,9 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         targetDataSource: 'Contas',
         propertyName: 'Limite Operacional Usado',
       });
-      journal.recordStepVerified(planHash, 2, 'prop-contas-limite');
+      expect(journal.getStepStatus(planHash, 2)?.status).toBe('PENDING');
 
-      journal.recordStepPending({
-        planHash,
-        stepNumber: 3,
-        operation: 'CREATE_PROPERTY',
-        targetDataSource: 'Categorias',
-        propertyName: 'Cor Hex',
-      });
-      journal.recordStepVerified(planHash, 3, 'prop-categorias-cor');
-
-      // 3. Update live snapshot to reflect the applied steps 1..3
-      // Obrigações.Status now has 7 options
-      snapshot.NOTION_DS_MONTHLY_OBLIGATIONS['Status'] = {
-        name: 'Status',
-        type: 'select',
-        selectOptions: [
-          'Prevista',
-          'Pendente',
-          'Paga',
-          'Atrasada',
-          'Dispensada',
-          'Revisão Necessária',
-          'Cancelada',
-        ],
-      };
-      // Contas has Limite Operacional Usado
-      snapshot.NOTION_DS_ACCOUNTS['Limite Operacional Usado'] = {
-        name: 'Limite Operacional Usado',
-        type: 'number',
-      };
-      // Categorias has Cor Hex
-      snapshot.NOTION_DS_CATEGORIES['Cor Hex'] = {
-        name: 'Cor Hex',
-        type: 'rich_text',
-      };
-
-      // 4. Instantiate BRAND NEW RUNNER with the same planHash (simulating process restart)
-      const mockNotionClient: any = {
-        dataSources: {
-          retrieve: async () => ({ properties: {} }),
-          update: async () => ({}),
-        },
-        databases: {
-          retrieve: async () => ({ archived: false }),
-          create: async () => ({ id: 'mock-db' }),
-        },
-        search: async () => ({ results: [] }),
-      };
-
+      // 4. Restart process: instantiate BRAND NEW RUNNER with same planHash
       const resumeRunner = new TestableMigrationRunner(
         {
           mode: 'apply',
@@ -1822,26 +2175,105 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         },
         {
           worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_recovery_test',
+        },
+      );
+      resumeRunner.setClient(fakeNotion);
+
+      // Execute resume. The runner must:
+      // - identify Step 2 as the frontier step
+      // - validate its exact postcondition
+      // - record RECOVERED_AFTER_UNCERTAIN_WRITE / NO_OP_VERIFIED
+      // - verify safeguarding gate
+      await expect(resumeRunner.execute(planHash)).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+
+      // Verify Step 2 is now NO_OP_VERIFIED in journal with recovery metadata
+      const step2JournalStatus = journal.getStepStatus(planHash, 2);
+      expect(step2JournalStatus?.status).toBe('NO_OP_VERIFIED');
+      const step2Metadata = JSON.parse(step2JournalStatus?.metadataJson || '{}');
+      expect(step2Metadata.recoveryReason).toBe('RECOVERED_AFTER_UNCERTAIN_WRITE');
+
+      // 5. Verify N+1 continuation WITHOUT duplicate PATCH on Step 2:
+      const executor2 = new SchemaApplyExecutor({
+        client: fakeNotion as any,
+        journal,
+        plan,
+        parentPageId: '00000000-0000-0000-0000-000000000001',
+        allowRealMutations: true,
+      });
+
+      const writeCountBeforeContinuation = fakeNotion.writeCallsCount; // 2
+      // Step 2 is verified via verifyStepAlreadyCompleted -> ZERO writes!
+      const isStep2Valid = await (executor2 as any).verifyStepAlreadyCompleted(plan.schemaPlan.steps[1]);
+      expect(isStep2Valid).toBe(true);
+
+      // Execute Step 3 ('Limite Usado da Fonte (Bruto)')
+      const step3Result = await (executor2 as any).executeCreateProperty(plan.schemaPlan.steps[2], Date.now());
+      expect(step3Result.status).toBe('VERIFIED');
+      expect(fakeNotion.writeCallsCount).toBe(writeCountBeforeContinuation + 1); // 3
+
+      // CONFIRM CRUCIAL INVARIANT: Step 2 was NEVER patched a second time!
+      expect(fakeNotion.writeCallsByProperty['Limite Operacional Usado']).toBe(1);
+    });
+
+    it('Frontier rule: alteração correspondente a passo posterior ao frontier permanece EXTERNAL_DRIFT_DETECTED', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const snapshot: Record<string, Record<string, any>> = JSON.parse(
+        JSON.stringify(LIVE_NOTION_FIXTURES),
+      );
+
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'dry-run',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_posterior_drift',
           liveSnapshotOverride: snapshot,
         },
       );
-      resumeRunner.setClient(mockNotionClient);
 
-      // Confirm journal has the plan and recognizes RESUME_APPLY
-      expect(resumeRunner.getJournalInstance().hasPlan(planHash)).toBe(true);
+      const dryRunReport = await runner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+      journal.savePlan(dryRunReport.plan, 'feat/phase-1-schema-apply-executor');
 
-      // Running resume execute() validates live state (which has 49 missing, NOT 51, because 2 properties were created!)
-      // And executes the apply safeguarding check
-      await expect(
-        resumeRunner.execute(planHash),
-      ).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+      // Journal has Step 1 as completed. So frontier is Step 2.
+      journal.recordStepPending({
+        planHash,
+        stepNumber: 1,
+        operation: 'ALTER_SELECT_OPTIONS',
+        targetDataSource: 'Obrigações Mensais',
+      });
+      journal.recordStepVerified(planHash, 1);
 
-      // 5. Test EXTERNAL DRIFT rejection during resume:
-      // If an unexplained external modification occurs (e.g. a homologated missing property appears without journal execution)
-      const driftedSnapshot: Record<string, Record<string, any>> = JSON.parse(JSON.stringify(snapshot));
-      driftedSnapshot.NOTION_DS_ACCOUNTS['Dia de Fechamento'] = {
+      // Live snapshot has Step 1 applied
+      snapshot.NOTION_DS_MONTHLY_OBLIGATIONS['Status'] = {
+        name: 'Status',
+        type: 'select',
+        selectOptions: [
+          'Prevista',
+          'Pendente',
+          'Paga',
+          'Atrasada',
+          'Dispensada',
+          'Revisão Necessária',
+          'Cancelada',
+        ],
+      };
+
+      // Live snapshot ALSO has Step 4 ('Contas.Dia de Fechamento') applied!
+      // Step 4 > frontier (Step 2) -> this MUST be rejected as EXTERNAL_DRIFT_DETECTED
+      snapshot.NOTION_DS_ACCOUNTS['Dia de Fechamento'] = {
         name: 'Dia de Fechamento',
         type: 'number',
+        number: { format: 'number' },
       };
 
       const driftRunner = new TestableMigrationRunner(
@@ -1858,14 +2290,15 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         },
         {
           worktreeStatusOverride: 'WORKTREE_CLEAN',
-          liveSnapshotOverride: driftedSnapshot,
+          gitCommitShaOverride: 'commit_sha_posterior_drift',
+          liveSnapshotOverride: snapshot,
         },
       );
-      driftRunner.setClient(mockNotionClient);
+      driftRunner.setClient({
+        dataSources: { retrieve: async () => ({ properties: {} }) },
+      });
 
-      await expect(
-        driftRunner.execute(planHash),
-      ).rejects.toThrow('EXTERNAL_DRIFT_DETECTED');
-    }, 30000);
+      await expect(driftRunner.execute(planHash)).rejects.toThrow('EXTERNAL_DRIFT_DETECTED');
+    });
   });
 });
