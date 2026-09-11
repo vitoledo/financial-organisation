@@ -567,6 +567,135 @@ describe('Domain: Schema Contract Specification', () => {
     expect(discrepancyUnexplained.amountMinor).toBe(5000n);
     expect(discrepancyUnexplained.toDecimalString()).toBe('50.00');
   });
+
+  test('CardBill specifies complete 23 properties and provenance / identity lifecycle', () => {
+    const cardBillsProps = TARGET_CONTRACT.NOTION_DS_CARD_BILLS.properties;
+    expect(cardBillsProps).toHaveLength(23);
+
+    // Provenance: Fonte is connector, not institution
+    const fonteProp = cardBillsProps.find((p) => p.domainField === 'source');
+    expect(fonteProp).toBeDefined();
+    expect(fonteProp?.notionProperty).toBe('Fonte');
+    expect(fonteProp?.notionType).toBe('select');
+    expect(fonteProp?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(fonteProp?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+      'Outra': 'OTHER',
+    });
+
+    // Upstream and stable bill IDs
+    const sourceBillId = cardBillsProps.find((p) => p.domainField === 'sourceBillId');
+    expect(sourceBillId?.notionProperty).toBe('ID da Fatura na Fonte');
+    expect(sourceBillId?.authority).toBe('UPSTREAM');
+
+    const stableBillId = cardBillsProps.find((p) => p.domainField === 'stableBillId');
+    expect(stableBillId?.notionProperty).toBe('ID Estável da Fatura');
+    expect(stableBillId?.authority).toBe('DERIVADO');
+
+    // Identity quality: SOURCE_ID vs PERIOD_FALLBACK
+    const identityQuality = cardBillsProps.find((p) => p.domainField === 'identityQuality');
+    expect(identityQuality?.notionProperty).toBe('Qualidade da Identidade');
+    expect(identityQuality?.expectedOptions).toEqual(['SOURCE_ID', 'PERIOD_FALLBACK']);
+
+    // Separate open estimated vs official closed bill amounts
+    const officialProp = cardBillsProps.find((p) => p.domainField === 'officialClosedBillAmount');
+    expect(officialProp?.notionProperty).toBe('Valor da Fatura Fechada (Oficial)');
+    expect(officialProp?.authority).toBe('UPSTREAM');
+
+    const estimatedProp = cardBillsProps.find((p) => p.domainField === 'estimatedOpenBillAmount');
+    expect(estimatedProp?.notionProperty).toBe('Valor Estimado da Fatura Aberta');
+    expect(estimatedProp?.authority).toBe('DERIVADO');
+
+    // Dual relation
+    const cycleTxProp = cardBillsProps.find((p) => p.domainField === 'transactionsRelation');
+    expect(cycleTxProp?.isBidirectionalRelation).toBe(true);
+    expect(cycleTxProp?.syncedPropertyName).toBe('Fatura Vinculada');
+    expect(cycleTxProp?.relationTargetEnvKey).toBe('NOTION_DS_TRANSACTIONS');
+  });
+
+  test('Contract verifies destination account relation in Transactions and Rules', () => {
+    const txProps = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS.properties;
+    const destAccTx = txProps.find((p) => p.domainField === 'destinationAccountRelation');
+    expect(destAccTx).toBeDefined();
+    expect(destAccTx?.notionProperty).toBe('Conta Destino');
+    expect(destAccTx?.notionType).toBe('relation');
+    expect(destAccTx?.relationTargetEnvKey).toBe('NOTION_DS_ACCOUNTS');
+    expect(destAccTx?.direction).toBe('both');
+    expect(destAccTx?.authority).toBe('REGRA_AUTOMATICA');
+
+    const ruleProps = TARGET_CONTRACT.NOTION_DS_RULES.properties;
+    const destAccRule = ruleProps.find((p) => p.domainField === 'assignDestinationAccount');
+    expect(destAccRule).toBeDefined();
+    expect(destAccRule?.notionProperty).toBe('Atribuir: Conta Destino');
+    expect(destAccRule?.notionType).toBe('relation');
+    expect(destAccRule?.relationTargetEnvKey).toBe('NOTION_DS_ACCOUNTS');
+    expect(destAccRule?.direction).toBe('both');
+    expect(destAccRule?.authority).toBe('USUARIO');
+  });
+
+  test('Contract verifies refined option mappings for Categories, Investments, Movements and Sync Log', () => {
+    // Categories defaultNature
+    const catProps = TARGET_CONTRACT.NOTION_DS_CATEGORIES.properties;
+    const defNature = catProps.find((p) => p.domainField === 'defaultNature');
+    expect(defNature?.expectedOptions).toEqual(['Receita', 'Despesa', 'Patrimonial', 'Mista']);
+    expect(defNature?.optionMappings).toEqual({
+      'Receita': 'OPERATING_REVENUE',
+      'Despesa': 'OPERATING_EXPENSE',
+      'Patrimonial': 'CAPITAL_OR_EQUITY',
+      'Mista': 'MIXED_SPLIT',
+    });
+
+    // Investments Classe do Ativo: FIIs -> FII
+    const invProps = TARGET_CONTRACT.NOTION_DS_INVESTMENTS.properties;
+    const assetType = invProps.find((p) => p.domainField === 'assetType');
+    expect(assetType?.optionMappings?.['FIIs']).toBe('FII');
+    expect(assetType?.optionMappings?.['Ações']).toBe('Ação');
+
+    // Movements movementType: Transferência, Rendimento, Resgate
+    const movProps = TARGET_CONTRACT.NOTION_DS_INVESTMENT_MOVEMENTS.properties;
+    const movType = movProps.find((p) => p.domainField === 'movementType');
+    expect(movType?.optionMappings?.['Transferência']).toBe('INTERNAL_TRANSFER');
+    expect(movType?.optionMappings?.['Rendimento']).toBe('INVESTMENT_INCOME');
+    expect(movType?.optionMappings?.['Resgate']).toBe('ASSET_REDEMPTION');
+
+    // Sync Log: Parcial, Executando
+    const logProps = TARGET_CONTRACT.NOTION_DS_SYNC_LOG.properties;
+    const logStatus = logProps.find((p) => p.domainField === 'status');
+    expect(logStatus?.optionMappings?.['Parcial']).toBe('PARTIAL_SUCCESS');
+    expect(logStatus?.optionMappings?.['Executando']).toBe('RUNNING');
+
+    const logFonte = logProps.find((p) => p.domainField === 'syncSource');
+    expect(logFonte?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração']);
+    expect(logFonte?.optionMappings).toEqual({
+      'Pierre': 'PIERRE',
+      'Manual': 'MANUAL',
+      'Migração': 'MIGRATION',
+    });
+  });
+
+  test('enforces authoritative field precedence: USUARIO > REGRA_AUTOMATICA / DERIVADO > UPSTREAM', () => {
+    const authorityPrecedence: Record<string, number> = {
+      USUARIO: 3,
+      REGRA_AUTOMATICA: 2,
+      DERIVADO: 2,
+      UPSTREAM: 1,
+      FONTE_EXTERNA: 1,
+      PIERRE: 1,
+    };
+
+    function resolveFieldAuthority(authorities: Array<keyof typeof authorityPrecedence>) {
+      return authorities.reduce((highest, current) =>
+        authorityPrecedence[current] > authorityPrecedence[highest] ? current : highest,
+      );
+    }
+
+    // User override wins over rule or upstream
+    expect(resolveFieldAuthority(['UPSTREAM', 'USUARIO'])).toBe('USUARIO');
+    expect(resolveFieldAuthority(['REGRA_AUTOMATICA', 'USUARIO'])).toBe('USUARIO');
+    expect(resolveFieldAuthority(['UPSTREAM', 'REGRA_AUTOMATICA'])).toBe('REGRA_AUTOMATICA');
+  });
 });
 
 describe('Notion: Schema Validator (Phase 0 Introspector)', () => {

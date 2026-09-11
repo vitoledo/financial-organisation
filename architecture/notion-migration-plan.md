@@ -1,4 +1,4 @@
-# Plano de Migração de Schema: Notion vs. Modelo de Domínio (V2.2 - Patch Operacional)
+# Plano de Migração de Schema: Notion vs. Modelo de Domínio (V2.3 - Patch Operacional Final Pré-Execução)
 
 > **Status:** Plano Técnico de Migração e Conformidade (Fase 1 - Homologado para Execução)  
 > **Baseline de Referência:** `0b657453b274793b79a8343502f69a64f21c6277` (Fase 0 encerrada e aprovada)  
@@ -9,36 +9,57 @@
 
 ## 1. Resumo Executivo e Princípios Norteadores da Migração
 
-Este documento define o plano arquitetural, executável e estritamente auditado para a migração de schemas entre o workspace Notion atual (12 bases introspectadas na Fase 0) e o modelo de domínio canônico V2.2, estabelecendo também o design técnico da 13ª base (*Faturas / Ciclos de Cartão*).
+Este documento define o plano arquitetural, executável e estritamente auditado para a migração de schemas entre o workspace Notion atual (12 bases introspectadas na Fase 0) e o modelo de domínio canônico V2.3, estabelecendo também o design técnico e operacional da 13ª base (*Faturas / Ciclos de Cartão*).
 
 ### 1.1 Princípios de Governança, Risco Residual Controlado e Salvaguardas
 
-1. **Snapshot Financeiro Pré-Migração Privado, Cifrado e Durável:**  
-   Substitui-se qualquer suposição de "risco nulo" por governança de risco residual controlado. Nenhuma mutação de schema ou backfill será executada sem a geração prévia de um **snapshot integral read-only de schema e dados transacionais/patrimoniais** persistido exclusivamente no storage privado local (`data/financial.db` ou backup SQLite local cifrado fora do controle de versão via `.gitignore`).  
-   *Diretriz mandatória:* **É terminantemente vedado o uso de diretórios de artifacts públicos ou repositórios como repositório de backup financeiro real.**
-2. **Protocolo Mandatório de Read-Before-Write em Selects / Status:**  
+1. **Snapshot Financeiro Pré-Migração Separado, Imutável, Cifrado e Testado:**  
+   Substitui-se qualquer suposição ingênua de "risco nulo" por governança de risco residual estritamente controlada. Nenhuma mutação de schema ou ingestão/backfill será autorizada sem a geração prévia de um **arquivo de snapshot integral read-only de schema e dados transacionais/patrimoniais**, imutável, cifrado com AES-256-GCM e timestampado: `data/snapshots/snapshot-pre-migration-<timestamp>.sqlite.enc` (acompanhado de seu hash SHA-256 no arquivo `snapshot-pre-migration-<timestamp>.sha256`).  
+   *Diretriz mandatória:* O arquivo `financial.db` operacional **não conta sozinho como snapshot**. É compulsório executar e aprovar um teste mandatório de restauração em dry-run (descriptografia para banco temporário e verificação da integridade das tabelas restauradas) antes de disparar qualquer chamada mutante contra a API do Notion. É terminantemente vedado o uso de diretórios de artifacts públicos ou versionamento no Git para dados financeiros reais.
+2. **Inexistência de Transação Distribuída (Notion + SQLite) e Backfill Idempotente, Checkpointed, Resumable e Verificado:**  
+   Não existe transação atômica distribuída (2PC) conectando a API remota do Notion e o banco SQLite local. Toda operação de sincronização ou backfill de dados históricos deve ser concebida e executada como **processo estritamente idempotente, checkpointed, resumable e verificado com reconciliação pós-execução**.  
+   O worker registra o cursor de processamento (batch checkpoint) de forma durável no SQLite a cada lote consumido. Em caso de interrupção abrupta (queda de rede, crash do processo ou HTTP 429 com esgotamento de quota), o pipeline é capaz de retomar exatamente do último cursor sem reprocessar entidades já confirmadas nem gerar registros duplicados. Todas as mutações utilizam chaves canônicas de idempotência e version hash (`canonicalHash` / `versionHash`), finalizando com um job de reconciliação de integridade que valida as contagens e somatórios nominais entre o Notion e o SQLite.
+3. **Protocolo Mandatório de Read-Before-Write em Selects / Status:**  
    Na API do Notion, o envio de um array `options` no método `PATCH /v1/data_sources/{id}` substitui integralmente a lista de opções da propriedade. Portanto, **toda e qualquer alteração de select/status exige leitura prévia do schema (`GET /v1/data_sources/{id}`)** para preservar 100% das opções físicas preexistentes. No caso de *Obrigações Mensais.Status*, as opções existentes (incluindo `Pendente`, `Paga`, `Atrasada` e `Dispensada`) são preservadas, adicionando-se apenas as opções ausentes de ciclo de vida (`Revisão Necessária` e `Cancelada`).
-3. **Uso Exclusivo de `data_source_id` nas Relações da API 2026-03-11:**  
+4. **Uso Exclusivo de `data_source_id` nas Relações da API 2026-03-11:**  
    Em conformidade estrita com a arquitetura moderna de Data Sources da versão `2026-03-11`, todas as propriedades de relation devem apontar explicitamente para o `data_source_id` da base alvo dentro do bloco `relation` (ex: `"relation": { "data_source_id": "<ID>" }`), **sendo proibido o uso do obsoleto `database_id`**.
-4. **Criação Atômica de Relação Dual Bidirecional Única:**  
+5. **Criação de Relação Dual Bidirecional Única (`dual_property`):**  
    A vinculação entre *Transações* e a 13ª base *Faturas / Ciclos de Cartão* é estabelecida através de **uma única relação bidirecional (dual)**. A relação é declarada uma única vez via `PATCH /v1/data_sources/{ds_transactions}` com o bloco `"dual_property": { "synced_property_name": "Lançamentos do Ciclo" }` apontando para o `data_source_id` de Faturas. Não devem ser criadas duas relações unidirecionais independentes.
-5. **Notion Number como Projeção Contábil Visual:**  
+6. **Notion Number como Projeção Contábil Visual:**  
    As propriedades do tipo `number` no Notion funcionam exclusivamente como **camada de projeção e visualização para o usuário**. A precisão matemática absoluta, invariantes monetários, frações de ativos e arredondamentos são mantidos e calculados de forma exata e canônica no ledger privado local (ponto fixo / inteiros escalados sem ponto flutuante IEEE-754).
-6. **Prioridade Absoluta a `optionMappings` sobre `ALTER_SCHEMA`:**  
+7. **Prioridade Absoluta a `optionMappings` sobre `ALTER_SCHEMA`:**  
    Nenhuma opção física existente no Notion será rotulada como `ALTER_SCHEMA` se um valor existente já representar o conceito de domínio. Utiliza-se mapeamento semântico explícito em código (`optionMappings`), evitando mutações físicas desnecessárias, sinônimos redundantes ou conflitos léxicos. Com isso, as mutações físicas de select em bases existentes foram reduzidas a apenas **1 única propriedade** (*Obrigações Mensais.Status*).
-7. **Desacoplamento Contextual de Aporte / Resgate em Transações:**  
+8. **Precedência Hierárquica de Autoridade em Campos Bidirecionais (`both`):**  
+   Nas propriedades com sincronização bidirecional (`direction: both`), os conflitos de autoridade na escrita são resolvidos estritamente pela seguinte precedência hierárquica imutável:  
+   1º **`USUARIO`** (decisão humana manual no Notion ou aplicativo: bloqueio absoluto contra sobreescritas automatizadas);  
+   2º **`REGRA_AUTOMATICA` / `DERIVADO`** (regras determinísticas de categorização, rateio e cálculos matemáticos do motor de reconciliação local);  
+   3º **`UPSTREAM` / `FONTE_EXTERNA`** (dados brutos importados da instituição financeira ou conector open-finance).  
+   Se um usuário categorizar manualmente um lançamento ou ajustar um teto operacional, nenhuma reexecução de sync ou regra poderá alterar esse valor, resguardando integralmente o controle do usuário.
+9. **Desacoplamento Contextual de Aporte / Resgate em Transações:**  
    **Não mapear universalmente `Transações.Natureza = Aporte` para `CAPITAL_CONTRIBUTION`.** No extrato bancário ou cartão, lançamentos rotulados genericamente como "Aporte" ou "Resgate" frequentemente constituem transferências internas entre contas próprias, proventos ou cobertura de limite. O motor contábil do adapter avalia o contexto da transação (contas envolvidas, vinculação com investimentos) e, em caso de ambiguidade semântica, encaminha o registro para conferência com `Status de Revisão = PENDING_REVIEW` e `Motivo da Revisão = "Natureza legada de aporte/resgate ambígua requer validação de contexto contábil"`.
-8. **Transferências Internas Próprias com Conta de Destino:**  
-   Criação das propriedades `Transações.Conta Destino` (`relation` -> Contas) e `Regras.Atribuir: Conta Destino` (`relation` -> Contas), viabilizando o reconhecimento e conciliação atômica de transferências entre contas do próprio titular (`INTERNAL_TRANSFER`).
-9. **Reconciliação Anti-Double-Count de Parcelas em Faturas:**  
-   Na decomposição matemática da fatura:
-   $$\\text{Valor da Fatura (Banco)} = \\text{Total de Compras no Ciclo} + \\text{Componentes Adicionais da Fatura} + \\text{Divergência Não Explicada}$$
-   Parcelas de compras de ciclos anteriores **só entram em `Componentes Adicionais da Fatura` quando NÃO existirem como lançamentos já contabilizados individualmente dentro do ciclo corrente**. Se uma parcela já foi importada ou vinculada como lançamento de compra no período, ela compõe estritamente o `Total de Compras no Ciclo`, evitando qualquer dupla contagem contábil.
-10. **Preservação de Campos Customizados e Tipos Livres:**  
+10. **Transferências Internas Próprias com Conta de Destino:**  
+    Criação das propriedades `Transações.Conta Destino` (`relation` -> Contas) e `Regras.Atribuir: Conta Destino` (`relation` -> Contas), viabilizando o reconhecimento e conciliação de transferências entre contas do próprio titular (`INTERNAL_TRANSFER`).
+11. **Faturas / Ciclos de Cartão: Conector vs. Instituição e Ciclos Abertos vs. Fechados:**  
+    Em Faturas, a propriedade `Fonte` representa unicamente o conector ou sistema de proveniência (`PIERRE`, `MANUAL`, `MIGRATION`, `OTHER`), enquanto a instituição financeira (ex: Nubank, Itaú) é derivada dinamicamente através da relação `Cartão Vinculado` com a base `Contas`.  
+    Para faturas abertas em andamento que ainda não possuam `bill_id` definitivo emitido pelo banco, adota-se a chave provisória `PERIOD_FALLBACK` (`source:source_account_id:period_start:period_end:currency`) com `Qualidade da Identidade = PERIOD_FALLBACK`. No momento do fechamento formal pelo emissor bancário e geração do identificador definitivo, o motor executa o protocolo de reconciliação e rekeying idempotente: localiza a fatura existente pelo ciclo e conta, atualiza `ID da Fatura na Fonte`, promove `Qualidade da Identidade` para `SOURCE_ID`, preserva a chave de fallback anterior como alias histórico e impede rigorosamente a criação de faturas duplicadas.  
+    O campo `Valor da Fatura Fechada (Oficial)` **só pode ser preenchido quando o ciclo estiver formalmente fechado na fonte/banco**; enquanto o ciclo estiver aberto, o valor permanece estritamente `null` (vazio), utilizando-se unicamente o campo `Valor Estimado da Fatura Aberta` para a projeção dinâmica em tempo real. É expressamente vedado copiar ou promover o valor estimado aberto para o campo oficial fechado.
+12. **Reconciliação Anti-Double-Count de Parcelas em Faturas:**  
+    Na decomposição matemática da fatura:  
+    $$\text{Valor da Fatura Fechada (Oficial)} = \text{Total de Compras no Ciclo} + \text{Componentes Adicionais da Fatura} + \text{Divergência Não Explicada}$$  
+    Parcelas de compras efetuadas em competências anteriores **só entram em `Componentes Adicionais da Fatura` se NÃO existirem como transações individuais já contabilizadas no ciclo corrente**. Caso a parcela já tenha sido importada ou associada como lançamento individual no período corrente, ela compõe estritamente o `Total de Compras no Ciclo` e é terminantemente excluída de `Componentes Adicionais da Fatura`, impedindo a ocorrência de double-count contábil.
+13. **Taxa de Poupança e Economia Realizada com Anti-Double-Count em Investimentos:**  
+    `savingsRateTarget`, `savingsRate` e `Poupança Realizada` somam estritamente a propriedade `savingsGoalContribution`. Transações de aportes para investimentos só pontuam nessa métrica se representarem alocação primária originada do fluxo de caixa e renda da competência corrente (`allocationPurpose = INVESTMENT_RESERVE` ou poupança do mês). Transações de compra de ativos (`ASSET_PURCHASE` — ex: compra de ações/FIIs) executadas a partir de recursos já previamente alocados em saldo de caixa/reserva poupados em meses passados **NÃO pontuam novamente como poupança**, eliminando qualquer duplicidade entre a formação de reserva líquida e a posterior aquisição de ativos.
+14. **Preflight Mandatório de Permissões da API Notion:**  
+    Antes de executar a primeira mutação de schema ou provisionamento de base, o sistema executa um teste de preflight estrito:  
+    a) Teste de capacidade de provisionamento (`POST /v1/databases`) na parent page do workspace (`WORKSPACE_ROOT_PAGE_ID`);  
+    b) Teste de leitura estrutural e capacidade de atualização de schema (`PATCH /v1/data_sources/{id}`) em todas as 12 bases configuradas;  
+    c) Validação de permissões e resolução de `data_source_id` para todas as bases que serão alvo de relações (`NOTION_DS_ACCOUNTS`, `NOTION_DS_TRANSACTIONS`, `NOTION_DS_CATEGORIES`, etc.).  
+    Caso qualquer uma das validações falhe com erro de autenticação, escopo insuficiente (ex: integração sem permissão de inserção/edição) ou `403 Forbidden`, o processo é abortado imediatamente sem aplicar qualquer mutação parcial no workspace.
+15. **Preservação de Campos Customizados e Tipos Livres:**  
     Propriedades criadas pelo usuário são preservadas integralmente. Os campos `Instituição` (em Contas e Investimentos) e `Liquidez` (em Investimentos) permanecem estritamente como `rich_text`, garantindo a flexibilidade de cadastrar novas instituições e prazos descritivos sem necessidade de alterar enums no Notion.
-11. **Title Unívoco e Sem Duplicações:**  
+16. **Title Unívoco e Sem Duplicações:**  
     A propriedade `Movimentação` é mantida como o único `title` da base de Movimentações de Investimentos, sendo terminantemente proibida a criação de um segundo campo `title` ("Identificador").
-12. **Desacoplamento Orçamentário sem Hardcode:**  
+17. **Desacoplamento Orçamentário sem Hardcode:**  
     Todo hardcode conceitual de frameworks rígidos (como 50/30/20) foi removido do domínio. Campos como `Necessidades planejadas` e `Desejos planejados` são preservados por retrocompatibilidade histórica, mas percentuais e agrupamentos são tratados como regras configuráveis.
 
 ---
@@ -52,11 +73,11 @@ Todas as divergências onde uma opção física existente no Notion representa o
 
 | Ação de Migração | Quantidade | Percentual | Descrição Operacional |
 | :--- | :---: | :---: | :--- |
-| **`KEEP_AS_IS`** | **91** | 37.4% | Propriedades mantidas exatamente como estão no Notion (tipos livres e campos legados preservados) |
-| **`MAP_ALIAS`** | **78** | 32.1% | Mapeadas por alias ou `optionMappings` no adapter (zero mutação no Notion, zero impacto em views) |
+| **`KEEP_AS_IS`** | **91** | 37.3% | Propriedades mantidas exatamente como estão no Notion (tipos livres e campos legados preservados) |
+| **`MAP_ALIAS`** | **78** | 32.0% | Mapeadas por alias ou `optionMappings` no adapter (zero mutação no Notion, zero impacto em views) |
 | **`ALTER_SCHEMA`** | **1** | 0.4% | Inclusão não-destrutiva de opções em *Obrigações.Status* via *Read-Before-Write* (preserva `Pendente` e `Dispensada`) |
-| **`CREATE_NEW`** | **73** | 30.0% | Novas propriedades essenciais (51 nas 12 bases existentes + 22 na 13ª base de Faturas) |
-| **TOTAL GERAL** | **243** | **100%** | **Total de decisões mapeadas propriedade por propriedade** |
+| **`CREATE_NEW`** | **74** | 30.3% | Novas propriedades essenciais (51 nas 12 bases existentes + 23 na 13ª base de Faturas) |
+| **TOTAL GERAL** | **244** | **100%** | **Total de decisões mapeadas propriedade por propriedade** |
 
 ### 2.2 Distribuição Detalhada por Data Source
 
@@ -74,8 +95,8 @@ Todas as divergências onde uma opção física existente no Notion representa o
 | 10. Metas Financeiras | `NOTION_DS_FINANCIAL_GOALS` | 10 | 8 | 2 | 0 | 0 |
 | 11. Fechamentos Mensais | `NOTION_DS_MONTHLY_CLOSINGS` | 25 | 8 | 8 | 0 | 9 |
 | 12. Log de Sincronização | `NOTION_DS_SYNC_LOG` | 24 | 7 | 7 | 0 | 10 |
-| 13. Faturas / Ciclos de Cartão | `NOTION_DS_CARD_BILLS` | 22 | 0 | 0 | 0 | 22 |
-| **TOTAL CONSOLIDADO** | — | **243** | **91** | **78** | **1** | **73** |
+| 13. Faturas / Ciclos de Cartão | `NOTION_DS_CARD_BILLS` | 23 | 0 | 0 | 0 | 23 |
+| **TOTAL CONSOLIDADO** | — | **244** | **91** | **78** | **1** | **74** |
 
 ---
 
@@ -454,29 +475,32 @@ Todas as divergências onde uma opção física existente no Notion representa o
 
 #### Especificação Contratual Completa e Rastreabilidade de Upstream
 1. **Campos Estruturados de Origem e Identidade Derivada:**
-   * `Fonte` (`select`, `UPSTREAM`): Identifica o conector/instituição emitente da fatura (`PIERRE`, `MANUAL`, `NUBANK`, `ITAU`, etc.).
-   * `ID da Fatura na Fonte` (`rich_text`, `UPSTREAM`): Identificador primário bruto retornado pela API ou fatura externa.
+   * `Fonte` (`select`, `UPSTREAM`): Identifica o conector técnico ou sistema de proveniência (`PIERRE`, `MANUAL`, `MIGRATION`, `OTHER`). A instituição emissora (ex: Nubank, Itaú) é resolvida dinamicamente através do `Cartão Vinculado` (`relation` -> `Contas`).
+   * `ID da Fatura na Fonte` (`rich_text`, `UPSTREAM`): Identificador primário bruto retornado pela API bancária quando a fatura for formalmente fechada/emitida.
    * `ID Estável da Fatura` (`rich_text`, `DERIVADO`): Chave canônica unívoca derivada desses componentes:  
-     $$\\text{Stable ID} = \\text{source} + \\text{":"} + \\text{source\\_account\\_id} + \\text{":"} + \\text{bill\\_id}$$
-   * **Fallback de Identidade Abrangente:** Quando não houver `bill_id` persistente:  
-     $$\\text{Fallback ID} = \\text{source} + \\text{":"} + \\text{source\\_account\\_id} + \\text{":"} + \\text{period\\_start} + \\text{":"} + \\text{period\\_end} + \\text{":"} + \\text{currency}$$
-     *(Vedado o uso isolado de `closing_date` como chave de identidade).*
-2. **Data de Liquidação Estrita:** `Data de Liquidação` representa **exclusivamente a data da quitação integral da fatura**. Pagamentos parciais e amortizações intermediárias são rastreados como registros individuais na relação `Transações de Pagamento`.
-3. **Relação Dual Única e Bidirecional:** A relação entre Faturas e as compras do ciclo é **estritamente uma única relação bidirecional (dual)** com `data_source_id`: `Faturas.Lançamentos do Ciclo` $\\longleftrightarrow$ `Transações.Fatura Vinculada`.
-4. **Distinção de Valores Aberto vs. Fechado:** Propriedades separadas para o valor oficial consolidado após o corte (`Valor da Fatura Fechada (Oficial)`) e a projeção acumulada em tempo real enquanto a fatura está em curso (`Valor Estimado da Fatura Aberta`).
-5. **Reconciliação Anti-Double-Count de Parcelas:** Transações de compras efetuadas dentro do intervalo (`Início do Período` até `Fim do Período`) compõem exclusivamente o `Total de Compras no Ciclo`. Parcelas de compras de ciclos anteriores só entram em `Componentes Adicionais da Fatura` se **NÃO existirem como lançamentos já contabilizados no ciclo corrente**, prevenindo estritamente a dupla contagem contábil.
+     $$\text{Stable ID} = \text{source} + \text{":"} + \text{source\_account\_id} + \text{":"} + \text{bill\_id}$$
+   * **Identidade Provisória e Rekeying Idempotente:** Para faturas abertas sem `bill_id`:  
+     $$\text{Fallback ID} = \text{source} + \text{":"} + \text{source\_account\_id} + \text{":"} + \text{period\_start} + \text{":"} + \text{period\_end} + \text{":"} + \text{currency}$$
+     A propriedade `Qualidade da Identidade` rastreia o estado (`SOURCE_ID` vs `PERIOD_FALLBACK`). Ao surgir a identidade oficial do emissor, o worker executa reconciliação e rekeying idempotente: atualiza `ID da Fatura na Fonte`, promove o status para `SOURCE_ID`, preserva a chave de fallback anterior como alias na rastreabilidade e impede a criação de registros duplicados no Notion.
+2. **Distinção Estrita entre Valor Aberto vs. Valor Oficial Fechado:**  
+   O campo `Valor da Fatura Fechada (Oficial)` **permanece estritamente nulo/vazio enquanto a fatura estiver aberta** (`status = Aberta em Curso` ou antes do corte bancário). Faturas em andamento utilizam exclusivamente o campo `Valor Estimado da Fatura Aberta` para a projeção dinâmica das compras correntes. É terminantemente proibido copiar ou promover estimativas abertas para o campo oficial.
+3. **Data de Liquidação Estrita:** `Data de Liquidação` representa **exclusivamente a data da quitação integral da fatura**. Pagamentos parciais e amortizações intermediárias são rastreados como registros individuais na relação `Transações de Pagamento`.
+4. **Relação Dual Única e Bidirecional:** A relação entre Faturas e as compras do ciclo é **estritamente uma única relação bidirecional (dual)** com `data_source_id`: `Faturas.Lançamentos do Ciclo` $\longleftrightarrow$ `Transações.Fatura Vinculada`.
+5. **Reconciliação Anti-Double-Count de Parcelas:** Transações de compras efetuadas dentro do intervalo (`Início do Período` até `Fim do Período`) compõem exclusivamente o `Total de Compras no Ciclo`. Parcelas de compras de ciclos anteriores só entram em `Componentes Adicionais da Fatura` se **NÃO existirem como lançamentos já contabilizados individualmente no ciclo corrente**, prevenindo estritamente a dupla contagem contábil.
+6. **Precedência Hierárquica de Autoridade:** Propriedades bidirecionais (`both`) seguem estritamente `USUARIO` (override manual) > `REGRA_AUTOMATICA` / `DERIVADO` > `UPSTREAM`.
 
-#### Arquitetura de Criação da Base (22 Propriedades Finais)
-A base é criada em duas fases atômicas sequenciais:
-* **Fase 1 (Provisionamento Inicial no POST /v1/databases):** Criação da base com as **21 propriedades iniciais** independentes no bloco `initial_data_source` (compreendendo as 19 propriedades de negócio base + os 2 campos de rastreabilidade `Fonte` e `ID da Fatura na Fonte`).
-* **Fase 2 (Estabelecimento da Relação Dual via PATCH):** Após a recepção do novo `data_source_id` retornado pelo Notion, executa-se um único `PATCH /v1/data_sources/{ds_transactions}` criando a relação bidirecional `Transações.Fatura Vinculada` conectada a `Faturas.Lançamentos do Ciclo`, totalizando as **22 propriedades finais previstas**.
+#### Arquitetura de Criação da Base (23 Propriedades Finais)
+A base é criada em duas fases sequenciais:
+* **Fase 1 (Provisionamento Inicial no POST /v1/databases):** Criação da base com as **22 propriedades iniciais** independentes no bloco `initial_data_source` (compreendendo as 20 propriedades de negócio e rastreabilidade + as 2 relations unidirecionais `Cartão Vinculado` e `Transações de Pagamento`).
+* **Fase 2 (Estabelecimento da Relação Dual via PATCH):** Após a recepção do novo `data_source_id` retornado pelo Notion, executa-se um único `PATCH /v1/data_sources/{ds_transactions}` criando a relação bidirecional `Transações.Fatura Vinculada` conectada a `Faturas.Lançamentos do Ciclo`, totalizando as **23 propriedades finais previstas**.
 
 | Propriedade a Criar | Tipo no Notion | Ação | Direção | Autoridade | Justificativa e Finalidade |
 | :--- | :--- | :---: | :---: | :---: | :--- |
 | `Fatura / Ciclo` | `title` | `CREATE_NEW` | write | `DERIVADO` | Título unívoco: ex. `Nubank - Ciclo 2026-07 (Venc 22/07)`. |
-| `Fonte` | `select` | `CREATE_NEW` | write | `UPSTREAM` | Origem/instituição da fatura (ex: `PIERRE`, `MANUAL`, `NUBANK`). |
-| `ID da Fatura na Fonte` | `rich_text` | `CREATE_NEW` | write | `UPSTREAM` | Identificador primário bruto emitido pelo banco/instituição. |
+| `Fonte` | `select` | `CREATE_NEW` | write | `UPSTREAM` | Conector ou proveniência técnica (`PIERRE`, `MANUAL`, `MIGRATION`, `OTHER`). Instituição vem de Cartão Vinculado. |
+| `ID da Fatura na Fonte` | `rich_text` | `CREATE_NEW` | write | `UPSTREAM` | Identificador primário bruto emitido pelo banco/instituição quando fechada. |
 | `ID Estável da Fatura` | `rich_text` | `CREATE_NEW` | write | `DERIVADO` | Chave de identidade canônica unívoca derivada (`source:account_id:bill_id` ou fallback completo). |
+| `Qualidade da Identidade` | `select` | `CREATE_NEW` | write | `DERIVADO` | Enums: `SOURCE_ID`, `PERIOD_FALLBACK` (permite rastrear chave provisória e reconciliar rekeying sem duplicidade). |
 | `Cartão Vinculado` | `relation` | `CREATE_NEW` | write | `DERIVADO` | Relação unidirecional com a conta do cartão em `Contas` (via `data_source_id`). |
 | `Moeda` | `select` | `CREATE_NEW` | write | `UPSTREAM` | Código da moeda da fatura (`BRL`, `USD`, `EUR`). |
 | `Início do Período` | `date` | `CREATE_NEW` | write | `DERIVADO` | Data inicial das compras elegíveis ao ciclo corrente. |
@@ -484,13 +508,13 @@ A base é criada em duas fases atômicas sequenciais:
 | `Data de Fechamento` | `date` | `CREATE_NEW` | write | `UPSTREAM` | Data oficial de corte da fatura emitida pelo banco. |
 | `Data de Vencimento` | `date` | `CREATE_NEW` | write | `UPSTREAM` | Data oficial de vencimento da fatura emitida pelo banco. |
 | `Tipo de Ciclo` | `select` | `CREATE_NEW` | write | `DERIVADO` | Enums: `Ciclo Real Banco`, `Ciclo Configurado`, `Ciclo Estimado`. |
-| `Origem / Qualidade dos Dados` | `select` | `CREATE_NEW` | write | `DERIVADO` | Enums: `REAL_BANK_STATEMENT`, `ESTIMATED_CUTOFF`, `MANUAL_OVERRIDE`. |
+| `Origem / Qualidade dos Dados` | `select` | `CREATE_NEW` | write | `DERIVADO` | Enums: `UPSTREAM_OFFICIAL`, `UPSTREAM_APPROXIMATE`, `DERIVED`, `MANUAL`. |
 | `Status da Fatura` | `select` | `CREATE_NEW` | both | `REGRA_AUTOMATICA` | Enums: `Aberta em Curso`, `Fechada a Vencer`, `Vencida`, `Paga Integralmente`, `Paga Parcialmente`. |
-| `Valor da Fatura Fechada (Oficial)` | `number` | `CREATE_NEW` | write | `UPSTREAM` | Valor consolidado oficial emitido pelo banco após o fechamento. |
-| `Valor Estimado da Fatura Aberta` | `number` | `CREATE_NEW` | write | `DERIVADO` | Projeção acumulada das compras correntes antes do corte. |
+| `Valor da Fatura Fechada (Oficial)` | `number` | `CREATE_NEW` | write | `UPSTREAM` | Valor consolidado oficial emitido pelo banco após o fechamento. Estritamente null enquanto fatura aberta. |
+| `Valor Estimado da Fatura Aberta` | `number` | `CREATE_NEW` | write | `DERIVADO` | Projeção acumulada das compras correntes em tempo real antes do corte. |
 | `Total de Compras no Ciclo` | `number` | `CREATE_NEW` | write | `DERIVADO` | Soma monetária real das transações de compras vinculadas a este ciclo. |
 | `Componentes Adicionais da Fatura` | `number` | `CREATE_NEW` | write | `DERIVADO` | Soma de parcelas de compras passadas não contabilizadas no ciclo, IOF, juros, encargos e estornos (anti-double-count). |
-| `Divergência Não Explicada` | `number` | `CREATE_NEW` | write | `DERIVADO` | Discrepância residual: `Valor Banco - (Compras + Componentes Adicionais)`. |
+| `Divergência Não Explicada` | `number` | `CREATE_NEW` | write | `DERIVADO` | Discrepância residual: `Valor Oficial Fechado - (Compras + Componentes Adicionais)`. |
 | `Valor Pago` | `number` | `CREATE_NEW` | both | `REGRA_AUTOMATICA` | Total acumulado liquidado até o momento. |
 | `Data de Liquidação` | `date` | `CREATE_NEW` | both | `REGRA_AUTOMATICA` | Data exclusiva da quitação integral da fatura. |
 | `Transações de Pagamento` | `relation` | `CREATE_NEW` | both | `REGRA_AUTOMATICA` | Relação com os lançamentos bancários de débito/saída que pagaram ou amortizaram a fatura (via `data_source_id`). |
@@ -502,22 +526,30 @@ A base é criada em duas fases atômicas sequenciais:
 
 Em conformidade estrita com a versão `2026-03-11` da API do Notion, as operações de schema devem seguir a semântica correta da arquitetura de Data Sources:
 
-1. **Read-Before-Write Mandatório em Alterações de Select/Status:** Antes de qualquer `PATCH`, faz-se `GET /v1/data_sources/{id}` para carregar as opções físicas existentes e enviar a união completa.
-2. **Alterações de Schema em Bases Existentes:** Realizadas via `PATCH /v1/data_sources/{data_source_id}`.
-3. **Uso Exclusivo de `data_source_id` nas Relações:** Todo bloco `relation` referencia `data_source_id`, nunca `database_id`.
-4. **Provisionamento em 2 Etapas da 13ª Base:** Realizada via `POST /v1/databases` com `initial_data_source` (21 propriedades iniciais) seguido por `PATCH /v1/data_sources/{ds_transactions}` para criar a relation dual única conectando `Fatura Vinculada` e `Lançamentos do Ciclo`.
+1. **Preflight Mandatório de Permissões:** Antes de qualquer alteração física, o worker executa checagens prévias de escrita e leitura (`GET /v1/data_sources/{id}` nas 12 bases, permissão de `POST /v1/databases` na parent page e verificação de targets de relation).
+2. **Snapshot Pré-Migração Separado e Teste de Restauração Compulsório:** Geração de arquivo imutável `data/snapshots/snapshot-pre-migration-<timestamp>.sqlite.enc` (AES-256-GCM) com hash SHA-256 e teste de restauração dry-run imediato.
+3. **Read-Before-Write Mandatório em Alterações de Select/Status:** Antes de qualquer `PATCH`, faz-se `GET /v1/data_sources/{id}` para carregar as opções físicas existentes e enviar a união completa.
+4. **Alterações de Schema em Bases Existentes:** Realizadas via `PATCH /v1/data_sources/{data_source_id}`.
+5. **Uso Exclusivo de `data_source_id` nas Relações:** Todo bloco `relation` referencia `data_source_id`, nunca `database_id`.
+6. **Provisionamento em 2 Etapas da 13ª Base:** Realizada via `POST /v1/databases` com `initial_data_source` (22 propriedades iniciais) seguido por `PATCH /v1/data_sources/{ds_transactions}` para criar a relation dual única conectando `Fatura Vinculada` e `Lançamentos do Ciclo` (totalizando 23 propriedades).
+7. **Backfill Idempotente, Checkpointed, Resumable e Verificado:** Execução em lotes com persistência contínua de cursor de progresso, retries com backoff exponencial + jitter para HTTP 429, dedup por `canonicalHash` e reconciliação matemática pós-execução.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Dev as Engenheiro / Worker
-    participant Storage as SQLite Privado Local (data/financial.db)
+    participant Storage as SQLite Privado Local (data/snapshots/)
     participant NotionDS as Notion Data Sources API (/v1/data_sources)
     participant NotionDB as Notion Databases API (/v1/databases)
 
-    Note over Dev,Storage: Fase Pré-Migração Compulsória (Backup Privado Durável)
-    Dev->>NotionDS: GET /v1/data_sources/{id} (12 bases introspectadas)
-    Dev->>Storage: Grava Snapshot Integral Read-Only Cifrado (fora do Git, zero artifact público)
+    Note over Dev,NotionDS: Fase 0-Pre: Preflight Mandatório de Permissões e Scopes
+    Dev->>NotionDS: GET /v1/data_sources/{id} (12 bases introspectadas: verifica leitura e schemas)
+    Dev->>NotionDB: Valida permissão de POST na parent page (WORKSPACE_ROOT_PAGE_ID)
+
+    Note over Dev,Storage: Fase Pré-Migração: Snapshot Separado, Cifrado e Teste de Restauração
+    Dev->>NotionDS: GET /v1/data_sources/{id} (Export integral read-only dos dados e schemas)
+    Dev->>Storage: Grava snapshot-pre-migration-<timestamp>.sqlite.enc (AES-256-GCM) + SHA-256
+    Dev->>Storage: Executa Teste de Restauração Dry-Run (descriptografa e valida integridade)
 
     Note over Dev,NotionDS: Fase 1: Inclusão Não-Destrutiva com Read-Before-Write (1 operação)
     Dev->>NotionDS: GET /v1/data_sources/{ds_obligations} (Lê opções: Pendente, Paga, Atrasada, Dispensada)
@@ -535,13 +567,13 @@ sequenceDiagram
     Dev->>NotionDS: PATCH /v1/data_sources/{ds_sync_log} (Duração, Run ID, etc.)
 
     Note over Dev,NotionDB: Fase 3: Provisionamento da 13ª Base Independente
-    Dev->>NotionDB: POST /v1/databases (com initial_data_source contendo 21 propriedades iniciais com data_source_id)
+    Dev->>NotionDB: POST /v1/databases (com initial_data_source contendo 22 propriedades iniciais com data_source_id)
     NotionDB-->>Dev: Retorna novo database_id e novo data_source_id (ds_card_bills)
     Dev->>Dev: Configura NOTION_DS_CARD_BILLS no .env local
 
-    Note over Dev,NotionDS: Fase 4: Estabelecimento Atômico da Relação Dual Bidirecional
-    Dev->>NotionDS: PATCH /v1/data_sources/{ds_transactions} (Cria Fatura Vinculada dual <-> Lançamentos do Ciclo)
-    Dev->>NotionDS: Backfill atômico com verificação de integridade
+    Note over Dev,NotionDS: Fase 4: Estabelecimento da Relação Dual Bidirecional Única
+    Dev->>NotionDS: PATCH /v1/data_sources/{ds_transactions} (Cria Fatura Vinculada dual <-> Lançamentos do Ciclo: 23ª propriedade)
+    Dev->>NotionDS: Backfill idempotente, checkpointed, resumable e verificado com reconciliação pós-execução
 ```
 
 ### 4.1 Payloads Exatos de Exemplo (Data Sources API 2026-03-11)
@@ -621,7 +653,7 @@ sequenceDiagram
 
 #### 4.1.3 Provisionamento da 13ª Base Independente com Propriedades Iniciais (`POST /v1/databases`)
 * **Endpoint:** `POST https://api.notion.com/v1/databases`
-* **Payload Estruturado (21 propriedades iniciais, com `data_source_id` nas relations):**
+* **Payload Estruturado (22 propriedades iniciais, com `data_source_id` nas relations):**
 ```json
 {
   "parent": {
@@ -642,14 +674,21 @@ sequenceDiagram
           "options": [
             { "name": "PIERRE" },
             { "name": "MANUAL" },
-            { "name": "NUBANK" },
-            { "name": "ITAU" },
-            { "name": "OUTRA" }
+            { "name": "MIGRATION" },
+            { "name": "OTHER" }
           ]
         }
       },
       "ID da Fatura na Fonte": { "rich_text": {} },
       "ID Estável da Fatura": { "rich_text": {} },
+      "Qualidade da Identidade": {
+        "select": {
+          "options": [
+            { "name": "SOURCE_ID" },
+            { "name": "PERIOD_FALLBACK" }
+          ]
+        }
+      },
       "Cartão Vinculado": {
         "relation": {
           "data_source_id": "a17455aa-4793-4001-9570-21b7f84ff4a2"
@@ -680,9 +719,10 @@ sequenceDiagram
       "Origem / Qualidade dos Dados": {
         "select": {
           "options": [
-            { "name": "REAL_BANK_STATEMENT" },
-            { "name": "ESTIMATED_CUTOFF" },
-            { "name": "MANUAL_OVERRIDE" }
+            { "name": "UPSTREAM_OFFICIAL" },
+            { "name": "UPSTREAM_APPROXIMATE" },
+            { "name": "DERIVED" },
+            { "name": "MANUAL" }
           ]
         }
       },
@@ -714,7 +754,7 @@ sequenceDiagram
 }
 ```
 
-#### 4.1.4 Estabelecimento Atômico da Relação Dual Bidirecional (`PATCH /v1/data_sources`)
+#### 4.1.4 Estabelecimento da Relação Dual Bidirecional (`PATCH /v1/data_sources`)
 Após a criação da 13ª base, obtém-se o novo `data_source_id` (ex: `f82a...91bc`) e executa-se a chamada única em Transações:
 * **Endpoint:** `PATCH https://api.notion.com/v1/data_sources/1fc274bd-b73a-45b1-a902-09aba993f199` (Transações)
 * **Payload:**
@@ -732,7 +772,7 @@ Após a criação da 13ª base, obtém-se o novo `data_source_id` (ex: `f82a...9
   }
 }
 ```
-Esta chamada cria atômica e bidirecionalmente a propriedade `Fatura Vinculada` em Transações e a propriedade `Lançamentos do Ciclo` em Faturas, completando as 22 propriedades da 13ª base sem risco de relações órfãs ou duplicadas.
+Esta chamada cria bidirecionalmente a propriedade `Fatura Vinculada` em Transações e a propriedade `Lançamentos do Ciclo` em Faturas, completando as 23 propriedades da 13ª base sem risco de relações órfãs ou duplicadas.
 
 ---
 
@@ -740,22 +780,27 @@ Esta chamada cria atômica e bidirecionalmente a propriedade `Fatura Vinculada` 
 
 | Cenário de Risco Residual | Probabilidade | Impacto | Mecanismo Preventivo de Salvaguarda | Procedimento de Rollback Seguro |
 | :--- | :---: | :---: | :--- | :--- |
-| **Perda de Dados por Falha em Backup** | Muito Baixa | Crítico | **Backup Durável Privado:** Snapshot integral de schema e dados sensíveis salvo exclusivamente no SQLite privado local (`data/financial.db`), fora do Git e cifrado. Proibido usar artifact público como backup. | Restaurar dados diretamente do snapshot SQLite local verificado. |
+| **Perda de Dados por Falha em Backup** | Muito Baixa | Crítico | **Backup Durável, Imutável e Cifrado com Teste de Restauração:** Snapshot integral read-only salvo em arquivo separado `data/snapshots/snapshot-pre-migration-<timestamp>.sqlite.enc` (AES-256-GCM) com SHA-256 e teste de restauração dry-run mandatório aprovado antes de mutações. `financial.db` operacional não conta sozinho. Proibido usar artifacts públicos. | Restaurar dados diretamente do snapshot verificado e testado. |
 | **Exclusão Acidental de Opções de Select** | Baixa | Alto | **Read-Before-Write Mandatório:** Leitura prévia obrigatória (`GET`) para preservar todas as opções físicas preexistentes (como `Pendente` e `Dispensada` em Obrigações). | Jamais apagar opções em uso. Manter opções históricas desativadas em novos cadastros. |
 | **Quebra de Visualizações ou Fórmulas do Notion** | Quase Nula | Alto | **Nenhum rename físico** de propriedade no Notion; 78 propriedades são resolvidas exclusivamente em memória via aliases no adapter. | Desativar mapeamento de aliases no código sem qualquer alteração no Notion. |
 | **Ambiguidade em Aporte / Resgate Legados** | Média | Médio | **Classificação Contextual Segura:** Lançamentos legados com `Aporte` ou `Resgate` não são mapeados cegamente para aporte de capital; se houver ambiguidade, são marcados com `Status de Revisão = PENDING_REVIEW`. | Revisão humana pontual via views filtradas do Notion. |
 | **Double-Count de Parcelas em Faturas** | Baixa | Médio | **Reconciliação Anti-Double-Count:** Parcelas anteriores só entram em `Componentes Adicionais` se NÃO constarem como transações individuais já importadas no ciclo corrente. | Re-executar cálculo idempotente de reconciliação de ciclo. |
-| **Rate Limit (HTTP 429) no Backfill** | Média | Baixo | **Requisito a Implementar:** Desenvolver client HTTP resiliente com retry exponencial e jitter antes do início do backfill massivo. | Pausar execução do worker e retomar a partir do último cursor processado. |
-| **Inconsistência no Provisionamento da 13ª Base** | Baixa | Baixo | Provisionamento isolado com chave estável `source:account_id:bill_id` e relation dual atômica via `data_source_id`. | Se a base contiver dados, não excluir: marcar registros como cancelados ou reconfigurar chave de apontamento no `.env`. |
+| **Duplicação por Falta de bill_id em Ciclos Abertos** | Baixa | Médio | **Identidade Provisória e Rekeying Idempotente:** Faturas abertas usam `Qualidade da Identidade = PERIOD_FALLBACK`. Ao surgir `bill_id`, executa-se rekeying idempotente atualizando `SOURCE_ID` e preservando aliases. | Reconciliar registros via chave de período e fundir duplicidades caso detectadas. |
+| **Divergência entre Valor Aberto e Oficial Fechado** | Baixa | Baixo | **Segregação Estrita de Valores:** `Valor da Fatura Fechada (Oficial)` permanece estritamente `null` enquanto o ciclo estiver aberto; usa-se exclusivamente `Valor Estimado da Fatura Aberta`. Proibido copiar estimativa para oficial. | Limpar campo oficial se preenchido indevidamente durante ciclo aberto. |
+| **Sobrescrita de Decisão Manual do Usuário** | Baixa | Médio | **Precedência de Autoridade:** Propriedades bidirecionais seguem estritamente `USUARIO` > `REGRA_AUTOMATICA` / `DERIVADO` > `UPSTREAM`. | Edições manuais do usuário são preservadas contra regravações automáticas. |
+| **Double-Count em Metas de Poupança vs. Compra de Ativos** | Baixa | Médio | **Anti-Double-Count de Investimentos:** `savingsRate` soma estritamente `savingsGoalContribution`; compras de ativos (`ASSET_PURCHASE`) custeadas com caixa já poupado não pontuam novamente. | Recomputar agregados mensais a partir de transações com `savingsGoalContribution`. |
+| **Rate Limit (HTTP 429) ou Falha de Rede no Backfill** | Média | Baixo | **Backfill Idempotente, Checkpointed e Resumable:** Persistência durável de cursor no SQLite por lote, retry com backoff exponencial + jitter. Zero transação distribuída fictícia. | Pausar execução do worker e retomar a partir do último checkpoint registrado. |
+| **Inconsistência no Provisionamento da 13ª Base** | Baixa | Baixo | Preflight de permissões (`POST /v1/databases`), provisionamento isolado com chave estável e relation dual bidirecional com `data_source_id`. | Se a base contiver dados, não excluir: marcar registros como cancelados ou reconfigurar chave de apontamento no `.env`. |
 
 ---
 
 ## 6. Critérios de Homologação da Fase 1
 
 A homologação da Fase 1 será considerada concluída quando:
-1. Os contratos em `src/domain/schema-contract.ts` e os testes unitários refletirem exatamente os 78 aliases e a especificação de 22 propriedades de Faturas (incluindo `Fonte`, `ID da Fatura na Fonte` e relation dual com `data_source_id`).
-2. O snapshot read-only preparatório for concluído com sucesso e persistido de forma durável no SQLite privado local.
-3. A única operação física de `ALTER_SCHEMA` (*Obrigações Mensais.Status*) for executada seguindo o protocolo de *Read-Before-Write*, preservando `Pendente` e `Dispensada`.
-4. As 51 propriedades novas nas 12 bases existentes forem adicionadas via Data Sources API.
-5. A 13ª base for provisionada via `POST /v1/databases` (21 propriedades iniciais) e a relation dual bidirecional `Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo` for estabelecida via `PATCH`.
-6. A execução de `pnpm notion:check-schema` certificar **13/13 bases verificadas**, com zero `MISSING` e zero `STRUCTURAL_MISMATCH` não homologado.
+1. **Contratos e Testes:** Os contratos em `src/domain/schema-contract.ts` e os testes unitários cobrirem integralmente as 244 decisões (incluindo os 78 aliases mapeados, `Conta Destino` em Transações e Regras, optionMappings refinados de Categorias, Investimentos, Movimentações e Log, e as 23 propriedades de Faturas com `Fonte` como conector e relation dual via `data_source_id`).
+2. **Preflight Aprovado:** Execução e aprovação de teste de preflight verificando permissões de leitura/escrita nas 12 bases e na parent page antes de qualquer chamada mutante.
+3. **Snapshot Privado com Teste de Restauração:** O snapshot read-only preparatório for gravado em arquivo separado imutável cifrado (`data/snapshots/snapshot-pre-migration-<timestamp>.sqlite.enc`), com hash SHA-256 e teste de restauração dry-run aprovado.
+4. **Read-Before-Write Homologado:** A única operação física de `ALTER_SCHEMA` (*Obrigações Mensais.Status*) for executada seguindo o protocolo de *Read-Before-Write*, preservando `Pendente` e `Dispensada`.
+5. **Criação de Colunas:** As 51 propriedades novas nas 12 bases existentes forem adicionadas via Data Sources API.
+6. **Provisionamento da 13ª Base:** A 13ª base for provisionada via `POST /v1/databases` (22 propriedades iniciais) e a relation dual bidirecional `Transações.Fatura Vinculada <-> Faturas.Lançamentos do Ciclo` for estabelecida via `PATCH`, totalizando as 23 propriedades.
+7. **Gate de Schema Verificado:** A execução de `pnpm notion:check-schema` certificar **13/13 bases verificadas**, com zero `MISSING` e zero `STRUCTURAL_MISMATCH` não homologado.
