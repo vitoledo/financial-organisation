@@ -674,6 +674,51 @@ describe('Domain: Schema Contract Specification', () => {
       'Migração': 'MIGRATION',
       'Outra': 'OTHER',
     });
+
+    // Obrigações: Origem (Rotina, Manual, Pierre)
+    const obProps = TARGET_CONTRACT.NOTION_DS_MONTHLY_OBLIGATIONS.properties;
+    const obOrigem = obProps.find((p) => p.domainField === 'origin');
+    expect(obOrigem?.expectedOptions).toEqual(['Rotina', 'Manual', 'Pierre']);
+    expect(obOrigem?.optionMappings).toEqual({
+      'Rotina': 'ROUTINE',
+      'Manual': 'MANUAL',
+      'Pierre': 'PIERRE',
+    });
+
+    // Metas: Tipo, Liquidez, Status
+    const goalProps = TARGET_CONTRACT.NOTION_DS_FINANCIAL_GOALS.properties;
+    const goalType = goalProps.find((p) => p.domainField === 'goalType');
+    expect(goalType?.expectedOptions).toEqual([
+      'Reserva de emergência',
+      'Compra',
+      'Viagem',
+      'Investimento',
+      'Quitação',
+      'Outro',
+    ]);
+    expect(goalType?.optionMappings?.['Reserva de emergência']).toBe('EMERGENCY_FUND');
+
+    const goalLiq = goalProps.find((p) => p.domainField === 'requiredLiquidity');
+    expect(goalLiq?.expectedOptions).toEqual(['Imediata', 'Curta', 'Média', 'Longa']);
+    expect(goalLiq?.optionMappings?.['Imediata']).toBe('IMMEDIATE');
+
+    const goalStatus = goalProps.find((p) => p.domainField === 'status');
+    expect(goalStatus?.expectedOptions).toEqual(['Planejada', 'Em andamento', 'Concluída', 'Pausada']);
+    expect(goalStatus?.optionMappings?.['Planejada']).toBe('PLANNED');
+
+    // Transações: Moeda includes Outra
+    const txProps = TARGET_CONTRACT.NOTION_DS_TRANSACTIONS.properties;
+    const txCurrency = txProps.find((p) => p.domainField === 'currency');
+    expect(txCurrency?.expectedOptions).toEqual(['BRL', 'USD', 'Outra']);
+
+    // Categorias: Variabilidade includes N/A
+    const catVar = catProps.find((p) => p.domainField === 'variability');
+    expect(catVar?.expectedOptions).toEqual(['Fixa', 'Variável', 'N/A']);
+
+    // Contas Fixas: Forma de pagamento
+    const billProps = TARGET_CONTRACT.NOTION_DS_FIXED_BILLS.properties;
+    const billPay = billProps.find((p) => p.domainField === 'paymentMethod');
+    expect(billPay?.expectedOptions).toEqual(['Cartão', 'Débito', 'Pix', 'Boleto', 'Débito automático', 'Outro']);
   });
 
   test('enforces authoritative field precedence: USUARIO > REGRA_AUTOMATICA / DERIVADO > UPSTREAM', () => {

@@ -25,354 +25,14 @@ export const REAL_DATA_SOURCE_IDS = {
   NOTION_DS_SYNC_LOG: '2a6107e9-4ebb-456f-84f9-dba3bc573d20',
 };
 
+import rawSnapshot from './fixtures/notion-live-schema.snapshot.json';
+
 /**
- * Exact fixtures reproducing the real introspected Phase 0 schema from Notion
- * (as captured in architecture/notion-schema-delta.md and architecture/notion-migration-plan.md).
+ * Sanitized, versionable structural snapshot derived from real introspection of the 12 bases.
+ * (No financial records, credentials, or PII).
  */
-export const LIVE_NOTION_FIXTURES: Record<string, Record<string, NotionPropertySnapshot>> = {
-  NOTION_DS_ACCOUNTS: {
-    'Conta': { type: 'title' },
-    'Fonte': { type: 'select', selectOptions: ['Pierre', 'Manual', 'Outra'] },
-    'ID da fonte': { type: 'rich_text' },
-    'Moeda': { type: 'select', selectOptions: ['BRL', 'USD', 'Outra'] },
-    'Instituição': { type: 'rich_text' },
-    'Tipo': {
-      type: 'select',
-      selectOptions: [
-        'Conta corrente',
-        'Cartão de crédito',
-        'Carteira',
-        'Corretora',
-        'Dinheiro',
-        'Outro',
-      ],
-    },
-    'Saldo': { type: 'number' },
-    'Limite contratado': { type: 'number' },
-    'Limite personalizado': { type: 'number' },
-    'Limite disponível': { type: 'number' },
-    'Atualizado em': { type: 'date' },
-    'Inclui no caixa': { type: 'checkbox' },
-    'Inclui no patrimônio': { type: 'checkbox' },
-    'Ativa': { type: 'checkbox' },
-    'Observações': { type: 'rich_text' },
-  },
-
-  NOTION_DS_TRANSACTIONS: {
-    'Lançamento': { type: 'title' },
-    'Fonte': { type: 'select', selectOptions: ['Pierre', 'Manual', 'Migração', 'Outra'] },
-    'ID da fonte': { type: 'rich_text' },
-    'Moeda': { type: 'select', selectOptions: ['BRL', 'USD'] },
-    'Data': { type: 'date' },
-    'Valor': { type: 'number' },
-    'Movimento': { type: 'select', selectOptions: ['Entrada', 'Saída'] },
-    'Conta': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
-    },
-    'Categoria': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_CATEGORIES,
-    },
-    'Categoria Pierre': { type: 'rich_text' },
-    'Descrição original': { type: 'rich_text' },
-    'Natureza': {
-      type: 'select',
-      selectOptions: [
-        'Receita',
-        'Despesa',
-        'Aporte',
-        'Resgate',
-        'Transferência interna',
-        'Reembolso',
-        'Pagamento de fatura',
-        'Ajuste',
-      ],
-    },
-    'Status': { type: 'select', selectOptions: ['Confirmado', 'Pendente', 'Cancelado'] },
-    'Conta no orçamento': { type: 'checkbox' },
-    'Conta como aporte': { type: 'checkbox' },
-    'Revisado': { type: 'checkbox' },
-    'Observações': { type: 'rich_text' },
-  },
-
-  NOTION_DS_CATEGORIES: {
-    'Categoria': { type: 'title' },
-    'Variabilidade': { type: 'select', selectOptions: ['Fixa', 'Variável'] },
-    'Natureza padrão': {
-      type: 'select',
-      selectOptions: ['Receita', 'Despesa', 'Patrimonial', 'Mista'],
-    },
-    'Grupo': {
-      type: 'select',
-      selectOptions: ['Necessidade', 'Desejo', 'Poupança/Investimento', 'Fora do orçamento'],
-    },
-    'Observações': { type: 'rich_text' },
-    'Contas fixas': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_FIXED_BILLS,
-    },
-    'Ativa': { type: 'checkbox' },
-    'Conta no orçamento': { type: 'checkbox' },
-    'Transações': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
-    },
-  },
-
-  NOTION_DS_RULES: {
-    'Regra': { type: 'title' },
-    'Prioridade': { type: 'number' },
-    'Ativa': { type: 'checkbox' },
-    'Auto aplicar': { type: 'checkbox' },
-    'Exigir revisão': { type: 'checkbox' },
-    'Válida de': { type: 'date' },
-    'Válida até': { type: 'date' },
-    'Contraparte contém': { type: 'rich_text' },
-    'Descrição contém': { type: 'rich_text' },
-    'Movimento esperado': {
-      type: 'select',
-      selectOptions: ['Qualquer', 'Entrada', 'Saída'],
-    },
-    'Conta origem': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
-    },
-    'Categoria Pierre': { type: 'rich_text' },
-    'Valor exato': { type: 'number' },
-    'Tolerância': { type: 'number' },
-    'Valor mínimo': { type: 'number' },
-    'Valor máximo': { type: 'number' },
-    'Dia mínimo': { type: 'number' },
-    'Dia máximo': { type: 'number' },
-    'Natureza resultante': {
-      type: 'select',
-      selectOptions: [
-        'Receita',
-        'Despesa',
-        'Aporte',
-        'Resgate',
-        'Transferência interna',
-        'Reembolso',
-        'Pagamento de fatura',
-        'Ajuste',
-      ],
-    },
-    'Categoria resultante': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_CATEGORIES,
-    },
-    'Conta como aporte': { type: 'checkbox' },
-    'Conta no orçamento': { type: 'checkbox' },
-    'Destino / contexto': { type: 'rich_text' },
-    'Observações': { type: 'rich_text' },
-    'Tipo': { type: 'select', selectOptions: ['Entrada', 'Saída', 'Qualquer'] },
-  },
-
-  NOTION_DS_FIXED_BILLS: {
-    'Conta fixa': { type: 'title' },
-    'Periodicidade': {
-      type: 'select',
-      selectOptions: ['Mensal', 'Bimestral', 'Trimestral', 'Semestral', 'Anual'],
-    },
-    'Forma de pagamento': {
-      type: 'select',
-      selectOptions: ['Boleto', 'Pix', 'Cartão', 'Débito automático'],
-    },
-    'Conta padrão': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
-    },
-    'Categoria': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_CATEGORIES,
-    },
-    'Ativa': { type: 'checkbox' },
-    'Gerar obrigação': { type: 'checkbox' },
-    'Observações': { type: 'rich_text' },
-    'Valor esperado': { type: 'number' },
-    'Dia do vencimento': { type: 'number' },
-    'Tolerância de valor': { type: 'number' },
-    'Regra de identificação': { type: 'rich_text' },
-  },
-
-  NOTION_DS_MONTHLY_OBLIGATIONS: {
-    'Obrigação': { type: 'title' },
-    'Conta fixa': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_FIXED_BILLS,
-    },
-    'Valor previsto': { type: 'number' },
-    'Status': {
-      type: 'select',
-      // Phase 0 real options currently in Notion (ALTER_SCHEMA will add Revisão Necessária & Cancelada via read-before-write)
-      selectOptions: ['Prevista', 'Paga', 'Atrasada'],
-    },
-    'Valor pago': { type: 'number' },
-    'Validado automaticamente': { type: 'checkbox' },
-    'Vencimento': { type: 'date' },
-    'Pago em': { type: 'date' },
-    'Observações': { type: 'rich_text' },
-    'Transação conciliada': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
-    },
-    'Referência': { type: 'date' },
-    'Conta': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
-    },
-    'Origem': { type: 'select', selectOptions: ['Automática', 'Manual'] },
-  },
-
-  NOTION_DS_INVESTMENTS: {
-    'Ativo': { type: 'title' },
-    'Moeda': { type: 'select', selectOptions: ['BRL', 'USD'] },
-    'Quantidade': { type: 'number' },
-    'Liquidez': { type: 'rich_text' },
-    'Data da avaliação': { type: 'date' },
-    'Classe': {
-      type: 'select',
-      selectOptions: ['Ações', 'Cripto', 'FIIs', 'Renda Fixa', 'ETFs', 'Outro'],
-    },
-    'Custo acumulado': { type: 'number' },
-    'Valor atual': { type: 'number' },
-    'Fonte do preço': { type: 'select', selectOptions: ['Pierre', 'Manual'] },
-    'Instituição': { type: 'rich_text' },
-    'ID da fonte': { type: 'rich_text' },
-    'Inclui no patrimônio': { type: 'checkbox' },
-    'Observações': { type: 'rich_text' },
-    'Movimentações': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_INVESTMENT_MOVEMENTS,
-    },
-  },
-
-  NOTION_DS_INVESTMENT_MOVEMENTS: {
-    'Movimentação': { type: 'title' },
-    'Preço unitário': { type: 'number' },
-    'Conta origem': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS,
-    },
-    'Ativo': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_INVESTMENTS,
-    },
-    'Tipo': {
-      type: 'select',
-      selectOptions: [
-        'Aporte',
-        'Compra',
-        'Venda',
-        'Rendimento',
-        'Resgate',
-        'Taxa',
-        'Transferência',
-        'Ajuste',
-      ],
-    },
-    'Data': { type: 'date' },
-    'Quantidade': { type: 'number' },
-    'Valor': { type: 'number' },
-    'Transação origem': {
-      type: 'relation',
-      relationDataSourceId: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
-    },
-    'Moeda': { type: 'select', selectOptions: ['BRL', 'USD'] },
-    'Observações': { type: 'rich_text' },
-    'ID da fonte': { type: 'rich_text' },
-    'Fonte': { type: 'select', selectOptions: ['Pierre', 'Manual'] },
-    'Custos e taxas': { type: 'number' },
-  },
-
-  NOTION_DS_MONTHLY_BUDGET: {
-    'Mês': { type: 'title' },
-    'Renda planejada': { type: 'number' },
-    'Teto pessoal de crédito': { type: 'number' },
-    'Aporte planejado': { type: 'number' },
-    'Meta de poupança %': { type: 'number' },
-    'Necessidades planejadas': { type: 'number' },
-    'Desejos planejados': { type: 'number' },
-    'Reserva operacional': { type: 'number' },
-    'Observações': { type: 'rich_text' },
-    'Status': {
-      type: 'select',
-      selectOptions: ['Planejado', 'Em andamento', 'Fechado'],
-    },
-    'Referência': { type: 'date' },
-  },
-
-  NOTION_DS_FINANCIAL_GOALS: {
-    'Meta': { type: 'title' },
-    'Valor alvo': { type: 'number' },
-    'Prazo': { type: 'date' },
-    'Valor atual': { type: 'number' },
-    'Aporte mensal planejado': { type: 'number' },
-    'Tipo': {
-      type: 'select',
-      selectOptions: ['Aposentadoria', 'Viagem', 'Reserva', 'Patrimônio', 'Outro'],
-    },
-    'Liquidez necessária': {
-      type: 'select',
-      selectOptions: ['Imediata', 'Curto Prazo', 'Médio Prazo', 'Longo Prazo'],
-    },
-    'Prioridade': { type: 'select', selectOptions: ['Alta', 'Média', 'Baixa'] },
-    'Observações': { type: 'rich_text' },
-    'Status': {
-      type: 'select',
-      selectOptions: ['Não iniciada', 'Em andamento', 'Concluída'],
-    },
-  },
-
-  NOTION_DS_MONTHLY_CLOSINGS: {
-    'Fechamento': { type: 'title' },
-    'Qualidade dos dados': {
-      type: 'select',
-      selectOptions: ['Alta', 'Média', 'Baixa'],
-    },
-    'Contas fixas pagas': { type: 'number' },
-    'Contas fixas pendentes': { type: 'number' },
-    'Itens para revisão': { type: 'number' },
-    'Fechado em': { type: 'date' },
-    'Status': {
-      type: 'select',
-      selectOptions: ['Aberto', 'Em revisão', 'Fechado'],
-    },
-    'Aportes': { type: 'number' },
-    'Observações': { type: 'rich_text' },
-    'Receitas': { type: 'number' },
-    'Despesas': { type: 'number' },
-    'Patrimônio final': { type: 'number' },
-    'Reconciliação OK': { type: 'checkbox' },
-    'Saldo livre final': { type: 'number' },
-    'Referência': { type: 'date' },
-    'Fatura em aberto': { type: 'number' },
-  },
-
-  NOTION_DS_SYNC_LOG: {
-    'Execução': { type: 'title' },
-    'Status': {
-      type: 'select',
-      selectOptions: ['Sucesso', 'Parcial', 'Erro', 'Executando'],
-    },
-    'Fonte': {
-      type: 'select',
-      selectOptions: ['Pierre', 'Manual', 'Migração'],
-    },
-    'Transações recebidas': { type: 'number' },
-    'Transações novas': { type: 'number' },
-    'Transações atualizadas': { type: 'number' },
-    'Parcelas recebidas': { type: 'number' },
-    'Freshness da fonte': { type: 'date' },
-    'Iniciada em': { type: 'date' },
-    'Concluída em': { type: 'date' },
-    'Contas recebidas': { type: 'number' },
-    'Pendências de revisão': { type: 'number' },
-    'Erro / alerta': { type: 'rich_text' },
-    'Observações': { type: 'rich_text' },
-  },
-};
+export const LIVE_NOTION_FIXTURES: Record<string, Record<string, NotionPropertySnapshot>> =
+  rawSnapshot as unknown as Record<string, Record<string, NotionPropertySnapshot>>;
 
 describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () => {
   const validator = new NotionSchemaValidator();
@@ -755,97 +415,110 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
     });
   });
 
-  describe('Anti-Regression: Known Physical Options Integrity in Live Fixtures', () => {
-    const KNOWN_PHYSICAL_SELECT_OPTIONS: Record<string, Record<string, string[]>> = {
-      NOTION_DS_ACCOUNTS: {
-        'Fonte': ['Pierre', 'Manual', 'Outra'],
-        'Moeda': ['BRL', 'USD', 'Outra'],
-        'Tipo': ['Conta corrente', 'Cartão de crédito', 'Carteira', 'Corretora', 'Dinheiro', 'Outro'],
-      },
-      NOTION_DS_TRANSACTIONS: {
-        'Fonte': ['Pierre', 'Manual', 'Migração', 'Outra'],
-        'Moeda': ['BRL', 'USD'],
-        'Movimento': ['Entrada', 'Saída'],
-        'Natureza': ['Receita', 'Despesa', 'Aporte', 'Resgate', 'Transferência interna', 'Reembolso', 'Pagamento de fatura', 'Ajuste'],
-        'Status': ['Confirmado', 'Pendente', 'Cancelado'],
-      },
-      NOTION_DS_CATEGORIES: {
-        'Variabilidade': ['Fixa', 'Variável'],
-        'Natureza padrão': ['Receita', 'Despesa', 'Patrimonial', 'Mista'],
-        'Grupo': ['Necessidade', 'Desejo', 'Poupança/Investimento', 'Fora do orçamento'],
-      },
-      NOTION_DS_RULES: {
-        'Movimento esperado': ['Qualquer', 'Entrada', 'Saída'],
-        'Natureza resultante': ['Receita', 'Despesa', 'Aporte', 'Resgate', 'Transferência interna', 'Reembolso', 'Pagamento de fatura', 'Ajuste'],
-        'Tipo': ['Entrada', 'Saída', 'Qualquer'],
-      },
-      NOTION_DS_FIXED_BILLS: {
-        'Periodicidade': ['Mensal', 'Bimestral', 'Trimestral', 'Semestral', 'Anual'],
-        'Forma de pagamento': ['Boleto', 'Pix', 'Cartão', 'Débito automático'],
-      },
-      NOTION_DS_MONTHLY_OBLIGATIONS: {
-        'Status': ['Prevista', 'Paga', 'Atrasada'],
-        'Origem': ['Automática', 'Manual'],
-      },
-      NOTION_DS_INVESTMENTS: {
-        'Moeda': ['BRL', 'USD'],
-        'Classe': ['Ações', 'Cripto', 'FIIs', 'Renda Fixa', 'ETFs', 'Outro'],
-        'Fonte do preço': ['Pierre', 'Manual'],
-      },
-      NOTION_DS_INVESTMENT_MOVEMENTS: {
-        'Tipo': ['Aporte', 'Compra', 'Venda', 'Rendimento', 'Resgate', 'Taxa', 'Transferência', 'Ajuste'],
-        'Moeda': ['BRL', 'USD'],
-        'Fonte': ['Pierre', 'Manual'],
-      },
-      NOTION_DS_MONTHLY_BUDGET: {
-        'Status': ['Planejado', 'Em andamento', 'Fechado'],
-      },
-      NOTION_DS_FINANCIAL_GOALS: {
-        'Tipo': ['Aposentadoria', 'Viagem', 'Reserva', 'Patrimônio', 'Outro'],
-        'Liquidez necessária': ['Imediata', 'Curto Prazo', 'Médio Prazo', 'Longo Prazo'],
-        'Prioridade': ['Alta', 'Média', 'Baixa'],
-        'Status': ['Não iniciada', 'Em andamento', 'Concluída'],
-      },
-      NOTION_DS_MONTHLY_CLOSINGS: {
-        'Qualidade dos dados': ['Alta', 'Média', 'Baixa'],
-        'Status': ['Aberto', 'Em revisão', 'Fechado'],
-      },
-      NOTION_DS_SYNC_LOG: {
-        'Status': ['Sucesso', 'Parcial', 'Erro', 'Executando'],
-        'Fonte': ['Pierre', 'Manual', 'Migração'],
-      },
-    };
-
-    test('validates that every known physical option is present in the live fixtures', () => {
-      for (const [baseKey, propMap] of Object.entries(KNOWN_PHYSICAL_SELECT_OPTIONS)) {
-        const fixtureBase = LIVE_NOTION_FIXTURES[baseKey];
-        expect(fixtureBase, `Base ${baseKey} should exist in fixtures`).toBeDefined();
-
-        for (const [propName, expectedOpts] of Object.entries(propMap)) {
-          const fixtureProp = fixtureBase[propName];
-          expect(fixtureProp, `Property ${propName} should exist in fixture ${baseKey}`).toBeDefined();
-          expect(fixtureProp.selectOptions, `Property ${propName} in ${baseKey} must have selectOptions`).toBeDefined();
-
-          for (const opt of expectedOpts) {
-            expect(
-              fixtureProp.selectOptions,
-              `Option "${opt}" must not be omitted from ${baseKey}.${propName}`,
-            ).toContain(opt);
-          }
-        }
+  describe('Anti-Regression: Physical Schema Snapshot Integrity and Option Equality', () => {
+    test('contains all 12 existing Data Sources in the physical snapshot', () => {
+      const keys = Object.keys(LIVE_NOTION_FIXTURES);
+      expect(keys).toHaveLength(12);
+      for (const envKey of Object.keys(REAL_DATA_SOURCE_IDS)) {
+        expect(LIVE_NOTION_FIXTURES[envKey], `Missing ${envKey} in snapshot`).toBeDefined();
       }
+    });
+
+    test('validates exact equality of all physical select/status options directly against the snapshot', () => {
+      // 1. Contas
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_ACCOUNTS['Moeda']?.selectOptions).toEqual(['BRL', 'USD', 'Outra']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_ACCOUNTS['Tipo']?.selectOptions).toEqual([
+        'Conta corrente', 'Cartão de crédito', 'Carteira', 'Corretora', 'Dinheiro', 'Outro',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_ACCOUNTS['Fonte']?.selectOptions).toEqual(['Pierre', 'Manual', 'Outra']);
+
+      // 2. Transações
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_TRANSACTIONS['Fonte']?.selectOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_TRANSACTIONS['Natureza']?.selectOptions).toEqual([
+        'Receita', 'Despesa', 'Transferência interna', 'Aporte', 'Resgate', 'Reembolso', 'Pagamento de fatura', 'Ajuste',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_TRANSACTIONS['Status']?.selectOptions).toEqual(['Pendente', 'Confirmado', 'Cancelado']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_TRANSACTIONS['Movimento']?.selectOptions).toEqual(['Entrada', 'Saída']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_TRANSACTIONS['Moeda']?.selectOptions).toEqual(['BRL', 'USD', 'Outra']);
+
+      // 3. Categorias
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_CATEGORIES['Natureza padrão']?.selectOptions).toEqual(['Receita', 'Despesa', 'Patrimonial', 'Mista']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_CATEGORIES['Variabilidade']?.selectOptions).toEqual(['Fixa', 'Variável', 'N/A']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_CATEGORIES['Grupo']?.selectOptions).toEqual([
+        'Necessidade', 'Desejo', 'Poupança/Investimento', 'Fora do orçamento',
+      ]);
+
+      // 4. Regras
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_RULES['Movimento esperado']?.selectOptions).toEqual(['Entrada', 'Saída', 'Qualquer']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_RULES['Tipo']?.selectOptions).toEqual([
+        'Contraparte + valor', 'Contraparte', 'Descrição', 'Categoria Pierre', 'Conta', 'Personalizada',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_RULES['Natureza resultante']?.selectOptions).toEqual([
+        'Receita', 'Despesa', 'Transferência interna', 'Aporte', 'Resgate', 'Reembolso', 'Pagamento de fatura', 'Ajuste',
+      ]);
+
+      // 5. Contas Fixas
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FIXED_BILLS['Forma de pagamento']?.selectOptions).toEqual([
+        'Cartão', 'Débito', 'Pix', 'Boleto', 'Débito automático', 'Outro',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FIXED_BILLS['Periodicidade']?.selectOptions).toEqual([
+        'Mensal', 'Bimestral', 'Trimestral', 'Semestral', 'Anual',
+      ]);
+
+      // 6. Obrigações Mensais
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_OBLIGATIONS['Status']?.selectOptions).toEqual([
+        'Prevista', 'Pendente', 'Paga', 'Atrasada', 'Dispensada',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_OBLIGATIONS['Origem']?.selectOptions).toEqual(['Rotina', 'Manual', 'Pierre']);
+
+      // 7. Investimentos
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENTS['Moeda']?.selectOptions).toEqual(['BRL', 'USD', 'Outra']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENTS['Classe']?.selectOptions).toEqual([
+        'Cripto', 'Renda fixa', 'Ações', 'FIIs', 'ETFs', 'Fundos', 'Caixa', 'Outro',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENTS['Fonte do preço']?.selectOptions).toEqual(['Pierre', 'Mercado', 'Manual', 'Outra']);
+
+      // 8. Movimentações de Investimentos
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENT_MOVEMENTS['Moeda']?.selectOptions).toEqual(['BRL', 'USD', 'Outra']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENT_MOVEMENTS['Tipo']?.selectOptions).toEqual([
+        'Aporte', 'Compra', 'Venda', 'Rendimento', 'Resgate', 'Taxa', 'Transferência', 'Ajuste',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENT_MOVEMENTS['Fonte']?.selectOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+
+      // 9. Planejamento Mensal
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_BUDGET['Status']?.selectOptions).toEqual(['Planejando', 'Ativo', 'Fechado']);
+
+      // 10. Metas Financeiras
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FINANCIAL_GOALS['Tipo']?.selectOptions).toEqual([
+        'Reserva de emergência', 'Compra', 'Viagem', 'Investimento', 'Quitação', 'Outro',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FINANCIAL_GOALS['Liquidez necessária']?.selectOptions).toEqual([
+        'Imediata', 'Curta', 'Média', 'Longa',
+      ]);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FINANCIAL_GOALS['Prioridade']?.selectOptions).toEqual(['Alta', 'Média', 'Baixa']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_FINANCIAL_GOALS['Status']?.selectOptions).toEqual([
+        'Planejada', 'Em andamento', 'Concluída', 'Pausada',
+      ]);
+
+      // 11. Fechamentos Mensais
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_CLOSINGS['Status']?.selectOptions).toEqual(['Aberto', 'Em revisão', 'Fechado']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_CLOSINGS['Qualidade dos dados']?.selectOptions).toEqual(['Alta', 'Média', 'Baixa']);
+
+      // 12. Log de Sincronização
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_SYNC_LOG['Status']?.selectOptions).toEqual(['Executando', 'Sucesso', 'Parcial', 'Erro']);
+      expect(LIVE_NOTION_FIXTURES.NOTION_DS_SYNC_LOG['Fonte']?.selectOptions).toEqual(['Pierre', 'Migração', 'Manual']);
     });
 
     test('validates that NOTION_DS_SYNC_LOG.Fonte strictly does NOT contain Outra', () => {
       const syncFonte = LIVE_NOTION_FIXTURES.NOTION_DS_SYNC_LOG['Fonte'];
-      expect(syncFonte.selectOptions).not.toContain('Outra');
-      expect(syncFonte.selectOptions).toEqual(['Pierre', 'Manual', 'Migração']);
+      expect(syncFonte?.selectOptions).not.toContain('Outra');
+      expect(syncFonte?.selectOptions).toEqual(['Pierre', 'Migração', 'Manual']);
     });
 
     test('validates that NOTION_DS_MONTHLY_OBLIGATIONS.Status strictly does NOT contain post-migration options yet', () => {
       const statusProp = LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_OBLIGATIONS['Status'];
-      expect(statusProp.selectOptions).not.toContain('Revisão Necessária');
-      expect(statusProp.selectOptions).not.toContain('Cancelada');
+      expect(statusProp?.selectOptions).not.toContain('Revisão Necessária');
+      expect(statusProp?.selectOptions).not.toContain('Cancelada');
     });
 
     test('fails if any known physical option is inadvertently omitted from a fixture property', () => {
