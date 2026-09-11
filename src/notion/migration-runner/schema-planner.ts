@@ -77,13 +77,11 @@ export class SchemaPlanner {
     for (const opt of rawExistingOptions) {
       const optName = typeof opt === 'string' ? opt : opt.name;
       const optId = typeof opt === 'object' ? opt.id : undefined;
-      const optColor = typeof opt === 'object' ? opt.color : undefined;
       if (!seenNames.has(optName)) {
         seenNames.add(optName);
         mergedOptionsPayload.push({
           ...(optId ? { id: optId } : {}),
           name: optName,
-          ...(optColor ? { color: optColor } : {}),
         });
       }
     }
@@ -246,16 +244,20 @@ export class SchemaPlanner {
         name: cardBillsContract.defaultTitle,
       },
       dependsOnStep: createDbStepNumber,
-      precondition: `Database criado no Step ${createDbStepNumber}; initial data source retornado pela Notion API 2026-03-11`,
+      precondition: `Database criado no Step ${createDbStepNumber}; executa GET /v1/databases/{database.id} para validar data_sources e capturar data_sources[0].id`,
       sanitizedPayload: {
         sourceStep: createDbStepNumber,
-        resolutionPath: 'database.data_sources[0].id',
+        method: 'GET',
+        endpoint: '/v1/databases/{database.id}',
+        extractionPath: 'database.data_sources[0].id',
       },
-      postcondition: `ID do Data Source de Faturas resolvido em runtime e propagado para o Step ${resolveDsStepNumber + 1}`,
+      postcondition: `ID do Data Source de Faturas resolvido em runtime via GET /v1/databases/:id e propagado para o Step ${resolveDsStepNumber + 1}`,
       risk: 'LOW',
-      rollback: 'N/A (operação idempotente de resolução em memória)',
+      rollback: 'N/A (operação estritamente de leitura para resolução em memória)',
       metadata: {
         runtimePropagationTarget: 'NOTION_DS_CARD_BILLS_DATA_SOURCE_ID',
+        httpMethod: 'GET',
+        endpointTemplate: '/v1/databases/{database.id}',
       },
     });
 

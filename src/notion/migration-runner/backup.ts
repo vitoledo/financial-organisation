@@ -32,8 +32,8 @@ export class FinancialBackupManager {
   }
 
   /**
-   * Derive a 32-byte AES-256 key from a passphrase or secret string using SHA-256.
-   * Strictly enforces minimum key length (32 chars) and disallows default/fallback keys.
+   * Derive a 32-byte AES-256 key from cryptographic material (64-hex, 44-base64, or high-entropy raw secret).
+   * Strictly enforces minimum key length (32 chars), entropy, and disallows default/fallback keys.
    */
   private deriveKey(key?: string): Buffer {
     const rawKey = key ?? this.backupKey ?? process.env.MIGRATION_BACKUP_KEY?.trim();
@@ -47,6 +47,28 @@ export class FinancialBackupManager {
         `Chave MIGRATION_BACKUP_KEY fraca. Exigido segredo com no mínimo ${MIN_KEY_LENGTH} caracteres.`,
       );
     }
+
+    // 1. 64-character hex string (32 bytes raw cryptographic key)
+    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+      return Buffer.from(rawKey, 'hex');
+    }
+
+    // 2. 44-character base64 string (32 bytes raw cryptographic key)
+    if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
+      const decoded = Buffer.from(rawKey, 'base64');
+      if (decoded.length === 32) {
+        return decoded;
+      }
+    }
+
+    // 3. Raw passphrase: must have high entropy (minimum 8 distinct characters)
+    const uniqueChars = new Set(rawKey).size;
+    if (uniqueChars < 8) {
+      throw new Error(
+        'Chave MIGRATION_BACKUP_KEY possui entropia insuficiente (muitos caracteres repetidos).',
+      );
+    }
+
     return crypto.createHash('sha256').update(rawKey, 'utf8').digest();
   }
 
@@ -86,6 +108,15 @@ export class FinancialBackupManager {
       await sourceDb.backup(tempSnapshotPath);
       sourceDb.close();
 
+      // Apply restrictive permissions (0o600) to temporary plaintext snapshot
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(tempSnapshotPath, 0o600);
+        } catch {
+          /* non-POSIX or permission ignored */
+        }
+      }
+
       const snapshotBuffer = fs.readFileSync(tempSnapshotPath);
       const originalSize = snapshotBuffer.length;
       const originalDbSha256 = crypto.createHash('sha256').update(snapshotBuffer).digest('hex');
@@ -108,12 +139,12 @@ export class FinancialBackupManager {
       const backupFileName = `financial-backup-${timestampClean}-${uniqueSuffix}.db.enc`;
       const backupFilePath = path.join(this.backupDir, backupFileName);
 
-      // Write encrypted backup to disk
+      // Write encrypted backup to disk with restrictive permissions (0o600)
       fs.writeFileSync(backupFilePath, backupPayload);
 
       if (process.platform !== 'win32') {
         try {
-          fs.chmodSync(backupFilePath, 0o400);
+          fs.chmodSync(backupFilePath, 0o600);
         } catch {
           /* non-POSIX systems */
         }
@@ -127,6 +158,10 @@ export class FinancialBackupManager {
 
       // Step 4: Write sidecar manifest file
       const manifestPath = `${backupFilePath}.manifest.json`;
+      const localDatabaseScope = 'LOCAL_FINANCIAL_DB_ONLY' as const;
+      const notionWorkspaceReconciliationNote =
+        'Local SQLite snapshot (financial.db.enc) covers only the local database. Notion workspace state is managed separately via read-before-write live preflight inspection.';
+
       const manifestContent = {
         format: 'FIN_ENC_V1',
         keyVersion: '1',
@@ -138,6 +173,8 @@ export class FinancialBackupManager {
         originalSizeBytes: originalSize,
         encryptedSizeBytes: encryptedSize,
         verifiedRestoration,
+        localDatabaseScope,
+        notionWorkspaceReconciliationNote,
       };
       fs.writeFileSync(manifestPath, JSON.stringify(manifestContent, null, 2), 'utf8');
 
@@ -150,14 +187,16 @@ export class FinancialBackupManager {
         encryptedSize,
         timestamp: timestampIso,
         verifiedRestoration,
+        localDatabaseScope,
+        notionWorkspaceReconciliationNote,
       };
     } finally {
-      // Securely delete temporary plaintext snapshot
+      // Best-effort plaintext deletion of temporary SQLite snapshot
       if (fs.existsSync(tempSnapshotPath)) {
         try {
           fs.unlinkSync(tempSnapshotPath);
         } catch {
-          /* best effort */
+          /* best-effort plaintext deletion */
         }
       }
     }
@@ -221,6 +260,13 @@ export class FinancialBackupManager {
       const decryptedBuffer = this.decryptBackupBuffer(encryptedBuffer, keyBuffer);
 
       fs.writeFileSync(tempDbPath, decryptedBuffer);
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(tempDbPath, 0o600);
+        } catch {
+          /* non-POSIX or permission ignored */
+        }
+      }
 
       // Verify SQLite integrity
       const tempDb = new Database(tempDbPath, { readonly: true });
@@ -239,7 +285,7 @@ export class FinancialBackupManager {
         try {
           fs.unlinkSync(tempDbPath);
         } catch {
-          /* best effort cleanup */
+          /* best-effort plaintext deletion */
         }
       }
     }

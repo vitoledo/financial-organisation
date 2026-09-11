@@ -659,9 +659,12 @@ function validatePropertyStructure(
     (actual.type === 'select' || actual.type === 'multi_select' || actual.type === 'status') &&
     Array.isArray(actual.selectOptions)
   ) {
+    const rawOptions: string[] = actual.selectOptions.map((o: any) =>
+      typeof o === 'string' ? o : o?.name ?? '',
+    );
     details.expectedOptions = targetOptions;
-    details.actualOptions = actual.selectOptions;
-    const actualNorm = new Set(actual.selectOptions.map(normalizePropName));
+    details.actualOptions = rawOptions;
+    const actualNorm = new Set(rawOptions.map(normalizePropName));
     const mappings = expected.optionMappings || {};
 
     const missing = targetOptions.filter((opt) => {
@@ -702,7 +705,7 @@ function validatePropertyStructure(
         allowedNorm.add(normalizePropName(k));
         allowedNorm.add(normalizePropName(v));
       }
-      const extra = actual.selectOptions.filter((o) => !allowedNorm.has(normalizePropName(o)));
+      const extra = rawOptions.filter((o) => !allowedNorm.has(normalizePropName(o)));
       if (extra.length > 0) {
         details.extraOptions = extra;
         warnings.push(
@@ -758,8 +761,9 @@ function validatePropertyStructure(
   };
 }
 
-export function normalizePropName(name: string): string {
-  return name
+export function normalizePropName(name: any): string {
+  const str = typeof name === 'string' ? name : (name?.name ?? '');
+  return str
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '') // remove diacritics
     .toLowerCase()

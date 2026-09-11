@@ -136,11 +136,30 @@ export interface BackupResult {
   encryptedSize: number;
   timestamp: string;
   verifiedRestoration: boolean;
+  localDatabaseScope: 'LOCAL_FINANCIAL_DB_ONLY';
+  notionWorkspaceReconciliationNote: string;
+}
+
+export type WorktreeStatus = 'WORKTREE_CLEAN' | 'WORKTREE_DIRTY';
+
+export interface SchemaConformanceResult {
+  typeMismatches: number;
+  renameTypeMismatches: number;
+  renameStructuralMismatches: number;
+  heuristicSuggestions: number;
+  structuralMismatches: number;
+  structuralMismatchProperty?: string;
+  missingCount: number;
+  unexpectedMissingProperties: string[];
+  isConformant: boolean;
 }
 
 export interface MigrationReadiness {
   dryRunValid: boolean;
   applyReady: boolean;
+  worktreeStatus: WorktreeStatus;
+  dirtyFiles?: string[];
+  schemaConformance?: SchemaConformanceResult;
   reasons: string[];
 }
 

@@ -13,6 +13,15 @@ import {
   verifyPlanHash,
   canonicalizeJson,
 } from '../src/notion/migration-runner';
+import {
+  PERCENTAGE_CONVENTION,
+  ratioToPercentage,
+  percentageToRatio,
+} from '../src/domain/schema-contract';
+import {
+  REAL_DATA_SOURCE_IDS,
+  LIVE_NOTION_FIXTURES,
+} from './contract-live-schema-fixtures.test';
 
 describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
   let tempDir: string;
@@ -66,6 +75,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
       });
 
       const report = await runner.runDryRun();
@@ -78,12 +88,61 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       expect(fs.existsSync(report.backup.manifestPath)).toBe(true);
     });
 
+    it('working tree dirty blocks readiness with WORKTREE_DIRTY', async () => {
+      const runner = new MigrationRunner({
+        mode: 'dry-run',
+        dbPath: testDbPath,
+        backupDir: testBackupDir,
+        backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_DIRTY',
+        mockDirtyFiles: ['M src/domain/schema-contract.ts'],
+      });
+
+      const report = await runner.runDryRun();
+      expect(report.readiness.worktreeStatus).toBe('WORKTREE_DIRTY');
+      expect(report.readiness.dryRunValid).toBe(false);
+      expect(report.readiness.applyReady).toBe(false);
+      expect(report.readiness.reasons.some((r) => r.includes('WORKTREE_DIRTY'))).toBe(true);
+      expect(report.readiness.dirtyFiles).toContain('M src/domain/schema-contract.ts');
+    });
+
+    it('unexpected schema mismatch blocks applyReady', async () => {
+      // Create a corrupted live snapshot where NOTION_DS_CATEGORIES['Natureza padrão'] is rich_text instead of select
+      const corruptedSnapshot: Record<string, Record<string, any>> = JSON.parse(
+        JSON.stringify(LIVE_NOTION_FIXTURES),
+      );
+      corruptedSnapshot.NOTION_DS_CATEGORIES['Natureza padrão'] = {
+        name: 'Natureza padrão',
+        type: 'rich_text',
+      };
+
+      const runner = new MigrationRunner({
+        mode: 'dry-run',
+        dbPath: testDbPath,
+        backupDir: testBackupDir,
+        backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
+        liveSnapshotOverride: corruptedSnapshot,
+        envVars: {
+          ...REAL_DATA_SOURCE_IDS,
+          NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+        },
+      });
+
+      const report = await runner.runDryRun();
+      expect(report.readiness.schemaConformance?.isConformant).toBe(false);
+      expect(report.readiness.schemaConformance?.typeMismatches).toBeGreaterThanOrEqual(1);
+      expect(report.readiness.applyReady).toBe(false);
+      expect(report.readiness.reasons.some((r) => r.includes('SCHEMA_NON_CONFORMANT'))).toBe(true);
+    });
+
     it('blocks apply execution if planHash is missing', async () => {
       const runner = new MigrationRunner({
         mode: 'apply',
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
       });
 
       await expect(runner.execute()).rejects.toThrow(/--plan-hash/);
@@ -95,6 +154,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
         envVars: {
           NOTION_PARENT_PAGE_ID: 'parent-page-uuid',
         },
@@ -115,6 +175,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
         envVars: envWithoutParent,
       });
 
@@ -146,6 +207,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
         envVars: mockEnv,
       });
       const dryReport = await runnerDry.runDryRun();
@@ -156,6 +218,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         dbPath: testDbPath,
         backupDir: testBackupDir,
         backupKey: validStrongBackupKey,
+        worktreeStatusOverride: 'WORKTREE_CLEAN',
         envVars: mockEnv,
       });
 
@@ -317,16 +380,48 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       const options = step1.sanitizedPayload.Status.select.options;
       expect(options.length).toBe(7);
 
-      // Verify existing IDs are preserved
-      expect(options[0]).toEqual({ id: 'opt-prevista-id', name: 'Prevista', color: 'gray' });
-      expect(options[1]).toEqual({ id: 'opt-pendente-id', name: 'Pendente', color: 'yellow' });
-      expect(options[2]).toEqual({ id: 'opt-paga-id', name: 'Paga', color: 'green' });
-      expect(options[3]).toEqual({ id: 'opt-atrasada-id', name: 'Atrasada', color: 'red' });
-      expect(options[4]).toEqual({ id: 'opt-dispensada-id', name: 'Dispensada', color: 'default' });
+      // Verify existing IDs are preserved without color
+      expect(options[0]).toEqual({ id: 'opt-prevista-id', name: 'Prevista' });
+      expect(options[1]).toEqual({ id: 'opt-pendente-id', name: 'Pendente' });
+      expect(options[2]).toEqual({ id: 'opt-paga-id', name: 'Paga' });
+      expect(options[3]).toEqual({ id: 'opt-atrasada-id', name: 'Atrasada' });
+      expect(options[4]).toEqual({ id: 'opt-dispensada-id', name: 'Dispensada' });
 
-      // Verify new options are appended without IDs
+      // Verify new options are appended without IDs and without color
       expect(options[5]).toEqual({ name: 'Revisão Necessária' });
       expect(options[6]).toEqual({ name: 'Cancelada' });
+
+      // Verify no color property on any option
+      for (const opt of options) {
+        expect(opt.color).toBeUndefined();
+      }
+    });
+
+    it('database resolution step explicitly retrieves /v1/databases/:id', () => {
+      const planner = new SchemaPlanner();
+      const plan = planner.generatePlan();
+      const resolveStep = plan.steps.find((s) => s.operation === 'RESOLVE_DATA_SOURCE_ID');
+      expect(resolveStep).toBeDefined();
+      expect(resolveStep!.sanitizedPayload.method).toBe('GET');
+      expect(resolveStep!.sanitizedPayload.endpoint).toBe('/v1/databases/{database.id}');
+      expect(resolveStep!.sanitizedPayload.extractionPath).toBe('database.data_sources[0].id');
+      expect(resolveStep!.metadata?.httpMethod).toBe('GET');
+      expect(resolveStep!.precondition).toContain('GET /v1/databases/{database.id}');
+    });
+
+    it('verifies single percentage convention SCALE_0_TO_100_NUMBER and round-trip conversion', () => {
+      expect(PERCENTAGE_CONVENTION).toBe('SCALE_0_TO_100_NUMBER');
+      expect(ratioToPercentage(0.5)).toBe(50);
+      expect(ratioToPercentage(1.0)).toBe(100);
+      expect(ratioToPercentage(0)).toBe(0);
+      expect(percentageToRatio(50)).toBe(0.5);
+      expect(percentageToRatio(100)).toBe(1.0);
+      expect(percentageToRatio(0)).toBe(0);
+
+      const testRatios = [0.01, 0.25, 0.333, 0.5, 0.75, 1.0];
+      for (const r of testRatios) {
+        expect(percentageToRatio(ratioToPercentage(r))).toBeCloseTo(r, 6);
+      }
     });
 
     it('CREATE_DATABASE possui initial_data_source e não possui properties no nível superior', () => {
@@ -425,13 +520,22 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         key: 'short-key-1234',
       });
       await expect(backupManagerWeakKey.createEncryptedBackup()).rejects.toThrow(/Chave MIGRATION_BACKUP_KEY fraca/);
+
+      const lowEntropyKey = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; // 32 chars but only 1 unique char
+      const backupManagerLowEntropy = new FinancialBackupManager({
+        dbPath: testDbPath,
+        backupDir: testBackupDir,
+        key: lowEntropyKey,
+      });
+      await expect(backupManagerLowEntropy.createEncryptedBackup()).rejects.toThrow(/entropia insuficiente/);
     });
 
-    it('creates an encrypted backup file and sidecar manifest, proving SQLite integrity', async () => {
+    it('creates an encrypted backup file and sidecar manifest with localDatabaseScope, proving SQLite integrity', async () => {
+      const hexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
       const backupManager = new FinancialBackupManager({
         dbPath: testDbPath,
         backupDir: testBackupDir,
-        key: validStrongBackupKey,
+        key: hexKey,
       });
 
       const result = await backupManager.createEncryptedBackup();
@@ -443,6 +547,8 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       expect(result.encryptedSize).toBeGreaterThan(result.originalSize);
       expect(result.encryptedHashSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(result.originalDbSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(result.localDatabaseScope).toBe('LOCAL_FINANCIAL_DB_ONLY');
+      expect(result.notionWorkspaceReconciliationNote).toContain('covers only the local database');
 
       // Verify sidecar manifest content
       const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
@@ -451,6 +557,8 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       expect(manifest.encryptedFileSha256).toBe(result.encryptedHashSha256);
       expect(manifest.originalDbSha256).toBe(result.originalDbSha256);
       expect(manifest.verifiedRestoration).toBe(true);
+      expect(manifest.localDatabaseScope).toBe('LOCAL_FINANCIAL_DB_ONLY');
+      expect(manifest.notionWorkspaceReconciliationNote).toContain('covers only the local database');
     });
 
     it('fails integrity test and throws error if backup file ciphertext is corrupted', async () => {
