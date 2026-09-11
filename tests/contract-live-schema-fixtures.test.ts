@@ -318,10 +318,9 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
       expect(getDiff('Meta Taxa de Poupança (%)')?.status).toBe('RENAME_CANDIDATE');
       expect(getDiff('Meta Taxa de Poupança (%)')?.candidateName).toBe('Meta de poupança %');
 
-      // 5 homologated CREATE_NEW
+      // 4 homologated CREATE_NEW
       const missing = diffs.filter((d) => d.status === 'MISSING').map((d) => d.notionProperty);
       expect(missing).toEqual([
-        'Metas por Grupo Orçamentário',
         'Receitas Realizadas',
         'Despesas Realizadas',
         'Poupança Realizada',

@@ -142,7 +142,7 @@ Todas as divergências onde uma opção física existente no Notion representa o
   * `Pagamento de fatura` -> `BILL_PAYMENT`
   * `Ajuste` -> `ACCOUNTING_ADJUSTMENT`
   * **Aporte / Resgate Legados:** Tratados com **dependência estrita de contexto contábil**. Não são mapeados cegamente para aporte de capital externo. Se houver vínculo com ativos/carteiras -> `CAPITAL_CONTRIBUTION` / `CAPITAL_WITHDRAWAL` ou `ASSET_PURCHASE` / `ASSET_SALE`. Se for entre contas próprias -> `INTERNAL_TRANSFER`. Se ambíguo -> manter provisório e sinalizar `Status de Revisão = PENDING_REVIEW`.
-* **Mapeamento de Status:** Mapear `Confirmado` -> `POSTED`, `Pendente` -> `PENDING`, `Cancelado` -> `VOIDED`. Não adicionar `Liquidado` ou `Estornado` sem necessidade semântica comprovada.
+* **Mapeamento de Status:** Mapear `Confirmado` -> `POSTED`, `Pendente` -> `PENDING`, `Cancelado` -> `CANCELLED`. Não adicionar `Liquidado` ou `Estornado` sem necessidade semântica comprovada.
 * **Transferências Internas:** Inclusão de `Conta Destino` (`relation` -> Contas via `data_source_id`) para indicar a contraparte creditada em transferências próprias.
 
 | Propriedade | Estado Atual (Notion) | Estado Alvo (Domínio) | Ação | Justificativa Técnica e Mapeamento Semântico | Risco Residual | Backfill Necessário | Impacto em Views | Rollback Seguro |
@@ -168,7 +168,7 @@ Todas as divergências onde uma opção física existente no Notion representa o
 | `Valor Bruto da Fonte` | Inexistente | `number` | `CREATE_NEW` | Valor original bruto retornado pelo conector com sinal original. | Baixo | Sim: preencher nas novas runs | Nova coluna | Ocultar propriedade |
 | `Efeito Orçamentário` | Inexistente | `select` | `CREATE_NEW` | Classificador de impacto: `INCOME`, `EXPENSE`, `REVERSAL`, `NEUTRAL`. | Baixo | Sim: inferir pelas naturezas | Nova coluna | Ocultar propriedade |
 | `Propósito de Alocação` | Inexistente | `select` | `CREATE_NEW` | Destinação: `INVESTMENT_RESERVE`, `OPERATIONAL_CASH`, `TAX_RESERVE`, etc. | Baixo | Não | Nova coluna | Ocultar propriedade |
-| `Contribuição Meta Poupança` | Inexistente | `number` | `CREATE_NEW` | Valor absoluto que pontua positivamente na meta de poupança/investimento. | Baixo | Sim: inferir para aportes | Nova coluna | Ocultar propriedade |
+| `Contribuição Meta Poupança` | Inexistente | `number` | `CREATE_NEW` | Valor absoluto que pontua positivamente na meta de poupança/investimento. | Baixo | Sim: preencher exclusivamente quando a classificação econômica comprovar nova contribuição para poupança (compra posterior de ativo com caixa já poupado vale zero) | Nova coluna | Ocultar propriedade |
 | `Fatura Vinculada` | Inexistente | `relation` | `CREATE_NEW` | Relação dual única conectada à 13ª base de Faturas (lado inverso de `Lançamentos do Ciclo`). | Baixo | Sim: vincular compras do cartão | Nova relação | Desvincular relação |
 | `Conta Destino` | Inexistente | `relation` | `CREATE_NEW` | Relação com base Contas para identificar conta favorecida em transferências internas próprias. | Baixo | Sim: preencher nas transferências | Nova relação | Desvincular relação |
 | `Status de Revisão` | Inexistente | `select` | `CREATE_NEW` | Enums: `AUTO_CONFIRMED`, `PENDING_REVIEW`, `MANUALLY_VALIDATED`, `LEGACY_UNVERIFIED`. | Baixo | Sim: marcar históricas como LEGACY | Nova coluna | Ocultar propriedade |
@@ -324,7 +324,7 @@ Todas as divergências onde uma opção física existente no Notion representa o
 * **Data Source ID:** `b19f56a4-e34f-42ec-9437-c5165b8725af`
 * **Finalidade:** Livro de ordens, histórico de transações de ativos, proventos e amortizações.
 * **Title Unívoco:** A propriedade existente `Movimentação` é mantida como o único `title`. É terminantemente proibido criar um segundo title `Identificador`.
-* **Mapeamento de Tipos:** Mapear todos os 8 tipos físicos existentes no Notion: `Aporte` -> `CAPITAL_CONTRIBUTION`, `Compra` -> `BUY`, `Venda` -> `SELL`, `Rendimento` -> `DIVIDEND_YIELD`, `Resgate` -> `CAPITAL_WITHDRAWAL`, `Taxa` -> `FEE_TAX`, `Transferência` -> `TRANSFER`, `Ajuste` -> `POSITION_ADJUSTMENT`.
+* **Mapeamento de Tipos:** Mapear todos os 8 tipos físicos existentes no Notion: `Aporte` -> `CAPITAL_CONTRIBUTION`, `Compra` -> `BUY`, `Venda` -> `SELL`, `Rendimento` -> `INVESTMENT_INCOME`, `Resgate` -> `ASSET_REDEMPTION` (quando for resgate do ativo, mantendo resolução contextual quando aplicável), `Taxa` -> `FEE_TAX`, `Transferência` -> `TRANSFER`, `Ajuste` -> `POSITION_ADJUSTMENT`.
 * **Convenção Direcional de Caixa:**
   * Compra (`BUY`): `netCashEffect = -(grossAmount + feesAmount)` (saída de caixa total).
   * Venda (`SELL`): `netCashEffect = +(grossAmount - feesAmount)` (entrada de caixa líquida).
@@ -424,7 +424,7 @@ Todas as divergências onde uma opção física existente no Notion representa o
 | `Resultado do Mês (Sobra Operacional)` | Inexistente | `number` | `CREATE_NEW` | Resultado financeiro operacional líquido (`Receitas - Despesas`). Criado separadamente de Saldo Livre. | Baixo | Sim: calcular nos fechados | Nova coluna | Ocultar propriedade |
 | `Patrimônio Inicial` | Inexistente | `number` | `CREATE_NEW` | Patrimônio líquido consolidado no início da competência. | Baixo | Sim: herdar do fechamento anterior | Nova coluna | Ocultar propriedade |
 | `Variação Patrimonial` | Inexistente | `number` | `CREATE_NEW` | Variação absoluta (`Patrimônio Final - Patrimônio Inicial`). | Baixo | Sim: calcular nos fechados | Nova coluna | Ocultar propriedade |
-| `Taxa de Poupança (%)` | Inexistente | `number` | `CREATE_NEW` | Percentual da renda poupado (`(Aportes / Receitas) * 100`). | Baixo | Sim: calcular nos fechados | Nova coluna | Ocultar propriedade |
+| `Taxa de Poupança (%)` | Inexistente | `number` | `CREATE_NEW` | Percentual da renda poupado: `(SUM(savingsGoalContribution) / SUM(BudgetEffect.INCOME)) * 100`. | Baixo | Sim: calcular nos fechados | Nova coluna | Ocultar propriedade |
 | `Fluxo Residual Não Alocado` | Inexistente | `number` | `CREATE_NEW` | Sobra operacional após aportes: `Resultado Operacional - Poupança/Aportes`. | Baixo | Sim: calcular nos fechados | Nova coluna | Ocultar propriedade |
 | `Despesas Essenciais (Necessidades)` | Inexistente | `number` | `CREATE_NEW` | Gastos consolidados de subsistência e necessidades básicas. | Baixo | Sim: totalizar por categoria | Nova coluna | Ocultar propriedade |
 | `Despesas Discricionárias (Desejos)` | Inexistente | `number` | `CREATE_NEW` | Gastos consolidados de estilo de vida e discricionários. | Baixo | Sim: totalizar por categoria | Nova coluna | Ocultar propriedade |
@@ -437,13 +437,13 @@ Todas as divergências onde uma opção física existente no Notion representa o
 * **Data Source ID Real e Validado:** `2a6107e9-4ebb-456f-84f9-dba3bc573d20`
 * **Finalidade:** Auditoria de execuções do worker e telemetria operacional.
 * **Mapeamento Semântico de Status (Sem Alteração Física):** Mapear opções físicas reais via `optionMappings`: `Sucesso` -> `SUCCESS`, `Parcial` -> `PARTIAL_SUCCESS`, `Erro` -> `ERROR`. Bloqueios de concorrência são registrados com status `Erro` e `Código do Erro = CONCURRENCY_LOCKED`. Zero `ALTER_SCHEMA` (`MAP_ALIAS`).
-* **Mapeamento de Fonte (Sem Alteração Física):** Mapear opções físicas reais: `Pierre` -> `PIERRE`, `Manual` -> `MANUAL`, `Migração` -> `MIGRATION`, `Outra` -> `OTHER`. Zero `ALTER_SCHEMA` (`MAP_ALIAS`).
+* **Mapeamento de Fonte (Sem Alteração Física):** Opções físicas reais no Notion: `Pierre` -> `PIERRE`, `Manual` -> `MANUAL`, `Migração` -> `MIGRATION`. Opção `OTHER` mantida apenas como mapeamento de fallback futuro em adapters sem mutação física. Zero `ALTER_SCHEMA` (`MAP_ALIAS`).
 
 | Propriedade | Estado Atual (Notion) | Estado Alvo (Domínio) | Ação | Justificativa Técnica e Mapeamento Semântico | Risco Residual | Backfill Necessário | Impacto em Views | Rollback Seguro |
 | :--- | :--- | :--- | :---: | :--- | :---: | :--- | :--- | :--- |
 | `Execução` | `title` | `title` | `KEEP_AS_IS` | Identificador da execução (`Sync - YYYY-MM-DD HH:mm:ss`). | Baixo | Não | Nenhum | N/A |
 | `Status` | `select` | `select` | `MAP_ALIAS` | Mapeia `Parcial` -> `PARTIAL_SUCCESS`, `Sucesso` -> `SUCCESS`, `Erro` -> `ERROR` via `optionMappings`. Zero mutação física. | Baixo | Não | Nenhum | Reverter adapter |
-| `Fonte` | `select` | `select` (Fonte de Sincronização) | `MAP_ALIAS` | Mapeia opções físicas existentes (`Migração` -> `MIGRATION`, `Pierre` -> `PIERRE`, `Manual` -> `MANUAL`, `Outra` -> `OTHER`). Zero mutação física. | Baixo | Não | Nenhum | Reverter adapter |
+| `Fonte` | `select` | `select` (Fonte de Sincronização) | `MAP_ALIAS` | Mapeia opções físicas existentes (`Pierre` -> `PIERRE`, `Manual` -> `MANUAL`, `Migração` -> `MIGRATION`); `OTHER` reservado em adapter como fallback sem mutação física. Zero mutação física. | Baixo | Não | Nenhum | Reverter adapter |
 | `Transações recebidas` | `number` | `number` | `KEEP_AS_IS` | Métrica de telemetria exata. | Baixo | Não | Nenhum | N/A |
 | `Transações novas` | `number` | `number` | `KEEP_AS_IS` | Métrica de inserções exata. | Baixo | Não | Nenhum | N/A |
 | `Transações atualizadas` | `number` | `number` | `KEEP_AS_IS` | Métrica de mutações exata. | Baixo | Não | Nenhum | N/A |

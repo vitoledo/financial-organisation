@@ -1,7 +1,7 @@
 # Manifesto de Schema-Delta: Notion vs. Modelo de Domínio (Fase 0)
 
 > **Status:** Relatório Técnico de Introspecção e Conformidade de Schema
-> **Data da Verificação:** 2026-09-11T13:43:08.537Z
+> **Data da Verificação:** 2026-09-11T14:08:59.748Z
 > **Notion API Version:** `2026-03-11`
 > **Data Sources Canônicos:** 13 (12 esperados existentes + 1 base proposta)
 
@@ -27,7 +27,7 @@
 | Mapeamento por Alias com Tipo Divergente (RENAME_TYPE_MISMATCH) | 0 |
 | Sugestões Heurísticas Não-Autoritativas (HEURISTIC_SUGGESTION) | 0 |
 | Divergências de Tipo em Nome Exato (TYPE_MISMATCH) | 0 |
-| Propriedades Ausentes em Bases Verificadas (MISSING) | 52 |
+| Propriedades Ausentes em Bases Verificadas (MISSING) | 51 |
 | Propriedades Não Verificadas (UNVERIFIED / UNKNOWN) | 0 |
 | Propriedades a Criar na 13ª Base (PROPOSED_TO_CREATE) | 23 |
 | Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | 34 |
@@ -250,7 +250,6 @@
 | `Teto Mensal Cartão` | `number` | `number` | 🔄 RENAME_CANDIDATE (`Teto pessoal de crédito`) | `USUARIO` | Teto pessoal de compras no cartão (ex: R$ 400) (Mapeado via alias explícito: "Teto pessoal de crédito" com tipo compatível: number) |
 | `Meta de Poupança/Aporte` | `number` | `number` | 🔄 RENAME_CANDIDATE (`Aporte planejado`) | `USUARIO` | Meta de dinheiro a poupar no mês (Mapeado via alias explícito: "Aporte planejado" com tipo compatível: number) |
 | `Meta Taxa de Poupança (%)` | `number` | `number` | 🔄 RENAME_CANDIDATE (`Meta de poupança %`) | `USUARIO` | Percentual alvo da renda líquida destinado a investimentos e reservas (Mapeado via alias explícito: "Meta de poupança %" com tipo compatível: number) |
-| `Metas por Grupo Orçamentário` | `rich_text` | `—` | ⚠️ MISSING | `USUARIO` | Metas percentuais ou tetos nominais por grupo orçamentário configurável |
 | `Receitas Realizadas` | `number` | `—` | ⚠️ MISSING | `DERIVADO` | Soma de transações OPERATING_REVENUE |
 | `Despesas Realizadas` | `number` | `—` | ⚠️ MISSING | `DERIVADO` | Soma de transações OPERATING_EXPENSE |
 | `Poupança Realizada` | `number` | `—` | ⚠️ MISSING | `DERIVADO` | Soma de transações com savingsGoalContribution |
