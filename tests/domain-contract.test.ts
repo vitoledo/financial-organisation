@@ -267,6 +267,38 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     expect(report.results.NOTION_DS_TRANSACTIONS.status).toBe('MISSING_ENV_ID');
   });
 
+  test('classifies properties into EXACT_MATCH, RENAME_CANDIDATE, TYPE_MISMATCH, MISSING, EXTRA_PRESERVE', () => {
+    const validator = new NotionSchemaValidator();
+    const contract = TARGET_CONTRACT.NOTION_DS_CATEGORIES; // expected: Nome da Categoria (title), Grupo 50/30/20 (select), Variabilidade (select), Natureza Padrão (select)
+
+    const actualNotionProps = {
+      'Nome da Categoria': { type: 'title' },           // EXACT_MATCH
+      'Grupo 50/30/20': { type: 'multi_select' },       // TYPE_MISMATCH (expected select)
+      'Variabilidade da Despesa': { type: 'select' },   // RENAME_CANDIDATE (for Variabilidade)
+      // Natureza Padrão is missing                     // MISSING
+      'Cor da Tag': { type: 'select' },                 // EXTRA_PRESERVE
+    };
+
+    const diffs = validator.compareProperties(contract, actualNotionProps);
+
+    const exact = diffs.find((d) => d.notionProperty === 'Nome da Categoria');
+    expect(exact?.status).toBe('EXACT_MATCH');
+
+    const typeMismatch = diffs.find((d) => d.notionProperty === 'Grupo 50/30/20');
+    expect(typeMismatch?.status).toBe('TYPE_MISMATCH');
+
+    const renameCandidate = diffs.find((d) => d.notionProperty === 'Variabilidade');
+    expect(renameCandidate?.status).toBe('RENAME_CANDIDATE');
+    expect(renameCandidate?.candidateName).toBe('Variabilidade da Despesa');
+
+    const missing = diffs.find((d) => d.notionProperty === 'Natureza Padrão');
+    expect(missing?.status).toBe('MISSING');
+
+    const extra = diffs.find((d) => d.notionProperty === 'Cor da Tag');
+    expect(extra?.status).toBe('EXTRA_PRESERVE');
+    expect(extra?.authority).toBe('USUARIO');
+  });
+
   test('generates clean markdown manifest without leaking tokens', async () => {
     const validator = new NotionSchemaValidator();
     const report = await validator.runIntrospection({});
@@ -280,3 +312,4 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     expect(md).not.toContain('Bearer');
   });
 });
+

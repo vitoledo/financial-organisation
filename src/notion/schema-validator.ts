@@ -3,13 +3,21 @@ import path from 'path';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT, DataSourceContract, PropertyContract } from '../domain/schema-contract';
 
+export type PropertyStatus =
+  | 'EXACT_MATCH'
+  | 'RENAME_CANDIDATE'
+  | 'TYPE_MISMATCH'
+  | 'MISSING'
+  | 'EXTRA_PRESERVE';
+
 export interface PropertyDiff {
   notionProperty: string;
   expectedType: string;
   actualType?: string;
-  status: 'MATCH' | 'TYPE_MISMATCH' | 'MISSING' | 'EXTRA';
+  status: PropertyStatus;
   authority: string;
   description: string;
+  candidateName?: string;
 }
 
 export interface DataSourceDiff {
@@ -172,24 +180,67 @@ export class NotionSchemaValidator {
     return response.properties ?? {};
   }
 
-  private compareProperties(
+  public compareProperties(
     contract: DataSourceContract,
     actual: Record<string, { type: string }>,
   ): PropertyDiff[] {
     const diffs: PropertyDiff[] = [];
-    const expectedByName = new Map<string, PropertyContract>();
+    const consumedActualKeys = new Set<string>();
 
-    for (const p of contract.properties) {
-      expectedByName.set(p.notionProperty.toLowerCase(), p);
-    }
+    // 1. Pass 1: Exact matches (case-insensitive & trimmed)
+    const unmatchedExpected: PropertyContract[] = [];
 
-    // Check expected properties
     for (const expected of contract.properties) {
       const matchKey = Object.keys(actual).find(
-        (k) => k.trim().toLowerCase() === expected.notionProperty.toLowerCase(),
+        (k) => !consumedActualKeys.has(k) && k.trim().toLowerCase() === expected.notionProperty.trim().toLowerCase(),
       );
 
-      if (!matchKey) {
+      if (matchKey) {
+        consumedActualKeys.add(matchKey);
+        const actualType = actual[matchKey].type;
+        const isTypeMatch = actualType === expected.notionType;
+
+        diffs.push({
+          notionProperty: matchKey,
+          expectedType: expected.notionType,
+          actualType,
+          status: isTypeMatch ? 'EXACT_MATCH' : 'TYPE_MISMATCH',
+          authority: expected.authority,
+          description: expected.description,
+        });
+      } else {
+        unmatchedExpected.push(expected);
+      }
+    }
+
+    // 2. Pass 2: Rename candidates for unmatched expected properties
+    for (const expected of unmatchedExpected) {
+      let bestMatchKey: string | undefined;
+      let bestSimilarity = 0;
+
+      for (const actualKey of Object.keys(actual)) {
+        if (consumedActualKeys.has(actualKey)) continue;
+
+        const sim = calculateSimilarity(expected.notionProperty, actualKey);
+        if (sim >= 0.55 && sim > bestSimilarity) {
+          bestSimilarity = sim;
+          bestMatchKey = actualKey;
+        }
+      }
+
+      if (bestMatchKey) {
+        consumedActualKeys.add(bestMatchKey);
+        const actualType = actual[bestMatchKey].type;
+        diffs.push({
+          notionProperty: expected.notionProperty,
+          expectedType: expected.notionType,
+          actualType,
+          status: 'RENAME_CANDIDATE',
+          candidateName: bestMatchKey,
+          authority: expected.authority,
+          description: `${expected.description} (Candidato existente no Notion: "${bestMatchKey}")`,
+        });
+      } else {
         diffs.push({
           notionProperty: expected.notionProperty,
           expectedType: expected.notionType,
@@ -197,32 +248,19 @@ export class NotionSchemaValidator {
           authority: expected.authority,
           description: expected.description,
         });
-      } else {
-        const actualType = actual[matchKey].type;
-        const isTypeMatch = actualType === expected.notionType;
-
-        diffs.push({
-          notionProperty: matchKey, // Actual casing from Notion
-          expectedType: expected.notionType,
-          actualType,
-          status: isTypeMatch ? 'MATCH' : 'TYPE_MISMATCH',
-          authority: expected.authority,
-          description: expected.description,
-        });
       }
     }
 
-    // Check extra properties present in Notion but not in contract
+    // 3. Pass 3: All remaining properties in Notion are EXTRA_PRESERVE
     for (const [actualKey, actualProp] of Object.entries(actual)) {
-      const isExpected = Object.keys(expectedByName).includes(actualKey.trim().toLowerCase());
-      if (!isExpected) {
+      if (!consumedActualKeys.has(actualKey)) {
         diffs.push({
           notionProperty: actualKey,
           expectedType: '—',
           actualType: actualProp.type,
-          status: 'EXTRA',
+          status: 'EXTRA_PRESERVE',
           authority: 'USUARIO',
-          description: 'Propriedade personalizada existente no Notion (será preservada)',
+          description: 'Propriedade existente no Notion (preservada integralmente)',
         });
       }
     }
@@ -253,6 +291,19 @@ export class NotionSchemaValidator {
     lines.push(`| Total de Data Sources Canônicos | ${report.totalDataSources} |`);
     lines.push(`| Bases Existentes Inspecionadas | ${report.existingInspected} |`);
     lines.push(`| Bases com ID Configurado no Ambiente | ${report.configuredCount} |`);
+
+    const allProps = Object.values(report.results).flatMap((r) => r.properties);
+    const totalExact = allProps.filter((p) => p.status === 'EXACT_MATCH').length;
+    const totalRename = allProps.filter((p) => p.status === 'RENAME_CANDIDATE').length;
+    const totalTypeMismatch = allProps.filter((p) => p.status === 'TYPE_MISMATCH').length;
+    const totalMissing = allProps.filter((p) => p.status === 'MISSING').length;
+    const totalExtra = allProps.filter((p) => p.status === 'EXTRA_PRESERVE').length;
+
+    lines.push(`| Propriedades com Correspondência Exata (EXACT_MATCH) | ${totalExact} |`);
+    lines.push(`| Candidatos a Renomeação (RENAME_CANDIDATE) | ${totalRename} |`);
+    lines.push(`| Divergências de Tipo (TYPE_MISMATCH) | ${totalTypeMismatch} |`);
+    lines.push(`| Propriedades Ausentes no Notion (MISSING) | ${totalMissing} |`);
+    lines.push(`| Propriedades Adicionais Preservadas (EXTRA_PRESERVE) | ${totalExtra} |`);
     lines.push('');
 
     // Check environment status
@@ -288,14 +339,24 @@ export class NotionSchemaValidator {
       lines.push('| :--- | :--- | :--- | :--- | :--- | :--- |');
 
       for (const p of diff.properties) {
-        const statusBadge =
-          p.status === 'MATCH'
-            ? '✅ OK'
-            : p.status === 'TYPE_MISMATCH'
-              ? '❌ TIPO DIVERGENTE'
-              : p.status === 'MISSING'
-                ? '⚠️ AUSENTE'
-                : 'ℹ️ EXTRA (PRESERVADA)';
+        let statusBadge = '';
+        switch (p.status) {
+          case 'EXACT_MATCH':
+            statusBadge = '✅ EXACT_MATCH';
+            break;
+          case 'RENAME_CANDIDATE':
+            statusBadge = `🔄 RENAME_CANDIDATE (\`${p.candidateName}\`)`;
+            break;
+          case 'TYPE_MISMATCH':
+            statusBadge = `❌ TYPE_MISMATCH (esperado: ${p.expectedType}, no Notion: ${p.actualType})`;
+            break;
+          case 'MISSING':
+            statusBadge = '⚠️ MISSING';
+            break;
+          case 'EXTRA_PRESERVE':
+            statusBadge = '🛡️ EXTRA_PRESERVE';
+            break;
+        }
 
         lines.push(
           `| \`${p.notionProperty}\` | \`${p.expectedType}\` | \`${p.actualType ?? '—'}\` | ${statusBadge} | \`${p.authority}\` | ${p.description} |`,
@@ -331,8 +392,9 @@ export class NotionSchemaValidator {
     lines.push('');
     lines.push('1. Para cada base com status `MISSING_ENV_ID`, copie o Data Source ID correspondente no Notion para o `.env`.');
     lines.push('2. Crie a 13ª base **Faturas / Ciclos de Cartão** no Notion seguindo as propriedades listadas na Seção 3.');
-    lines.push('3. Nas bases existentes, revise as propriedades marcadas como `⚠️ AUSENTE` ou `❌ TIPO DIVERGENTE` e adicione/ajuste-as.');
-    lines.push('4. Execute novamente `pnpm notion:check-schema` para validar que todos os status convergiram para `✅ OK`.');
+    lines.push('3. Nas bases existentes, revise as propriedades marcadas como `⚠️ MISSING`, `❌ TYPE_MISMATCH` ou `🔄 RENAME_CANDIDATE` e adicione/ajuste-as.');
+    lines.push('4. Propriedades marcadas como `🛡️ EXTRA_PRESERVE` são mantidas integralmente no Notion.');
+    lines.push('5. Execute novamente `pnpm notion:check-schema` para validar que todos os status convergiram para `✅ EXACT_MATCH`.');
     lines.push('');
 
     return lines.join('\n');
@@ -344,6 +406,44 @@ export class NotionSchemaValidator {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(targetPath, md, 'utf8');
   }
+}
+
+function normalizePropName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove diacritics
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');      // remove spaces and punctuation
+}
+
+function calculateSimilarity(str1: string, str2: string): number {
+  const norm1 = normalizePropName(str1);
+  const norm2 = normalizePropName(str2);
+  if (norm1 === norm2) return 1.0;
+  if (norm1.includes(norm2) || norm2.includes(norm1)) {
+    const minLen = Math.min(norm1.length, norm2.length);
+    const maxLen = Math.max(norm1.length, norm2.length);
+    return minLen / maxLen;
+  }
+  const m = norm1.length;
+  const n = norm2.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = norm1[i - 1] === norm2[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost,
+      );
+    }
+  }
+
+  const maxLen = Math.max(m, n);
+  return maxLen === 0 ? 1 : 1 - dp[m][n] / maxLen;
 }
 
 function maskId(id: string): string {
