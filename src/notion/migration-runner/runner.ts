@@ -7,6 +7,8 @@ import { NotionSchemaValidator } from '../schema-validator';
 import {
   CompleteMigrationPlan,
   DryRunReport,
+  ApplyReport,
+  MigrationReport,
   InputFingerprint,
   MigrationReadiness,
   WorktreeStatus,
@@ -494,9 +496,33 @@ export class MigrationRunner {
   }
 
   /**
+   * Resolves whether physical schema mutations (apply) are operationally authorized.
+   * Strictly FALSE unless:
+   * 1. mode === 'apply'
+   * 2. NOTION_SCHEMA_APPLY_ENABLED === 'I_UNDERSTAND_SCHEMA_ONLY'
+   * 3. NOTION_SCHEMA_APPLY_PLAN_HASH === providedPlanHash
+   */
+  public resolveAllowRealMutations(providedPlanHash?: string): boolean {
+    if (this.mode !== 'apply') {
+      return false;
+    }
+
+    const token = this.envVars.NOTION_SCHEMA_APPLY_ENABLED?.trim();
+    const planHashConfirmation = this.envVars.NOTION_SCHEMA_APPLY_PLAN_HASH?.trim();
+
+    const isTokenValid = token === 'I_UNDERSTAND_SCHEMA_ONLY';
+    const isHashValid =
+      Boolean(providedPlanHash) &&
+      Boolean(planHashConfirmation) &&
+      planHashConfirmation === providedPlanHash;
+
+    return isTokenValid && isHashValid;
+  }
+
+  /**
    * Execution dispatcher.
    */
-  public async execute(providedPlanHash?: string): Promise<DryRunReport> {
+  public async execute(providedPlanHash?: string): Promise<MigrationReport> {
     if (this.mode === 'dry-run') {
       return this.runDryRun();
     }
@@ -538,25 +564,33 @@ export class MigrationRunner {
         dryRunResult.readiness.gitBranch ?? 'unknown',
       );
 
+      const allowRealMutations = this.resolveAllowRealMutations(providedPlanHash);
+
       const executor = new SchemaApplyExecutor({
         client: this.client,
         journal: this.journal,
         plan: dryRunResult.plan,
         envVars: this.envVars,
         parentPageId: dryRunResult.preflight.parentPage.pageId,
-        allowRealMutations: false,
+        allowRealMutations,
       });
 
       const runId = `run_${Date.now()}`;
-      await executor.executeDdlPlan(
+      const summary = await executor.executeDdlPlan(
         runId,
         dryRunResult.readiness.gitCommitSha ?? 'unknown',
         dryRunResult.readiness.gitBranch ?? 'unknown',
       );
 
-      throw new Error(
-        'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
-      );
+      return {
+        mode: 'apply',
+        timestamp: new Date().toISOString(),
+        planHash: providedPlanHash,
+        runId,
+        summary,
+        mutationsExecuted: summary.verifiedCount,
+        plan: dryRunResult.plan,
+      };
     } else {
       // -----------------------------------------------------------------------
       // RESUME_APPLY: Carrega plano imutável do SQLite e valida contra baseline + passos do journal
@@ -711,6 +745,58 @@ export class MigrationRunner {
               completedStepNumbers.add(frontierStep.stepNumber);
             }
           }
+        } else if (frontierStep.operation === 'CREATE_DATABASE') {
+          const dbId = this.journal.getCreatedDatabaseId(providedPlanHash);
+          if (dbId && this.client) {
+            try {
+              const db = await this.client.databases.retrieve({ database_id: dbId });
+              const verif = StepStructuralVerifier.verifyDatabase(db, plan.inputFingerprint.parentPageId, providedPlanHash);
+              if (verif.valid) {
+                this.journal.recordStepNoOp(providedPlanHash, frontierStep.stepNumber, {
+                  operation: frontierStep.operation,
+                  targetDataSource: frontierStep.targetDataSource.name,
+                  existingId: dbId,
+                  metadata: {
+                    recoveryReason: 'RECOVERED_AFTER_UNCERTAIN_WRITE',
+                    recoveredFromUncertainWrite: true,
+                  },
+                });
+                completedStepNumbers.add(frontierStep.stepNumber);
+              }
+            } catch {
+              // Ignore retrieve failure
+            }
+          }
+        } else if (frontierStep.operation === 'RESOLVE_DATA_SOURCE_ID') {
+          const dbId = this.journal.getCreatedDatabaseId(providedPlanHash);
+          if (dbId && this.client) {
+            try {
+              const db = (await this.client.databases.retrieve({ database_id: dbId })) as any;
+              const verif = StepStructuralVerifier.verifyResolveDataSource(db);
+              if (verif.valid && verif.dataSourceId) {
+                const billsDs = (await this.client.dataSources.retrieve({ data_source_id: verif.dataSourceId })) as any;
+                const createDbStep = plan.schemaPlan.steps.find((s) => s.operation === 'CREATE_DATABASE');
+                const initialProps = createDbStep?.sanitizedPayload?.initial_data_source?.properties || {};
+                const propsVerif = StepStructuralVerifier.verifyCardBillsInitialProperties(billsDs, initialProps, {
+                  allowSyncedDualRelation: true,
+                });
+                if (propsVerif.valid) {
+                  this.journal.recordStepNoOp(providedPlanHash, frontierStep.stepNumber, {
+                    operation: frontierStep.operation,
+                    targetDataSource: frontierStep.targetDataSource.name,
+                    existingId: verif.dataSourceId,
+                    metadata: {
+                      recoveryReason: 'RECOVERED_AFTER_UNCERTAIN_WRITE',
+                      recoveredFromUncertainWrite: true,
+                    },
+                  });
+                  completedStepNumbers.add(frontierStep.stepNumber);
+                }
+              }
+            } catch {
+              // Ignore retrieve failure
+            }
+          }
         }
       }
 
@@ -821,32 +907,59 @@ export class MigrationRunner {
       // Create pre-resume safety backup
       await this.backupManager.createEncryptedBackup();
 
+      const allowRealMutations = this.resolveAllowRealMutations(providedPlanHash);
+
       const executor = new SchemaApplyExecutor({
         client: this.client,
         journal: this.journal,
         plan,
         envVars: this.envVars,
         parentPageId: plan.inputFingerprint.parentPageId,
-        allowRealMutations: false,
+        allowRealMutations,
       });
 
       const runId = `resume_${Date.now()}`;
-      await executor.executeDdlPlan(
+      const summary = await executor.executeDdlPlan(
         runId,
         gitState.commitSha ?? 'unknown',
         gitState.branch ?? 'unknown',
       );
 
-      throw new Error(
-        'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
-      );
+      return {
+        mode: 'apply',
+        timestamp: new Date().toISOString(),
+        planHash: providedPlanHash,
+        runId,
+        summary,
+        mutationsExecuted: summary.verifiedCount,
+        plan,
+      };
     }
   }
 
   /**
-   * Formats a comprehensive dry-run report for terminal display.
+   * Formats a comprehensive dry-run or apply report for terminal display.
    */
-  public formatReport(report: DryRunReport): string {
+  public formatReport(report: MigrationReport): string {
+    if (report.mode === 'apply') {
+      const lines: string[] = [];
+      lines.push('═══════════════════════════════════════════════════════════════════════════════');
+      lines.push('  RELATÓRIO DO NOTION MIGRATION RUNNER — SCHEMA APPLY EXECUTOR');
+      lines.push('═══════════════════════════════════════════════════════════════════════════════\n');
+      lines.push(`Modo de Execução: APPLY`);
+      lines.push(`Timestamp: ${report.timestamp}`);
+      lines.push(`Run ID: ${report.runId}`);
+      lines.push(`Plan Hash: ${report.planHash}`);
+      lines.push(`Total de Passos: ${report.summary.totalSteps}`);
+      lines.push(`Passos Verificados (VERIFIED): ${report.summary.verifiedCount}`);
+      lines.push(`Passos Idempotentes (NO_OP_VERIFIED): ${report.summary.noOpCount}`);
+      lines.push(`Mutations Executadas no Notion: ${report.mutationsExecuted}`);
+      lines.push('\n═══════════════════════════════════════════════════════════════════════════════');
+      lines.push('  EXECUÇÃO DDL CONCLUÍDA COM SUCESSO NO NOTION');
+      lines.push('═══════════════════════════════════════════════════════════════════════════════');
+      return lines.join('\n');
+    }
+
     const lines: string[] = [];
     lines.push('═══════════════════════════════════════════════════════════════════════════════');
     lines.push('  RELATÓRIO DO NOTION MIGRATION RUNNER — DRY-RUN (READ-ONLY)');

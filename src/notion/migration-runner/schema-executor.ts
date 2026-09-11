@@ -2,6 +2,7 @@ import { Client } from '@notionhq/client';
 import { CompleteMigrationPlan, DdlApplyExecutionSummary, DdlStepExecutionResult, MigrationStep } from './types';
 import { MigrationJournal } from './journal';
 import { StepStructuralVerifier } from './step-verifier';
+import { SchemaPlanner } from './schema-planner';
 
 export interface SchemaApplyExecutorOptions {
   client: Client;
@@ -151,6 +152,23 @@ export class SchemaApplyExecutor {
     }
   }
 
+  private getExpectedCardBillsInitialProperties(): Record<string, any> {
+    const createDbStep = this.plan.schemaPlan.steps.find((s) => s.operation === 'CREATE_DATABASE');
+    const properties = createDbStep?.sanitizedPayload?.initial_data_source?.properties;
+    if (properties && typeof properties === 'object') {
+      return properties;
+    }
+    // Fallback to generating from schema planner if step 52 is not in this specific sub-plan/test
+    const planner = new SchemaPlanner({ envVars: this.envVars });
+    const fullPlan = planner.generatePlan();
+    const fullCreateDbStep = fullPlan.steps.find((s: any) => s.operation === 'CREATE_DATABASE');
+    const fallbackProperties = fullCreateDbStep?.sanitizedPayload?.initial_data_source?.properties;
+    if (fallbackProperties && typeof fallbackProperties === 'object') {
+      return fallbackProperties;
+    }
+    throw new Error('CONFIG_ERROR: initial_data_source.properties não encontrado no passo CREATE_DATABASE do plano.');
+  }
+
   /**
    * Re-verifies live postcondition for a step already recorded as completed.
    * Utilizes unified StepStructuralVerifier to ensure zero regression.
@@ -162,10 +180,14 @@ export class SchemaApplyExecutor {
     try {
       if (step.operation === 'CREATE_PROPERTY') {
         const dsId = step.targetDataSource.id;
+        const propName = step.property!;
         if (!dsId) return false;
+
         const ds = (await this.client.dataSources.retrieve({ data_source_id: dsId })) as any;
-        const prop = ds?.properties?.[step.property!];
-        const verif = StepStructuralVerifier.verifyCreateProperty(prop, step.sanitizedPayload, step.property!);
+        const prop = ds?.properties?.[propName];
+        if (!prop) return false;
+
+        const verif = StepStructuralVerifier.verifyCreateProperty(prop, step.sanitizedPayload, propName);
         if (!verif.valid || !verif.isCompatible) {
           this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
           return false;
@@ -200,13 +222,40 @@ export class SchemaApplyExecutor {
 
       if (step.operation === 'RESOLVE_DATA_SOURCE_ID') {
         const dbId = this.journal.getCreatedDatabaseId(this.plan.planHash);
-        if (!dbId) return false;
+        if (!dbId || !resolvedCardBillsDsId) return false;
         const db = (await this.client.databases.retrieve({ database_id: dbId })) as any;
         const verif = StepStructuralVerifier.verifyResolveDataSource(db);
         if (!verif.valid || verif.dataSourceId !== resolvedCardBillsDsId) {
           this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
           return false;
         }
+
+        // Validate initial properties
+        try {
+          const billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedCardBillsDsId })) as any;
+          const initialProps = this.getExpectedCardBillsInitialProperties();
+          const propsVerif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+            billsDs,
+            initialProps,
+            { allowSyncedDualRelation: true },
+          );
+          if (!propsVerif.valid) {
+            this.journal.recordRevalidationFailed(
+              this.plan.planHash,
+              step.stepNumber,
+              propsVerif.detail ?? 'Revalidação de propriedades iniciais falhou',
+            );
+            return false;
+          }
+        } catch (readErr: any) {
+          this.journal.recordRevalidationFailed(
+            this.plan.planHash,
+            step.stepNumber,
+            `Falha na leitura do data source: ${readErr?.message || String(readErr)}`,
+          );
+          return false;
+        }
+
         return true;
       }
 
@@ -231,6 +280,23 @@ export class SchemaApplyExecutor {
           this.journal.recordRevalidationFailed(this.plan.planHash, step.stepNumber, verif.detail ?? 'Revalidação falhou');
           return false;
         }
+
+        // Final verification of complete Faturas database schema (all 23 properties)
+        const initialProps = this.getExpectedCardBillsInitialProperties();
+        const finalVerif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+          billsDs,
+          initialProps,
+          dsId,
+        );
+        if (!finalVerif.valid) {
+          this.journal.recordRevalidationFailed(
+            this.plan.planHash,
+            step.stepNumber,
+            finalVerif.detail ?? 'Revalidação de schema final de Faturas falhou',
+          );
+          return false;
+        }
+
         return true;
       }
 
@@ -625,10 +691,34 @@ export class SchemaApplyExecutor {
     }
 
     const resolvedDsId = verif.dataSourceId;
+
+    // Hardened Step 53: Retrieve Data Source and structurally validate ALL initial properties from CREATE_DATABASE
+    let billsDs: any;
+    try {
+      billsDs = (await this.client.dataSources.retrieve({ data_source_id: resolvedDsId })) as any;
+    } catch (readErr: any) {
+      const err = `RESOLVE_DATA_SOURCE_FAILED: Falha na leitura obrigatória do Data Source '${resolvedDsId}' para validação estrutural inicial: ${readErr?.message || String(readErr)}`;
+      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+      throw new Error(err);
+    }
+
+    const initialProps = this.getExpectedCardBillsInitialProperties();
+    const propsVerif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+      billsDs,
+      initialProps,
+    );
+
+    if (!propsVerif.valid) {
+      const err = `POSTCONDITION_FAILED: Validação estrutural de propriedades iniciais falhou no Step 53 [${propsVerif.reason}]: ${propsVerif.detail}`;
+      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+      throw new Error(err);
+    }
+
     this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, resolvedDsId, {
       databaseId: dbId,
       resolvedDataSourceId: resolvedDsId,
       totalDataSources: db.data_sources.length,
+      validatedInitialPropertiesCount: Object.keys(initialProps).length,
     });
 
     return {
@@ -637,7 +727,7 @@ export class SchemaApplyExecutor {
       status: 'VERIFIED',
       targetDataSource: step.targetDataSource.name,
       createdId: resolvedDsId,
-      detail: `Data Source ID resolvido com sucesso via GET /v1/databases/${dbId}: ${resolvedDsId}`,
+      detail: `Data Source ID resolvido com sucesso via GET /v1/databases/${dbId}: ${resolvedDsId} e ${Object.keys(initialProps).length} propriedades iniciais validadas estruturalmente.`,
       durationMs: Date.now() - startTime,
     };
   }
@@ -678,6 +768,19 @@ export class SchemaApplyExecutor {
       );
 
       if (verif.valid) {
+        // Final verification of complete Faturas database schema (all 23 properties)
+        const initialProps = this.getExpectedCardBillsInitialProperties();
+        const finalVerif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+          billsDs,
+          initialProps,
+          transactionsDsId,
+        );
+        if (!finalVerif.valid) {
+          const err = `POSTCONDITION_FAILED: Verificação final da base Faturas falhou pós-Step 54 (NO_OP) [${finalVerif.reason}]: ${finalVerif.detail}`;
+          this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+          throw new Error(err);
+        }
+
         this.journal.recordStepNoOp(this.plan.planHash, step.stepNumber, {
           operation: step.operation,
           targetDataSource: step.targetDataSource.name,
@@ -694,7 +797,7 @@ export class SchemaApplyExecutor {
           targetDataSource: step.targetDataSource.name,
           property: 'Fatura Vinculada',
           createdId: existingRelProp.id,
-          detail: `Dual relation 'Fatura Vinculada' já existe exatamente vinculada a '${resolvedCardBillsDsId}'. Registrado como NO_OP_VERIFIED.`,
+          detail: `Dual relation 'Fatura Vinculada' já existe exatamente vinculada a '${resolvedCardBillsDsId}' e schema final de 23 propriedades confirmado. Registrado como NO_OP_VERIFIED.`,
           durationMs: Date.now() - startTime,
         };
       }
@@ -749,6 +852,20 @@ export class SchemaApplyExecutor {
       throw new Error(err);
     }
 
+    // Final verification of complete Faturas database schema (initial properties + dual relation = exactly 23 properties)
+    const initialProps = this.getExpectedCardBillsInitialProperties();
+    const finalVerif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+      verifiedBillsDs,
+      initialProps,
+      transactionsDsId,
+    );
+
+    if (!finalVerif.valid) {
+      const err = `POSTCONDITION_FAILED: Verificação final da base Faturas falhou pós-Step 54 [${finalVerif.reason}]: ${finalVerif.detail}`;
+      this.journal.recordStepFailed(this.plan.planHash, step.stepNumber, err);
+      throw new Error(err);
+    }
+
     const createdRel = verifiedTxDs.properties?.['Fatura Vinculada'];
     this.journal.recordStepVerified(this.plan.planHash, step.stepNumber, createdRel?.id, {
       relationTarget: resolvedCardBillsDsId,
@@ -762,7 +879,7 @@ export class SchemaApplyExecutor {
       targetDataSource: step.targetDataSource.name,
       property: 'Fatura Vinculada',
       createdId: createdRel?.id,
-      detail: `Dual relation 'Fatura Vinculada' criada com sucesso e sincronizada com 'Lançamentos do Ciclo' (ID: ${createdRel?.id}).`,
+      detail: `Dual relation 'Fatura Vinculada' criada com sucesso, sincronizada com 'Lançamentos do Ciclo' e schema final de 23 propriedades confirmado (ID: ${createdRel?.id}).`,
       durationMs: Date.now() - startTime,
     };
   }

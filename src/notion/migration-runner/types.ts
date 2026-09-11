@@ -176,6 +176,18 @@ export interface DryRunReport {
   mutationsExecuted: 0;
 }
 
+export interface ApplyReport {
+  mode: 'apply';
+  timestamp: string;
+  planHash: string;
+  runId: string;
+  summary: DdlApplyExecutionSummary;
+  mutationsExecuted: number;
+  plan: CompleteMigrationPlan;
+}
+
+export type MigrationReport = DryRunReport | ApplyReport;
+
 export type JournalStepStatus =
   | 'PENDING'
   | 'APPLIED'

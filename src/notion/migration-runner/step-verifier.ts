@@ -1,4 +1,5 @@
 import { MigrationStep } from './types';
+import { TARGET_CONTRACT } from '../../domain/schema-contract';
 
 export interface VerificationResult {
   valid: boolean;
@@ -429,6 +430,164 @@ export class StepStructuralVerifier {
         valid: false,
         reason: 'BILLS_SYNC_PROPERTY_NAME_MISMATCH',
         detail: `'Lançamentos do Ciclo' sincroniza com '${billsSyncName || 'ausente'}', esperado 'Fatura Vinculada'`,
+      };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Verifies all initial properties of Faturas / Ciclos de Cartão after resolving its data_source_id in Step 53.
+   * Compares each property from CREATE_DATABASE.initial_data_source.properties:
+   * - presence of each expected initial property
+   * - structural verification (type, number format, select options, relation targets) via verifyCreateProperty
+   * - rejection of unexpected extra properties (unless allowSyncedDualRelation is true and prop is 'Lançamentos do Ciclo')
+   */
+  public static verifyCardBillsInitialProperties(
+    billsDs: any,
+    expectedInitialProperties: Record<string, any>,
+    options: { allowSyncedDualRelation?: boolean } = {},
+  ): VerificationResult {
+    if (!billsDs || !billsDs.properties || typeof billsDs.properties !== 'object') {
+      return {
+        valid: false,
+        reason: 'DATA_SOURCE_MISSING_OR_EMPTY',
+        detail: 'Data Source Faturas não encontrado ou sem propriedades retornadas na API.',
+      };
+    }
+
+    const actualProps = billsDs.properties;
+    const cardBillsContract = TARGET_CONTRACT.NOTION_DS_CARD_BILLS;
+    const propContractMap = new Map(cardBillsContract.properties.map((p) => [p.notionProperty, p]));
+
+    // 1. Verify every expected initial property
+    for (const [propName, propPayload] of Object.entries(expectedInitialProperties)) {
+      const actualProp = actualProps[propName];
+      if (!actualProp) {
+        return {
+          valid: false,
+          reason: 'INITIAL_PROPERTY_MISSING',
+          detail: `Propriedade inicial obrigatória '${propName}' ausente no Data Source Faturas`,
+        };
+      }
+
+      const propContract = propContractMap.get(propName);
+      const verif = this.verifyCreateProperty(
+        actualProp,
+        { [propName]: propPayload },
+        propName,
+        { allowExtraOptions: propContract?.allowExtraOptions },
+      );
+
+      if (!verif.valid || !verif.isCompatible) {
+        return {
+          valid: false,
+          reason: verif.reason,
+          detail: `Propriedade inicial '${propName}' inválida: ${verif.detail}`,
+        };
+      }
+    }
+
+    // 2. Reject unexpected extra properties in the new database
+    for (const actualPropName of Object.keys(actualProps)) {
+      if (expectedInitialProperties[actualPropName]) {
+        continue;
+      }
+      if (actualPropName === 'Lançamentos do Ciclo' && options.allowSyncedDualRelation) {
+        continue;
+      }
+      return {
+        valid: false,
+        reason: 'UNEXPECTED_PROPERTY',
+        detail: `Propriedade extra inesperada '${actualPropName}' encontrada na base Faturas`,
+      };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Final verification of the complete Faturas / Ciclos de Cartão database schema after Step 54.
+   * Total properties must be exactly 23 (22 initial + 'Lançamentos do Ciclo').
+   * Verifies initial properties + verifies 'Lançamentos do Ciclo' dual relation on Faturas side.
+   */
+  public static verifyCardBillsFinalSchema(
+    billsDs: any,
+    expectedInitialProperties: Record<string, any>,
+    expectedTransactionsDsId: string,
+  ): VerificationResult {
+    if (!billsDs || !billsDs.properties || typeof billsDs.properties !== 'object') {
+      return {
+        valid: false,
+        reason: 'DATA_SOURCE_MISSING_OR_EMPTY',
+        detail: 'Data Source Faturas não encontrado ou sem propriedades retornadas na API.',
+      };
+    }
+
+    const actualProps = billsDs.properties;
+    const actualKeys = Object.keys(actualProps);
+
+    // 1. Verify initial properties (allowing the dual relation property)
+    const initialCheck = this.verifyCardBillsInitialProperties(
+      billsDs,
+      expectedInitialProperties,
+      { allowSyncedDualRelation: true },
+    );
+    if (!initialCheck.valid) {
+      return initialCheck;
+    }
+
+    // 2. Verify 'Lançamentos do Ciclo' relation on Faturas side
+    const cycleProp = actualProps['Lançamentos do Ciclo'];
+    if (!cycleProp) {
+      return {
+        valid: false,
+        reason: 'SYNCED_DUAL_RELATION_MISSING',
+        detail: "Propriedade dual sincronizada 'Lançamentos do Ciclo' ausente na base Faturas pós-Step 54",
+      };
+    }
+
+    if (cycleProp.type !== 'relation') {
+      return {
+        valid: false,
+        reason: 'SYNCED_DUAL_RELATION_TYPE_MISMATCH',
+        detail: `'Lançamentos do Ciclo' possui tipo '${cycleProp.type}', esperado 'relation'`,
+      };
+    }
+
+    const relTarget = cycleProp.relation?.data_source_id || cycleProp.relationDataSourceId;
+    if (!relTarget || relTarget !== expectedTransactionsDsId) {
+      return {
+        valid: false,
+        reason: 'RELATION_TARGET_MISMATCH',
+        detail: `'Lançamentos do Ciclo' aponta para '${relTarget || 'ausente'}', esperado Transações (${expectedTransactionsDsId})`,
+      };
+    }
+
+    const relType = cycleProp.relation?.type || cycleProp.relationType;
+    if (!relType || relType !== 'dual_property') {
+      return {
+        valid: false,
+        reason: 'RELATION_TYPE_MISMATCH',
+        detail: `'Lançamentos do Ciclo' possui tipo de relation '${relType || 'ausente'}', esperado 'dual_property'`,
+      };
+    }
+
+    const syncName = cycleProp.relation?.dual_property?.synced_property_name || cycleProp.syncedPropertyName;
+    if (syncName !== 'Fatura Vinculada') {
+      return {
+        valid: false,
+        reason: 'SYNC_PROPERTY_NAME_MISMATCH',
+        detail: `'Lançamentos do Ciclo' sincroniza com '${syncName || 'ausente'}', esperado 'Fatura Vinculada'`,
+      };
+    }
+
+    // 3. Exact count check: exactly 23 properties
+    if (actualKeys.length !== 23) {
+      return {
+        valid: false,
+        reason: 'PROPERTY_COUNT_MISMATCH',
+        detail: `Base Faturas possui ${actualKeys.length} propriedades, esperado exatamente 23 conforme contrato homologado.`,
       };
     }
 

@@ -845,6 +845,221 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
     });
   });
 
+  function createMockCardBillsProperties(options: {
+    includeDualRelation?: boolean;
+    overrideProps?: Record<string, any>;
+    omitProps?: string[];
+    extraProps?: Record<string, any>;
+  } = {}) {
+    const base: Record<string, any> = {
+      'Fatura / Ciclo': { id: 'p_title', type: 'title', title: {} },
+      'Fonte': { id: 'p_fonte', type: 'select', select: { options: [{ name: 'Pierre' }, { name: 'Manual' }, { name: 'Migração' }, { name: 'Outra' }] } },
+      'ID da Fatura na Fonte': { id: 'p_src_id', type: 'rich_text', rich_text: {} },
+      'ID Estável da Fatura': { id: 'p_stable_id', type: 'rich_text', rich_text: {} },
+      'Qualidade da Identidade': { id: 'p_ident_qual', type: 'select', select: { options: [{ name: 'SOURCE_ID' }, { name: 'PERIOD_FALLBACK' }] } },
+      'Cartão Vinculado': { id: 'p_card', type: 'relation', relation: { data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_ACCOUNTS, type: 'single_property' } },
+      'Moeda': { id: 'p_curr', type: 'select', select: { options: [{ name: 'BRL' }, { name: 'USD' }, { name: 'EUR' }] } },
+      'Início do Período': { id: 'p_start', type: 'date', date: {} },
+      'Fim do Período': { id: 'p_end', type: 'date', date: {} },
+      'Data de Fechamento': { id: 'p_close', type: 'date', date: {} },
+      'Data de Vencimento': { id: 'p_due', type: 'date', date: {} },
+      'Tipo de Ciclo': { id: 'p_cycle_type', type: 'select', select: { options: [{ name: 'Ciclo Real Banco' }, { name: 'Ciclo Configurado' }, { name: 'Ciclo Estimado' }] } },
+      'Origem / Qualidade dos Dados': { id: 'p_val_qual', type: 'select', select: { options: [{ name: 'UPSTREAM_OFFICIAL' }, { name: 'UPSTREAM_APPROXIMATE' }, { name: 'DERIVED' }, { name: 'MANUAL' }] } },
+      'Status da Fatura': { id: 'p_status', type: 'select', select: { options: [{ name: 'Aberta em Curso' }, { name: 'Fechada a Vencer' }, { name: 'Vencida' }, { name: 'Paga Integralmente' }, { name: 'Paga Parcialmente' }] } },
+      'Valor da Fatura Fechada (Oficial)': { id: 'p_val_ofic', type: 'number', number: { format: 'real' } },
+      'Valor Estimado da Fatura Aberta': { id: 'p_val_est', type: 'number', number: { format: 'real' } },
+      'Total de Compras no Ciclo': { id: 'p_tot_comp', type: 'number', number: { format: 'real' } },
+      'Componentes Adicionais da Fatura': { id: 'p_comp_adic', type: 'number', number: { format: 'real' } },
+      'Divergência Não Explicada': { id: 'p_div_nao_exp', type: 'number', number: { format: 'real' } },
+      'Valor Pago': { id: 'p_val_pago', type: 'number', number: { format: 'real' } },
+      'Data de Liquidação': { id: 'p_data_liq', type: 'date', date: {} },
+      'Transações de Pagamento': { id: 'p_tx_pag', type: 'relation', relation: { data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS, type: 'single_property' } },
+    };
+
+    if (options.includeDualRelation) {
+      base['Lançamentos do Ciclo'] = {
+        id: 'p_dual_ciclo',
+        type: 'relation',
+        relation: {
+          data_source_id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+          type: 'dual_property',
+          dual_property: { synced_property_name: 'Fatura Vinculada' },
+        },
+      };
+    }
+
+    if (options.overrideProps) {
+      Object.assign(base, options.overrideProps);
+    }
+
+    if (options.extraProps) {
+      Object.assign(base, options.extraProps);
+    }
+
+    if (options.omitProps) {
+      for (const p of options.omitProps) {
+        delete base[p];
+      }
+    }
+
+    return base;
+  }
+
+  class StatefulNotionFake {
+    public writeCallsCount = 0;
+    public writeCallsByProperty: Record<string, number> = {};
+    public dataSourcesMap: Map<string, any> = new Map();
+    public databasesMap: Map<string, any> = new Map();
+
+    constructor(initialFixtures: Record<string, Record<string, any>>) {
+      for (const [envKey, dsId] of Object.entries(REAL_DATA_SOURCE_IDS)) {
+        const rawProps = JSON.parse(JSON.stringify(initialFixtures[envKey] || {}));
+        const props: Record<string, any> = {};
+        for (const [pName, pDef] of Object.entries(rawProps)) {
+          const def: any = { ...pDef };
+          if (def.type === 'select') {
+            const rawOpts = def.select?.options || def.selectOptions || [];
+            def.select = {
+              options: rawOpts.map((o: any, idx: number) => ({
+                id: o.id || `opt_${idx}`,
+                name: typeof o === 'string' ? o : o.name,
+              })),
+            };
+          }
+          props[pName] = def;
+        }
+        this.dataSourcesMap.set(dsId, {
+          id: dsId,
+          properties: props,
+        });
+      }
+    }
+
+    public dataSources = {
+      retrieve: async ({ data_source_id }: { data_source_id: string }) => {
+        const ds = this.dataSourcesMap.get(data_source_id);
+        if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
+        return JSON.parse(JSON.stringify(ds));
+      },
+      update: async ({ data_source_id, properties }: { data_source_id: string; properties: any }) => {
+        this.writeCallsCount++;
+        const ds = this.dataSourcesMap.get(data_source_id);
+        if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
+
+        for (const [propName, propDef] of Object.entries(properties)) {
+          this.writeCallsByProperty[propName] = (this.writeCallsByProperty[propName] || 0) + 1;
+
+          if ((propDef as any).select?.options) {
+            ds.properties[propName] = {
+              id: `prop_${propName}_id`,
+              name: propName,
+              type: 'select',
+              select: {
+                options: (propDef as any).select.options.map((o: any, idx: number) => ({
+                  id: o.id || `opt_${idx}`,
+                  name: o.name,
+                })),
+              },
+            };
+          } else if ((propDef as any).relation) {
+            ds.properties[propName] = {
+              id: `prop_${propName}_id`,
+              name: propName,
+              type: 'relation',
+              relation: {
+                data_source_id: (propDef as any).relation.data_source_id,
+                type: (propDef as any).relation.type,
+                dual_property: (propDef as any).relation.dual_property,
+              },
+            };
+            const targetDsId = (propDef as any).relation.data_source_id;
+            const targetDs = this.dataSourcesMap.get(targetDsId);
+            const syncProp = (propDef as any).relation.dual_property?.synced_property_name;
+            if (targetDs && syncProp) {
+              targetDs.properties[syncProp] = {
+                id: `prop_${syncProp}_id`,
+                name: syncProp,
+                type: 'relation',
+                relation: {
+                  data_source_id,
+                  type: 'dual_property',
+                  dual_property: { synced_property_name: propName },
+                },
+              };
+            }
+          } else if ((propDef as any).number) {
+            ds.properties[propName] = {
+              id: `prop_${propName}_id`,
+              name: propName,
+              type: 'number',
+              number: (propDef as any).number,
+            };
+          } else if ((propDef as any).rich_text) {
+            ds.properties[propName] = {
+              id: `prop_${propName}_id`,
+              name: propName,
+              type: 'rich_text',
+              rich_text: {},
+            };
+          } else {
+            const pType = Object.keys(propDef as any)[0] || 'rich_text';
+            ds.properties[propName] = {
+              id: `prop_${propName}_id`,
+              name: propName,
+              type: pType,
+              [pType]: (propDef as any)[pType],
+            };
+          }
+        }
+
+        return JSON.parse(JSON.stringify(ds));
+      },
+    };
+
+    public databases = {
+      retrieve: async ({ database_id }: { database_id: string }) => {
+        const db = this.databasesMap.get(database_id);
+        if (!db) throw new Error(`Database '${database_id}' not found`);
+        return JSON.parse(JSON.stringify(db));
+      },
+      create: async (params: any) => {
+        this.writeCallsCount++;
+        const dbId = 'mock-db-id';
+        const dsId = 'mock-ds-id';
+        const newDb = {
+          id: dbId,
+          parent: params.parent,
+          title: params.title,
+          description: params.description,
+          archived: false,
+          data_sources: [{ id: dsId }],
+        };
+        this.databasesMap.set(dbId, newDb);
+        const initialProps = params.initial_data_source?.properties || {};
+        const simulatedProps: Record<string, any> = {};
+        for (const [pName, pDef] of Object.entries(initialProps)) {
+          const pType = Object.keys(pDef as any)[0] || 'rich_text';
+          simulatedProps[pName] = {
+            id: `prop_${pName}_id`,
+            name: pName,
+            type: pType,
+            [pType]: (pDef as any)[pType],
+          };
+        }
+        this.dataSourcesMap.set(dsId, { id: dsId, properties: simulatedProps });
+        return newDb;
+      },
+    };
+
+    public pages = {
+      retrieve: async ({ page_id }: { page_id: string }) => {
+        return { id: page_id, archived: false };
+      },
+    };
+
+    public search = async () => ({ results: [] });
+  }
+
   describe('8. SchemaApplyExecutor DDL Operations & Idempotency', () => {
     it('strictly blocks execution when allowRealMutations is false', async () => {
       const journal = new MigrationJournal(testDbPath);
@@ -1134,6 +1349,8 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       });
       journal.recordStepVerified(planHash, 52, 'created-db-id-789');
 
+      const mockCardBillsProps = createMockCardBillsProperties();
+
       const mockClient: any = {
         databases: {
           retrieve: async (params: any) => {
@@ -1141,6 +1358,15 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
             return {
               id: params.database_id,
               data_sources: [{ id: 'ds-resolved-card-bills-999' }],
+            };
+          },
+        },
+        dataSources: {
+          retrieve: async (params: any) => {
+            expect(params.data_source_id).toBe('ds-resolved-card-bills-999');
+            return {
+              id: 'ds-resolved-card-bills-999',
+              properties: mockCardBillsProps,
             };
           },
         },
@@ -1169,6 +1395,10 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         client: mockClient,
         journal,
         plan,
+        envVars: {
+          ...REAL_DATA_SOURCE_IDS,
+          NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+        },
         allowRealMutations: true,
       });
 
@@ -1207,21 +1437,11 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
               if (params?.data_source_id === 'ds-resolved-card-bills-999') {
                 return {
                   id: 'ds-resolved-card-bills-999',
-                  properties: {
-                    'Lançamentos do Ciclo': {
-                      id: 'rel-ciclo-id',
-                      type: 'relation',
-                      relation: {
-                        data_source_id: 'ds-transactions-id',
-                        type: 'dual_property',
-                        dual_property: { synced_property_name: 'Fatura Vinculada' },
-                      },
-                    },
-                  },
+                  properties: createMockCardBillsProperties({ includeDualRelation: true }),
                 };
               }
               return {
-                id: 'ds-transactions-id',
+                id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
                 properties: {
                   'Fatura Vinculada': {
                     id: 'rel-fatura-id',
@@ -1235,7 +1455,16 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
                 },
               };
             }
-            return { properties: {} };
+            if (params?.data_source_id === 'ds-resolved-card-bills-999') {
+              return {
+                id: 'ds-resolved-card-bills-999',
+                properties: createMockCardBillsProperties(),
+              };
+            }
+            return {
+              id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+              properties: {},
+            };
           },
           update: async (params: any) => {
             updatePayload = params;
@@ -1252,7 +1481,7 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
             {
               stepNumber: 54,
               operation: 'CREATE_DUAL_RELATION',
-              targetDataSource: { name: 'Transações', envKey: 'NOTION_DS_TRANSACTIONS', id: 'ds-transactions-id' },
+              targetDataSource: { name: 'Transações', envKey: 'NOTION_DS_TRANSACTIONS', id: REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS },
               property: 'Fatura Vinculada',
               risk: 'SAFE_MUTATION',
               precondition: 'none',
@@ -1268,6 +1497,10 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         client: mockClient,
         journal,
         plan,
+        envVars: {
+          ...REAL_DATA_SOURCE_IDS,
+          NOTION_PARENT_PAGE_ID: '00000000-0000-0000-0000-000000000001',
+        },
         allowRealMutations: true,
       });
 
@@ -1991,113 +2224,6 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
     });
 
     it('CRASH RECOVERY OBRIGATÓRIO NA JANELA CRÍTICA: PATCH de CREATE_PROPERTY retorna sucesso, simula crash antes de recordStepApplied, novo runner reconhece frontier step, recupera com NO_OP_VERIFIED e continua N+1 sem novo PATCH', async () => {
-      // 1. In-memory stateful Notion fake
-      class StatefulNotionFake {
-        public writeCallsCount = 0;
-        public writeCallsByProperty: Record<string, number> = {};
-        public dataSourcesMap: Map<string, any> = new Map();
-        public databasesMap: Map<string, any> = new Map();
-
-        constructor(initialFixtures: Record<string, Record<string, any>>) {
-          for (const [envKey, dsId] of Object.entries(REAL_DATA_SOURCE_IDS)) {
-            const rawProps = JSON.parse(JSON.stringify(initialFixtures[envKey] || {}));
-            const props: Record<string, any> = {};
-            for (const [pName, pDef] of Object.entries(rawProps)) {
-              const def: any = { ...pDef };
-              if (def.type === 'select') {
-                const rawOpts = def.select?.options || def.selectOptions || [];
-                def.select = {
-                  options: rawOpts.map((o: any, idx: number) => ({
-                    id: o.id || `opt_${idx}`,
-                    name: typeof o === 'string' ? o : o.name,
-                  })),
-                };
-              }
-              props[pName] = def;
-            }
-            this.dataSourcesMap.set(dsId, {
-              id: dsId,
-              properties: props,
-            });
-          }
-        }
-
-        public dataSources = {
-          retrieve: async ({ data_source_id }: { data_source_id: string }) => {
-            const ds = this.dataSourcesMap.get(data_source_id);
-            if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
-            return JSON.parse(JSON.stringify(ds));
-          },
-          update: async ({ data_source_id, properties }: { data_source_id: string; properties: any }) => {
-            this.writeCallsCount++;
-            const ds = this.dataSourcesMap.get(data_source_id);
-            if (!ds) throw new Error(`Data Source '${data_source_id}' not found`);
-            if (!ds.properties) ds.properties = {};
-
-            for (const [propName, propDef] of Object.entries(properties)) {
-              this.writeCallsByProperty[propName] = (this.writeCallsByProperty[propName] || 0) + 1;
-
-              if ((propDef as any).select) {
-                ds.properties[propName] = {
-                  id: `prop_${propName}_id`,
-                  name: propName,
-                  type: 'select',
-                  select: {
-                    options: (propDef as any).select.options.map((o: any, idx: number) => ({
-                      id: o.id || `opt_${idx}`,
-                      name: o.name,
-                    })),
-                  },
-                };
-              } else if ((propDef as any).number) {
-                ds.properties[propName] = {
-                  id: `prop_${propName}_id`,
-                  name: propName,
-                  type: 'number',
-                  number: (propDef as any).number,
-                };
-              } else if ((propDef as any).rich_text) {
-                ds.properties[propName] = {
-                  id: `prop_${propName}_id`,
-                  name: propName,
-                  type: 'rich_text',
-                  rich_text: {},
-                };
-              } else {
-                const pType = Object.keys(propDef as any)[0] || 'rich_text';
-                ds.properties[propName] = {
-                  id: `prop_${propName}_id`,
-                  name: propName,
-                  type: pType,
-                  [pType]: (propDef as any)[pType],
-                };
-              }
-            }
-
-            return JSON.parse(JSON.stringify(ds));
-          },
-        };
-
-        public databases = {
-          retrieve: async ({ database_id }: { database_id: string }) => {
-            const db = this.databasesMap.get(database_id);
-            if (!db) throw new Error(`Database '${database_id}' not found`);
-            return JSON.parse(JSON.stringify(db));
-          },
-          create: async (params: any) => {
-            this.writeCallsCount++;
-            const dbId = 'mock-db-id';
-            const dsId = 'mock-ds-id';
-            const newDb = { id: dbId, parent: params.parent, title: params.title, archived: false, data_sources: [{ id: dsId }] };
-            this.databasesMap.set(dbId, newDb);
-            this.dataSourcesMap.set(dsId, { id: dsId, properties: {} });
-            return newDb;
-          },
-        };
-
-        public search = async () => ({ results: [] });
-      }
-
       const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
       const journal = new MigrationJournal(testDbPath);
 
@@ -2299,6 +2425,514 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
       });
 
       await expect(driftRunner.execute(planHash)).rejects.toThrow('EXTERNAL_DRIFT_DETECTED');
+    });
+  });
+
+  describe('11. Step 53 Hardening, Database Recovery & Operational Apply Gates', () => {
+    const parentPageId = '00000000-0000-0000-0000-000000000001';
+    const envVars = {
+      ...REAL_DATA_SOURCE_IDS,
+      NOTION_PARENT_PAGE_ID: parentPageId,
+    };
+    const planner = new SchemaPlanner({ envVars });
+    const fullPlan = planner.generatePlan();
+    const createDbStep = fullPlan.steps.find((s) => s.operation === 'CREATE_DATABASE');
+    const initialPropsPayload = createDbStep?.sanitizedPayload?.initial_data_source?.properties || {};
+
+    it('Step 53: base com parent/título/marker corretos mas propriedade inicial faltante DEVE FALHAR', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_test_step53_missing_prop';
+
+      journal.recordStepPending({ planHash, stepNumber: 52, operation: 'CREATE_DATABASE', targetDataSource: 'Faturas / Ciclos de Cartão' });
+      journal.recordStepVerified(planHash, 52, 'db-id-123');
+
+      // Database is valid with correct marker, parent and title
+      // BUT data_source is missing 'Valor Pago'
+      const invalidProps = createMockCardBillsProperties({ omitProps: ['Valor Pago'] });
+
+      const mockClient: any = {
+        databases: {
+          retrieve: async () => ({
+            id: 'db-id-123',
+            data_sources: [{ id: 'ds-faturas-123' }],
+          }),
+        },
+        dataSources: {
+          retrieve: async () => ({
+            id: 'ds-faturas-123',
+            properties: invalidProps,
+          }),
+        },
+      };
+
+      // Direct verifier check
+      const verif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+        { properties: invalidProps },
+        initialPropsPayload,
+      );
+      expect(verif.valid).toBe(false);
+      expect(verif.reason).toBe('INITIAL_PROPERTY_MISSING');
+      expect(verif.detail).toContain('Valor Pago');
+
+      // Executor execution check
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan: {
+          version: '1.0.0',
+          planHash,
+          schemaPlan: {
+            steps: [
+              {
+                stepNumber: 53,
+                operation: 'RESOLVE_DATA_SOURCE_ID',
+                targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+                sanitizedPayload: {},
+              },
+            ],
+          },
+        } as any,
+        envVars,
+        allowRealMutations: true,
+      });
+
+      await expect(executor.executeDdlPlan('run_step53_fail_missing', 'sha', 'main')).rejects.toThrow(
+        /INITIAL_PROPERTY_MISSING|Valor Pago/,
+      );
+      expect(journal.getStepStatus(planHash, 53)?.status).toBe('FAILED');
+    });
+
+    it('Step 53: number format incorreto DEVE FALHAR', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_test_step53_wrong_format';
+
+      journal.recordStepPending({ planHash, stepNumber: 52, operation: 'CREATE_DATABASE', targetDataSource: 'Faturas / Ciclos de Cartão' });
+      journal.recordStepVerified(planHash, 52, 'db-id-123');
+
+      // 'Valor da Fatura Fechada (Oficial)' has wrong number format 'number' instead of 'real'
+      const invalidProps = createMockCardBillsProperties({
+        overrideProps: {
+          'Valor da Fatura Fechada (Oficial)': {
+            id: 'p_val_ofic',
+            type: 'number',
+            number: { format: 'number' },
+          },
+        },
+      });
+
+      const mockClient: any = {
+        databases: {
+          retrieve: async () => ({
+            id: 'db-id-123',
+            data_sources: [{ id: 'ds-faturas-123' }],
+          }),
+        },
+        dataSources: {
+          retrieve: async () => ({
+            id: 'ds-faturas-123',
+            properties: invalidProps,
+          }),
+        },
+      };
+
+      const verif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+        { properties: invalidProps },
+        initialPropsPayload,
+      );
+      expect(verif.valid).toBe(false);
+      expect(verif.reason).toBe('FORMAT_MISMATCH');
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan: {
+          version: '1.0.0',
+          planHash,
+          schemaPlan: {
+            steps: [
+              {
+                stepNumber: 53,
+                operation: 'RESOLVE_DATA_SOURCE_ID',
+                targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+                sanitizedPayload: {},
+              },
+            ],
+          },
+        } as any,
+        envVars,
+        allowRealMutations: true,
+      });
+
+      await expect(executor.executeDdlPlan('run_step53_fail_format', 'sha', 'main')).rejects.toThrow(
+        /FORMAT_MISMATCH/,
+      );
+    });
+
+    it('Step 53: relation target incorreto DEVE FALHAR', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_test_step53_wrong_rel';
+
+      journal.recordStepPending({ planHash, stepNumber: 52, operation: 'CREATE_DATABASE', targetDataSource: 'Faturas / Ciclos de Cartão' });
+      journal.recordStepVerified(planHash, 52, 'db-id-123');
+
+      // 'Cartão Vinculado' points to wrong relation target
+      const invalidProps = createMockCardBillsProperties({
+        overrideProps: {
+          'Cartão Vinculado': {
+            id: 'p_card',
+            type: 'relation',
+            relation: {
+              data_source_id: 'wrong-account-data-source-id',
+              type: 'single_property',
+            },
+          },
+        },
+      });
+
+      const mockClient: any = {
+        databases: {
+          retrieve: async () => ({
+            id: 'db-id-123',
+            data_sources: [{ id: 'ds-faturas-123' }],
+          }),
+        },
+        dataSources: {
+          retrieve: async () => ({
+            id: 'ds-faturas-123',
+            properties: invalidProps,
+          }),
+        },
+      };
+
+      const verif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+        { properties: invalidProps },
+        initialPropsPayload,
+      );
+      expect(verif.valid).toBe(false);
+      expect(verif.reason).toBe('RELATION_TARGET_MISMATCH');
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan: {
+          version: '1.0.0',
+          planHash,
+          schemaPlan: {
+            steps: [
+              {
+                stepNumber: 53,
+                operation: 'RESOLVE_DATA_SOURCE_ID',
+                targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+                sanitizedPayload: {},
+              },
+            ],
+          },
+        } as any,
+        envVars,
+        allowRealMutations: true,
+      });
+
+      await expect(executor.executeDdlPlan('run_step53_fail_rel', 'sha', 'main')).rejects.toThrow(
+        /RELATION_TARGET_MISMATCH/,
+      );
+    });
+
+    it('Step 53: propriedade extra inesperada na nova base DEVE FALHAR', async () => {
+      const journal = new MigrationJournal(testDbPath);
+      const planHash = 'hash_test_step53_extra_prop';
+
+      journal.recordStepPending({ planHash, stepNumber: 52, operation: 'CREATE_DATABASE', targetDataSource: 'Faturas / Ciclos de Cartão' });
+      journal.recordStepVerified(planHash, 52, 'db-id-123');
+
+      // Database has all 22 properties PLUS an unexpected property
+      const invalidProps = createMockCardBillsProperties({
+        extraProps: {
+          'Propriedade Fantasma': {
+            id: 'p_ghost',
+            type: 'rich_text',
+            rich_text: {},
+          },
+        },
+      });
+
+      const mockClient: any = {
+        databases: {
+          retrieve: async () => ({
+            id: 'db-id-123',
+            data_sources: [{ id: 'ds-faturas-123' }],
+          }),
+        },
+        dataSources: {
+          retrieve: async () => ({
+            id: 'ds-faturas-123',
+            properties: invalidProps,
+          }),
+        },
+      };
+
+      const verif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+        { properties: invalidProps },
+        initialPropsPayload,
+      );
+      expect(verif.valid).toBe(false);
+      expect(verif.reason).toBe('UNEXPECTED_PROPERTY');
+      expect(verif.detail).toContain('Propriedade Fantasma');
+
+      const executor = new SchemaApplyExecutor({
+        client: mockClient,
+        journal,
+        plan: {
+          version: '1.0.0',
+          planHash,
+          schemaPlan: {
+            steps: [
+              {
+                stepNumber: 53,
+                operation: 'RESOLVE_DATA_SOURCE_ID',
+                targetDataSource: { name: 'Faturas / Ciclos de Cartão', envKey: 'NOTION_DS_CARD_BILLS' },
+                sanitizedPayload: {},
+              },
+            ],
+          },
+        } as any,
+        envVars,
+        allowRealMutations: true,
+      });
+
+      await expect(executor.executeDdlPlan('run_step53_fail_extra', 'sha', 'main')).rejects.toThrow(
+        /UNEXPECTED_PROPERTY|Propriedade Fantasma/,
+      );
+    });
+
+    it('Step 53 & Step 54: schema final correto com 23 propriedades homologadas PASSA', async () => {
+      // 1. Initial 22 properties pass Step 53
+      const validInitialProps = createMockCardBillsProperties({ includeDualRelation: false });
+      const initialVerif = StepStructuralVerifier.verifyCardBillsInitialProperties(
+        { properties: validInitialProps },
+        initialPropsPayload,
+      );
+      expect(initialVerif.valid).toBe(true);
+
+      // 2. Final 23 properties pass post-Step 54 verification
+      const validFinalProps = createMockCardBillsProperties({ includeDualRelation: true });
+      expect(Object.keys(validFinalProps).length).toBe(23);
+
+      const finalVerif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+        { properties: validFinalProps },
+        initialPropsPayload,
+        REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+      );
+      expect(finalVerif.valid).toBe(true);
+
+      // 3. Negative checks on Step 54:
+      // Missing dual relation fails
+      const withoutDual = StepStructuralVerifier.verifyCardBillsFinalSchema(
+        { properties: validInitialProps },
+        initialPropsPayload,
+        REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+      );
+      expect(withoutDual.valid).toBe(false);
+      expect(withoutDual.reason).toBe('SYNCED_DUAL_RELATION_MISSING');
+
+      // Wrong relation target in dual property fails
+      const wrongTargetFinal = createMockCardBillsProperties({
+        includeDualRelation: true,
+        overrideProps: {
+          'Lançamentos do Ciclo': {
+            id: 'p_dual',
+            type: 'relation',
+            relation: {
+              data_source_id: 'wrong-tx-id',
+              type: 'dual_property',
+              dual_property: { synced_property_name: 'Fatura Vinculada' },
+            },
+          },
+        },
+      });
+      const wrongTargetVerif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+        { properties: wrongTargetFinal },
+        initialPropsPayload,
+        REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+      );
+      expect(wrongTargetVerif.valid).toBe(false);
+      expect(wrongTargetVerif.reason).toBe('RELATION_TARGET_MISMATCH');
+
+      // Extra 24th property fails
+      const extra24Props = createMockCardBillsProperties({
+        includeDualRelation: true,
+        extraProps: { 'Prop 24 Inesperada': { id: 'p24', type: 'rich_text', rich_text: {} } },
+      });
+      const extra24Verif = StepStructuralVerifier.verifyCardBillsFinalSchema(
+        { properties: extra24Props },
+        initialPropsPayload,
+        REAL_DATA_SOURCE_IDS.NOTION_DS_TRANSACTIONS,
+      );
+      expect(extra24Verif.valid).toBe(false);
+      expect(extra24Verif.reason).toBe('UNEXPECTED_PROPERTY');
+    });
+
+    it('Operational Apply Gate: gate ausente -> ZERO writes', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: parentPageId,
+            // NOTION_SCHEMA_APPLY_ENABLED NOT SET!
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_gate_test',
+          liveSnapshotOverride: LIVE_NOTION_FIXTURES,
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      const dryRunReport = await runner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+
+      // When gate is absent, resolveAllowRealMutations returns false and execute rejects
+      expect(runner.resolveAllowRealMutations(planHash)).toBe(false);
+      await expect(runner.execute(planHash)).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Operational Apply Gate: token incorreto -> ZERO writes', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: parentPageId,
+            NOTION_SCHEMA_APPLY_ENABLED: 'INCORRECT_TOKEN_TRY_MUTATE',
+            NOTION_SCHEMA_APPLY_PLAN_HASH: 'some_hash',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_gate_test',
+          liveSnapshotOverride: LIVE_NOTION_FIXTURES,
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      const dryRunReport = await runner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+
+      expect(runner.resolveAllowRealMutations(planHash)).toBe(false);
+      await expect(runner.execute(planHash)).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Operational Apply Gate: hash de confirmação diferente -> ZERO writes', async () => {
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+      const runner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: parentPageId,
+            NOTION_SCHEMA_APPLY_ENABLED: 'I_UNDERSTAND_SCHEMA_ONLY',
+            NOTION_SCHEMA_APPLY_PLAN_HASH: 'bogus_hash_mismatch',
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_gate_test',
+          liveSnapshotOverride: LIVE_NOTION_FIXTURES,
+        },
+      );
+      runner.setClient(fakeNotion);
+
+      const dryRunReport = await runner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+
+      expect(runner.resolveAllowRealMutations(planHash)).toBe(false);
+      await expect(runner.execute(planHash)).rejects.toThrow('MUTAÇÕES REAIS BLOQUEADAS');
+      expect(fakeNotion.writeCallsCount).toBe(0);
+    });
+
+    it('Operational Apply Gate: todos os gates corretos -> executor atinge o caminho mutante em mock/fake', async () => {
+      // 1. First obtain the valid plan and planHash
+      const tempRunner = new TestableMigrationRunner(
+        {
+          mode: 'dry-run',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: parentPageId,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_apply_allowed',
+          liveSnapshotOverride: LIVE_NOTION_FIXTURES,
+        },
+      );
+      const dryRunReport = await tempRunner.runDryRun();
+      const planHash = dryRunReport.plan.planHash;
+
+      // 2. Setup stateful fake Notion
+      const fakeNotion = new StatefulNotionFake(LIVE_NOTION_FIXTURES);
+
+      // 3. Configure runner with EXACT approval gates
+      const applyRunner = new TestableMigrationRunner(
+        {
+          mode: 'apply',
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          backupKey: validStrongBackupKey,
+          notionApiKey: 'ntn_mock_api_key',
+          envVars: {
+            ...REAL_DATA_SOURCE_IDS,
+            NOTION_PARENT_PAGE_ID: parentPageId,
+            NOTION_SCHEMA_APPLY_ENABLED: 'I_UNDERSTAND_SCHEMA_ONLY',
+            NOTION_SCHEMA_APPLY_PLAN_HASH: planHash,
+          },
+        },
+        {
+          worktreeStatusOverride: 'WORKTREE_CLEAN',
+          gitCommitShaOverride: 'commit_sha_apply_allowed',
+          liveSnapshotOverride: LIVE_NOTION_FIXTURES,
+        },
+      );
+      applyRunner.setClient(fakeNotion);
+
+      // Gate check
+      expect(applyRunner.resolveAllowRealMutations(planHash)).toBe(true);
+
+      // Execute apply
+      const report = await applyRunner.execute(planHash);
+      expect(report.mode).toBe('apply');
+      if (report.mode === 'apply') {
+        expect(report.summary.totalSteps).toBe(54);
+        expect(report.summary.verifiedCount).toBe(54);
+        expect(report.summary.noOpCount).toBe(0);
+        expect(report.mutationsExecuted).toBe(54);
+        expect(fakeNotion.writeCallsCount).toBeGreaterThan(50);
+
+        // Check report formatting
+        const formatted = applyRunner.formatReport(report);
+        expect(formatted).toContain('SCHEMA APPLY EXECUTOR');
+        expect(formatted).toContain('EXECUÇÃO DDL CONCLUÍDA COM SUCESSO NO NOTION');
+      }
     });
   });
 });
