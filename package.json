@@ -15,7 +15,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "notion:check-schema": "ts-node scripts/introspect-notion.ts"
+    "notion:check-schema": "ts-node scripts/introspect-notion.ts",
+    "notion:migrate": "ts-node scripts/migrate-notion.ts"
   },
   "keywords": [
     "finance",
