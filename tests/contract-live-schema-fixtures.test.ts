@@ -358,7 +358,7 @@ export const LIVE_NOTION_FIXTURES: Record<string, Record<string, NotionPropertyS
     },
     'Fonte': {
       type: 'select',
-      selectOptions: ['Pierre', 'Manual', 'Migração', 'Outra'],
+      selectOptions: ['Pierre', 'Manual', 'Migração'],
     },
     'Transações recebidas': { type: 'number' },
     'Transações novas': { type: 'number' },
@@ -578,7 +578,7 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
       ]);
     });
 
-    test('6. Obrigações (NOTION_DS_MONTHLY_OBLIGATIONS): single ALTER_SCHEMA on Status, Transação conciliada mapped', () => {
+    test('6. Obrigações (NOTION_DS_MONTHLY_OBLIGATIONS): single ALTER_SCHEMA on Status, Referência, Conta, Origem represented', () => {
       const diffs = allDiffs.NOTION_DS_MONTHLY_OBLIGATIONS;
       const getDiff = (p: string) => findDiff(diffs, p);
 
@@ -588,9 +588,13 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
       expect(getDiff('Identificador')?.status).toBe('RENAME_CANDIDATE');
       expect(getDiff('Data de Vencimento')?.status).toBe('RENAME_CANDIDATE');
       expect(getDiff('Data do Pagamento')?.status).toBe('RENAME_CANDIDATE');
+      expect(getDiff('Referência')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Conta')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Origem')?.status).toBe('EXACT_MATCH');
 
+      // 0 missing: all existing fields represented and reused, zero duplicates
       const missing = diffs.filter((d) => d.status === 'MISSING').map((d) => d.notionProperty);
-      expect(missing).toEqual(['Competência']);
+      expect(missing).toEqual([]);
     });
 
     test('7. Investimentos (NOTION_DS_INVESTMENTS): Instituição/Liquidez are rich_text, Classe matches', () => {
@@ -665,7 +669,7 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
       ]);
     });
 
-    test('10. Metas Financeiras (NOTION_DS_FINANCIAL_GOALS): zero missing and clean alias mapping', () => {
+    test('10. Metas Financeiras (NOTION_DS_FINANCIAL_GOALS): represents all 10 properties with zero missing', () => {
       const diffs = allDiffs.NOTION_DS_FINANCIAL_GOALS;
       const getDiff = (p: string) => findDiff(diffs, p);
 
@@ -675,6 +679,12 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
       expect(getDiff('Prazo Alvo')?.candidateName).toBe('Prazo');
       expect(getDiff('Valor Atual Acumulado')?.status).toBe('RENAME_CANDIDATE');
       expect(getDiff('Valor Atual Acumulado')?.candidateName).toBe('Valor atual');
+      expect(getDiff('Aporte Mensal Planejado')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Tipo')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Liquidez Necessária')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Prioridade')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Status')?.status).toBe('EXACT_MATCH');
+      expect(getDiff('Observações')?.status).toBe('EXACT_MATCH');
 
       const missing = diffs.filter((d) => d.status === 'MISSING');
       expect(missing).toHaveLength(0);
@@ -742,6 +752,121 @@ describe('Phase 0 Live Schema Fixtures Verification (Contract Alignment)', () =>
         'Hash do Lote RAW',
         'Versão do Worker / Commit',
       ]);
+    });
+  });
+
+  describe('Anti-Regression: Known Physical Options Integrity in Live Fixtures', () => {
+    const KNOWN_PHYSICAL_SELECT_OPTIONS: Record<string, Record<string, string[]>> = {
+      NOTION_DS_ACCOUNTS: {
+        'Fonte': ['Pierre', 'Manual', 'Outra'],
+        'Moeda': ['BRL', 'USD', 'Outra'],
+        'Tipo': ['Conta corrente', 'Cartão de crédito', 'Carteira', 'Corretora', 'Dinheiro', 'Outro'],
+      },
+      NOTION_DS_TRANSACTIONS: {
+        'Fonte': ['Pierre', 'Manual', 'Migração', 'Outra'],
+        'Moeda': ['BRL', 'USD'],
+        'Movimento': ['Entrada', 'Saída'],
+        'Natureza': ['Receita', 'Despesa', 'Aporte', 'Resgate', 'Transferência interna', 'Reembolso', 'Pagamento de fatura', 'Ajuste'],
+        'Status': ['Confirmado', 'Pendente', 'Cancelado'],
+      },
+      NOTION_DS_CATEGORIES: {
+        'Variabilidade': ['Fixa', 'Variável'],
+        'Natureza padrão': ['Receita', 'Despesa', 'Patrimonial', 'Mista'],
+        'Grupo': ['Necessidade', 'Desejo', 'Poupança/Investimento', 'Fora do orçamento'],
+      },
+      NOTION_DS_RULES: {
+        'Movimento esperado': ['Qualquer', 'Entrada', 'Saída'],
+        'Natureza resultante': ['Receita', 'Despesa', 'Aporte', 'Resgate', 'Transferência interna', 'Reembolso', 'Pagamento de fatura', 'Ajuste'],
+        'Tipo': ['Entrada', 'Saída', 'Qualquer'],
+      },
+      NOTION_DS_FIXED_BILLS: {
+        'Periodicidade': ['Mensal', 'Bimestral', 'Trimestral', 'Semestral', 'Anual'],
+        'Forma de pagamento': ['Boleto', 'Pix', 'Cartão', 'Débito automático'],
+      },
+      NOTION_DS_MONTHLY_OBLIGATIONS: {
+        'Status': ['Prevista', 'Paga', 'Atrasada'],
+        'Origem': ['Automática', 'Manual'],
+      },
+      NOTION_DS_INVESTMENTS: {
+        'Moeda': ['BRL', 'USD'],
+        'Classe': ['Ações', 'Cripto', 'FIIs', 'Renda Fixa', 'ETFs', 'Outro'],
+        'Fonte do preço': ['Pierre', 'Manual'],
+      },
+      NOTION_DS_INVESTMENT_MOVEMENTS: {
+        'Tipo': ['Aporte', 'Compra', 'Venda', 'Rendimento', 'Resgate', 'Taxa', 'Transferência', 'Ajuste'],
+        'Moeda': ['BRL', 'USD'],
+        'Fonte': ['Pierre', 'Manual'],
+      },
+      NOTION_DS_MONTHLY_BUDGET: {
+        'Status': ['Planejado', 'Em andamento', 'Fechado'],
+      },
+      NOTION_DS_FINANCIAL_GOALS: {
+        'Tipo': ['Aposentadoria', 'Viagem', 'Reserva', 'Patrimônio', 'Outro'],
+        'Liquidez necessária': ['Imediata', 'Curto Prazo', 'Médio Prazo', 'Longo Prazo'],
+        'Prioridade': ['Alta', 'Média', 'Baixa'],
+        'Status': ['Não iniciada', 'Em andamento', 'Concluída'],
+      },
+      NOTION_DS_MONTHLY_CLOSINGS: {
+        'Qualidade dos dados': ['Alta', 'Média', 'Baixa'],
+        'Status': ['Aberto', 'Em revisão', 'Fechado'],
+      },
+      NOTION_DS_SYNC_LOG: {
+        'Status': ['Sucesso', 'Parcial', 'Erro', 'Executando'],
+        'Fonte': ['Pierre', 'Manual', 'Migração'],
+      },
+    };
+
+    test('validates that every known physical option is present in the live fixtures', () => {
+      for (const [baseKey, propMap] of Object.entries(KNOWN_PHYSICAL_SELECT_OPTIONS)) {
+        const fixtureBase = LIVE_NOTION_FIXTURES[baseKey];
+        expect(fixtureBase, `Base ${baseKey} should exist in fixtures`).toBeDefined();
+
+        for (const [propName, expectedOpts] of Object.entries(propMap)) {
+          const fixtureProp = fixtureBase[propName];
+          expect(fixtureProp, `Property ${propName} should exist in fixture ${baseKey}`).toBeDefined();
+          expect(fixtureProp.selectOptions, `Property ${propName} in ${baseKey} must have selectOptions`).toBeDefined();
+
+          for (const opt of expectedOpts) {
+            expect(
+              fixtureProp.selectOptions,
+              `Option "${opt}" must not be omitted from ${baseKey}.${propName}`,
+            ).toContain(opt);
+          }
+        }
+      }
+    });
+
+    test('validates that NOTION_DS_SYNC_LOG.Fonte strictly does NOT contain Outra', () => {
+      const syncFonte = LIVE_NOTION_FIXTURES.NOTION_DS_SYNC_LOG['Fonte'];
+      expect(syncFonte.selectOptions).not.toContain('Outra');
+      expect(syncFonte.selectOptions).toEqual(['Pierre', 'Manual', 'Migração']);
+    });
+
+    test('validates that NOTION_DS_MONTHLY_OBLIGATIONS.Status strictly does NOT contain post-migration options yet', () => {
+      const statusProp = LIVE_NOTION_FIXTURES.NOTION_DS_MONTHLY_OBLIGATIONS['Status'];
+      expect(statusProp.selectOptions).not.toContain('Revisão Necessária');
+      expect(statusProp.selectOptions).not.toContain('Cancelada');
+    });
+
+    test('fails if any known physical option is inadvertently omitted from a fixture property', () => {
+      // Intentionally simulate omission of 'Taxa' in a cloned fixture of Movements Tipo
+      const corruptedProps: Record<string, NotionPropertySnapshot> = {
+        ...LIVE_NOTION_FIXTURES.NOTION_DS_INVESTMENT_MOVEMENTS,
+        'Tipo': {
+          type: 'select',
+          selectOptions: ['Aporte', 'Compra', 'Venda', 'Rendimento', 'Resgate', 'Transferência', 'Ajuste'], // Missing 'Taxa'
+        },
+      };
+
+      const diffs = validator.compareProperties(
+        TARGET_CONTRACT.NOTION_DS_INVESTMENT_MOVEMENTS,
+        corruptedProps,
+        REAL_DATA_SOURCE_IDS,
+      );
+
+      const tipoDiff = diffs.find((d) => normalizePropName(d.notionProperty) === normalizePropName('Tipo de Movimentação'));
+      expect(tipoDiff?.status).toBe('RENAME_STRUCTURAL_MISMATCH');
+      expect(tipoDiff?.description).toContain('Taxa');
     });
   });
 });

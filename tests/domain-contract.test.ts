@@ -667,7 +667,7 @@ describe('Domain: Schema Contract Specification', () => {
     expect(logStatus?.optionMappings?.['Executando']).toBe('RUNNING');
 
     const logFonte = logProps.find((p) => p.domainField === 'syncSource');
-    expect(logFonte?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração', 'Outra']);
+    expect(logFonte?.expectedOptions).toEqual(['Pierre', 'Manual', 'Migração']);
     expect(logFonte?.optionMappings).toEqual({
       'Pierre': 'PIERRE',
       'Manual': 'MANUAL',
