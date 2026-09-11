@@ -32,8 +32,8 @@ export class FinancialBackupManager {
   }
 
   /**
-   * Derive a 32-byte AES-256 key from cryptographic material (64-hex, 44-base64, or high-entropy raw secret).
-   * Strictly enforces minimum key length (32 chars), entropy, and disallows default/fallback keys.
+   * Derive a 32-byte AES-256 key from cryptographic material (strictly 64-hex or Base64 decoding to 32 bytes).
+   * Free-text passphrases, SHA-256 fallbacks, and non-32-byte keys are strictly rejected.
    */
   private deriveKey(key?: string): Buffer {
     const rawKey = key ?? this.backupKey ?? process.env.MIGRATION_BACKUP_KEY?.trim();
@@ -42,18 +42,14 @@ export class FinancialBackupManager {
         'Chave de backup ausente. Configure a variável de ambiente MIGRATION_BACKUP_KEY.',
       );
     }
-    if (rawKey.length < MIN_KEY_LENGTH) {
-      throw new Error(
-        `Chave MIGRATION_BACKUP_KEY fraca. Exigido segredo com no mínimo ${MIN_KEY_LENGTH} caracteres.`,
-      );
-    }
 
     // 1. 64-character hex string (32 bytes raw cryptographic key)
     if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-      return Buffer.from(rawKey, 'hex');
+      const buf = Buffer.from(rawKey, 'hex');
+      if (buf.length === 32) return buf;
     }
 
-    // 2. 44-character base64 string (32 bytes raw cryptographic key)
+    // 2. Base64 string that decodes to exactly 32 bytes
     if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
       const decoded = Buffer.from(rawKey, 'base64');
       if (decoded.length === 32) {
@@ -61,15 +57,9 @@ export class FinancialBackupManager {
       }
     }
 
-    // 3. Raw passphrase: must have high entropy (minimum 8 distinct characters)
-    const uniqueChars = new Set(rawKey).size;
-    if (uniqueChars < 8) {
-      throw new Error(
-        'Chave MIGRATION_BACKUP_KEY possui entropia insuficiente (muitos caracteres repetidos).',
-      );
-    }
-
-    return crypto.createHash('sha256').update(rawKey, 'utf8').digest();
+    throw new Error(
+      'Chave MIGRATION_BACKUP_KEY inválida. Exigido material criptográfico de exatamente 32 bytes codificado em 64 caracteres hexadecimais ou Base64 (strings livres/passphrases não são permitidas).',
+    );
   }
 
   /**

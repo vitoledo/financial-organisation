@@ -140,7 +140,7 @@ export interface BackupResult {
   notionWorkspaceReconciliationNote: string;
 }
 
-export type WorktreeStatus = 'WORKTREE_CLEAN' | 'WORKTREE_DIRTY';
+export type WorktreeStatus = 'WORKTREE_CLEAN' | 'WORKTREE_DIRTY' | 'GIT_STATE_UNVERIFIED';
 
 export interface SchemaConformanceResult {
   typeMismatches: number;
@@ -151,6 +151,7 @@ export interface SchemaConformanceResult {
   structuralMismatchProperty?: string;
   missingCount: number;
   unexpectedMissingProperties: string[];
+  expectedMissingButPresent: string[];
   isConformant: boolean;
 }
 
@@ -158,6 +159,8 @@ export interface MigrationReadiness {
   dryRunValid: boolean;
   applyReady: boolean;
   worktreeStatus: WorktreeStatus;
+  gitBranch?: string;
+  gitCommitSha?: string;
   dirtyFiles?: string[];
   schemaConformance?: SchemaConformanceResult;
   reasons: string[];
@@ -171,4 +174,62 @@ export interface DryRunReport {
   backup: BackupResult;
   plan: CompleteMigrationPlan;
   mutationsExecuted: 0;
+}
+
+export type JournalStepStatus =
+  | 'PENDING'
+  | 'APPLIED'
+  | 'VERIFIED'
+  | 'NO_OP_VERIFIED'
+  | 'FAILED';
+
+export interface JournalStepEntry {
+  id?: number;
+  planHash: string;
+  stepNumber: number;
+  operation: MigrationOperation;
+  targetDataSource: string;
+  targetDataSourceId?: string;
+  propertyName?: string;
+  status: JournalStepStatus;
+  startedAt: string;
+  completedAt?: string;
+  createdId?: string;
+  metadataJson?: string;
+  errorSanitized?: string;
+}
+
+export interface JournalRunEntry {
+  runId: string;
+  planHash: string;
+  commitSha: string;
+  gitBranch: string;
+  status: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+  startedAt: string;
+  completedAt?: string;
+  errorSanitized?: string;
+}
+
+export interface DdlStepExecutionResult {
+  stepNumber: number;
+  operation: MigrationOperation;
+  status: 'VERIFIED' | 'NO_OP_VERIFIED';
+  targetDataSource: string;
+  property?: string;
+  createdId?: string;
+  detail: string;
+  durationMs: number;
+}
+
+export interface DdlApplyExecutionSummary {
+  runId: string;
+  planHash: string;
+  commitSha: string;
+  gitBranch: string;
+  totalSteps: number;
+  verifiedCount: number;
+  noOpCount: number;
+  startedAt: string;
+  completedAt: string;
+  stepResults: DdlStepExecutionResult[];
 }

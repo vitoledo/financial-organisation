@@ -1344,4 +1344,26 @@ describe('Domain: Money & DecimalQuantity Constructor Invariant Hardening', () =
   });
 });
 
+describe('Domain: Schema Contract Invariants', () => {
+  test('all properties with notionType === number must declare explicit numberFormat (real | number)', () => {
+    const violations: Array<{ base: string; prop: string; format?: string }> = [];
+
+    for (const [baseKey, contract] of Object.entries(TARGET_CONTRACT)) {
+      for (const prop of contract.properties) {
+        if (prop.notionType === 'number') {
+          if (!prop.numberFormat || (prop.numberFormat !== 'real' && prop.numberFormat !== 'number')) {
+            violations.push({
+              base: baseKey,
+              prop: prop.notionProperty,
+              format: prop.numberFormat,
+            });
+          }
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
+  });
+});
+
 

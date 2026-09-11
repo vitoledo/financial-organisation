@@ -1,7 +1,8 @@
+import path from 'path';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
 import { Client } from '@notionhq/client';
-import { TARGET_CONTRACT } from '../../domain/schema-contract';
+import { TARGET_CONTRACT, HOMOLOGATED_MISSING_PROPERTIES } from '../../domain/schema-contract';
 import { NotionSchemaValidator } from '../schema-validator';
 import {
   CompleteMigrationPlan,
@@ -16,6 +17,8 @@ import { BackfillPlanner } from './backfill-planner';
 import { computePlanHash, verifyPlanHash, canonicalizeJson } from './hasher';
 import { PreflightValidator } from './preflight';
 import { FinancialBackupManager } from './backup';
+import { MigrationJournal } from './journal';
+import { SchemaApplyExecutor } from './schema-executor';
 
 export interface MigrationRunnerOptions {
   mode?: 'dry-run' | 'apply';
@@ -26,28 +29,34 @@ export interface MigrationRunnerOptions {
   envVars?: Record<string, string | undefined>;
   notionApiKey?: string;
   allowEmptyDbForBackup?: boolean;
+  expectedCommitSha?: string;
+}
+
+export interface TestDoubles {
   worktreeStatusOverride?: WorktreeStatus;
   mockDirtyFiles?: string[];
   liveSnapshotOverride?: Record<string, Record<string, any>>;
+  gitBranchOverride?: string;
+  gitCommitShaOverride?: string;
+  simulateGitFailure?: boolean;
+  simulateRemoteTrackingMismatch?: boolean;
 }
 
 export class MigrationRunner {
-  private mode: 'dry-run' | 'apply';
-  private envVars: Record<string, string | undefined>;
-  private client?: Client;
-  private preflightValidator: PreflightValidator;
-  private backfillPlanner: BackfillPlanner;
-  private backupManager: FinancialBackupManager;
-  private worktreeStatusOverride?: WorktreeStatus;
-  private mockDirtyFiles?: string[];
-  private liveSnapshotOverride?: Record<string, Record<string, any>>;
+  protected mode: 'dry-run' | 'apply';
+  protected envVars: Record<string, string | undefined>;
+  protected client?: Client;
+  protected preflightValidator: PreflightValidator;
+  protected backfillPlanner: BackfillPlanner;
+  protected backupManager: FinancialBackupManager;
+  protected journal: MigrationJournal;
+  protected expectedCommitSha?: string;
+  protected testDoubles?: TestDoubles;
 
   constructor(options: MigrationRunnerOptions = {}) {
     this.mode = options.mode ?? 'dry-run';
     this.envVars = options.envVars ?? process.env;
-    this.worktreeStatusOverride = options.worktreeStatusOverride;
-    this.mockDirtyFiles = options.mockDirtyFiles;
-    this.liveSnapshotOverride = options.liveSnapshotOverride;
+    this.expectedCommitSha = options.expectedCommitSha;
 
     const apiKey = options.notionApiKey ?? this.envVars.NOTION_API_KEY?.trim();
     if (apiKey) {
@@ -65,51 +74,146 @@ export class MigrationRunner {
       key: options.backupKey ?? this.envVars.MIGRATION_BACKUP_KEY?.trim(),
       allowEmptyDbForBackup: options.allowEmptyDbForBackup ?? false,
     });
+
+    const journalDbPath =
+      options.dbPath ??
+      (this.envVars.DATABASE_PATH
+        ? path.resolve(process.cwd(), this.envVars.DATABASE_PATH)
+        : path.resolve(process.cwd(), 'data', 'financial.db'));
+    this.journal = new MigrationJournal(journalDbPath);
+  }
+
+  public setTestDoublesForTesting(testDoubles: TestDoubles): void {
+    this.testDoubles = testDoubles;
+  }
+
+  public getJournal(): MigrationJournal {
+    return this.journal;
   }
 
   /**
-   * Resolves the current git commit SHA.
+   * Resolves the current git state in a strict fail-closed manner.
+   * Any failure in git commands, detached/invalid commit, or remote tracking mismatch
+   * flags GIT_STATE_UNVERIFIED and blocks dry-run and apply.
    */
-  private resolveCommitSha(): string {
-    try {
-      return execSync('git rev-parse HEAD', {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim();
-    } catch {
-      return this.envVars.GIT_COMMIT_SHA?.trim() || 'unknown';
-    }
-  }
-
-  /**
-   * Checks whether the git working tree is clean.
-   * Any tracked modified file, staged change, or untracked file in relevant paths
-   * (src/, scripts/, tests/, architecture/, package.json, tsconfig.json) flags WORKTREE_DIRTY.
-   */
-  private checkWorkingTreeClean(): {
+  public resolveGitState(): {
     status: WorktreeStatus;
+    branch?: string;
+    commitSha?: string;
     dirtyFiles: string[];
+    unverifiedReason?: string;
   } {
-    if (this.worktreeStatusOverride) {
+    if (this.testDoubles?.simulateGitFailure) {
       return {
-        status: this.worktreeStatusOverride,
+        status: 'GIT_STATE_UNVERIFIED',
+        dirtyFiles: [],
+        unverifiedReason: 'Simulated git failure in test environment',
+      };
+    }
+
+    if (this.testDoubles?.worktreeStatusOverride) {
+      return {
+        status: this.testDoubles.worktreeStatusOverride,
+        branch: this.testDoubles.gitBranchOverride ?? 'feat/phase-1-schema-apply-executor',
+        commitSha: this.testDoubles.gitCommitShaOverride ?? '0123456789abcdef0123456789abcdef01234567',
         dirtyFiles:
-          this.mockDirtyFiles ??
-          (this.worktreeStatusOverride === 'WORKTREE_DIRTY' ? ['M mock/modified-file.ts'] : []),
+          this.testDoubles.mockDirtyFiles ??
+          (this.testDoubles.worktreeStatusOverride === 'WORKTREE_DIRTY' ? ['M mock/modified-file.ts'] : []),
+        unverifiedReason:
+          this.testDoubles.worktreeStatusOverride === 'GIT_STATE_UNVERIFIED'
+            ? 'Test double override'
+            : undefined,
       };
     }
 
     try {
-      const output = execSync('git status --porcelain', {
+      // 1. Resolve commit SHA
+      const commitSha = execSync('git rev-parse HEAD', {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       }).trim();
 
-      if (!output) {
-        return { status: 'WORKTREE_CLEAN', dirtyFiles: [] };
+      if (!commitSha || !/^[0-9a-f]{40}$/i.test(commitSha)) {
+        return {
+          status: 'GIT_STATE_UNVERIFIED',
+          dirtyFiles: [],
+          unverifiedReason: `Commit SHA inválido ou não determinável: '${commitSha}'`,
+        };
       }
 
-      const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+      // 2. Resolve branch
+      let branch = 'unknown';
+      try {
+        const branchOutput = execSync('git rev-parse --abbrev-ref HEAD', {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        if (branchOutput && branchOutput !== 'HEAD') {
+          branch = branchOutput;
+        } else {
+          branch = 'DETACHED_HEAD';
+        }
+      } catch {
+        branch = 'UNVERIFIED';
+      }
+
+      // 3. Remote Tracking Parity Check (if tracking branch configured)
+      if (this.testDoubles?.simulateRemoteTrackingMismatch) {
+        return {
+          status: 'GIT_STATE_UNVERIFIED',
+          branch,
+          commitSha,
+          dirtyFiles: [],
+          unverifiedReason: 'HEAD local diverge do tracking remoto (simulado)',
+        };
+      }
+
+      try {
+        const upstreamSha = execSync('git rev-parse @{u}', {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+
+        if (upstreamSha && upstreamSha !== commitSha) {
+          return {
+            status: 'GIT_STATE_UNVERIFIED',
+            branch,
+            commitSha,
+            dirtyFiles: [],
+            unverifiedReason: `HEAD local (${commitSha.slice(0, 7)}) diverge do tracking remoto @{u} (${upstreamSha.slice(0, 7)}). Push ou sincronização obrigatória.`,
+          };
+        }
+      } catch {
+        // No upstream tracking branch configured yet, skip tracking parity check
+      }
+
+      // 4. Expected Commit SHA Check (if provided)
+      if (this.expectedCommitSha && commitSha !== this.expectedCommitSha) {
+        return {
+          status: 'GIT_STATE_UNVERIFIED',
+          branch,
+          commitSha,
+          dirtyFiles: [],
+          unverifiedReason: `HEAD local (${commitSha}) não coincide com o commit esperado (${this.expectedCommitSha}).`,
+        };
+      }
+
+      // 5. Working Tree Status Check
+      const statusOutput = execSync('git status --porcelain', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+
+      if (!statusOutput) {
+        return {
+          status: 'WORKTREE_CLEAN',
+          branch,
+          commitSha,
+          dirtyFiles: [],
+        };
+      }
+
+      const lines = statusOutput.split('\n').map((l) => l.trim()).filter(Boolean);
       const relevantDirtyFiles: string[] = [];
 
       for (const line of lines) {
@@ -134,12 +238,26 @@ export class MigrationRunner {
       }
 
       if (relevantDirtyFiles.length > 0) {
-        return { status: 'WORKTREE_DIRTY', dirtyFiles: relevantDirtyFiles };
+        return {
+          status: 'WORKTREE_DIRTY',
+          branch,
+          commitSha,
+          dirtyFiles: relevantDirtyFiles,
+        };
       }
 
-      return { status: 'WORKTREE_CLEAN', dirtyFiles: [] };
-    } catch {
-      return { status: 'WORKTREE_CLEAN', dirtyFiles: [] };
+      return {
+        status: 'WORKTREE_CLEAN',
+        branch,
+        commitSha,
+        dirtyFiles: [],
+      };
+    } catch (err: any) {
+      return {
+        status: 'GIT_STATE_UNVERIFIED',
+        dirtyFiles: [],
+        unverifiedReason: `Falha ao executar comandos git: ${err.message || String(err)}`,
+      };
     }
   }
 
@@ -152,18 +270,18 @@ export class MigrationRunner {
   public async runDryRun(): Promise<DryRunReport> {
     const timestamp = new Date().toISOString();
 
-    // 0. Gate: Working Tree Clean Check
-    const { status: worktreeStatus, dirtyFiles } = this.checkWorkingTreeClean();
+    // 0. Gate: Fail-closed Git State Check
+    const gitState = this.resolveGitState();
 
     // 1. Read-only Preflight Check
     const preflight = await this.preflightValidator.runPreflight(this.envVars);
 
-    // Apply liveSnapshotOverride if specified (e.g. for testing)
-    if (this.liveSnapshotOverride) {
-      preflight.liveSnapshot = this.liveSnapshotOverride;
+    // Apply liveSnapshotOverride if specified in test doubles
+    if (this.testDoubles?.liveSnapshotOverride) {
+      preflight.liveSnapshot = this.testDoubles.liveSnapshotOverride;
       preflight.liveSnapshotSha256 = crypto
         .createHash('sha256')
-        .update(canonicalizeJson(this.liveSnapshotOverride), 'utf8')
+        .update(canonicalizeJson(this.testDoubles.liveSnapshotOverride), 'utf8')
         .digest('hex');
     }
 
@@ -176,7 +294,8 @@ export class MigrationRunner {
     const schemaPlan = schemaPlanner.generatePlan();
 
     // 3. Generate Deterministic Backfill Plan (DML)
-    const backfillPlan = this.backfillPlanner.generatePlan();
+    const backfillPlanner = new BackfillPlanner();
+    const backfillPlan = backfillPlanner.generatePlan();
 
     // 4. Build Input Fingerprint
     const dataSourceIds: Record<string, string> = {};
@@ -187,7 +306,7 @@ export class MigrationRunner {
     }
 
     const inputFingerprint: InputFingerprint = {
-      commitSha: this.resolveCommitSha(),
+      commitSha: gitState.commitSha ?? 'unknown',
       notionApiVersion: preflight.apiVersion,
       parentPageId: preflight.parentPage.pageId || '',
       dataSourceIds,
@@ -221,7 +340,7 @@ export class MigrationRunner {
     let structuralMismatches = 0;
     let structuralMismatchProperty: string | undefined;
     let missingCount = 0;
-    const unexpectedMissingProperties: string[] = [];
+    const actualMissingProperties = new Set<string>();
 
     const hasLiveSnapshot = Object.keys(preflight.liveSnapshot).length > 0;
 
@@ -242,8 +361,23 @@ export class MigrationRunner {
           }
           if (diff.status === 'MISSING') {
             missingCount++;
+            actualMissingProperties.add(`${contract.envKey}.${diff.notionProperty}`);
           }
         }
+      }
+    }
+
+    const unexpectedMissingProperties: string[] = [];
+    for (const prop of actualMissingProperties) {
+      if (!HOMOLOGATED_MISSING_PROPERTIES.has(prop)) {
+        unexpectedMissingProperties.push(prop);
+      }
+    }
+
+    const expectedMissingButPresent: string[] = [];
+    for (const prop of HOMOLOGATED_MISSING_PROPERTIES) {
+      if (!actualMissingProperties.has(prop)) {
+        expectedMissingButPresent.push(prop);
       }
     }
 
@@ -255,7 +389,9 @@ export class MigrationRunner {
       heuristicSuggestions === 0 &&
       structuralMismatches === 1 &&
       structuralMismatchProperty === 'Obrigações Mensais.Status' &&
-      missingCount === 51;
+      missingCount === HOMOLOGATED_MISSING_PROPERTIES.size &&
+      unexpectedMissingProperties.length === 0 &&
+      expectedMissingButPresent.length === 0;
 
     const schemaConformance: SchemaConformanceResult = {
       typeMismatches,
@@ -266,6 +402,7 @@ export class MigrationRunner {
       structuralMismatchProperty,
       missingCount,
       unexpectedMissingProperties,
+      expectedMissingButPresent,
       isConformant,
     };
 
@@ -282,18 +419,41 @@ export class MigrationRunner {
 
     let applyReady = dryRunValid && preflight.errors.length === 0;
 
-    if (worktreeStatus === 'WORKTREE_DIRTY') {
+    if (gitState.status === 'GIT_STATE_UNVERIFIED') {
       dryRunValid = false;
       applyReady = false;
       reasons.push(
-        `WORKTREE_DIRTY: Working tree possui alterações não commitadas ou staged (${dirtyFiles.join(', ')}). Dry-run e apply bloqueados até commit 100% limpo.`,
+        `GIT_STATE_UNVERIFIED: Estado git não verificável (${gitState.unverifiedReason ?? 'Falha ao verificar commit/branch'}). Dry-run e apply bloqueados.`,
+      );
+    } else if (gitState.status === 'WORKTREE_DIRTY') {
+      dryRunValid = false;
+      applyReady = false;
+      reasons.push(
+        `WORKTREE_DIRTY: Working tree possui alterações não commitadas ou staged (${gitState.dirtyFiles.join(', ')}). Dry-run e apply bloqueados até commit 100% limpo.`,
       );
     }
 
     if (!schemaConformance.isConformant) {
       applyReady = false;
+      const details: string[] = [];
+      if (typeMismatches > 0) details.push(`TYPE_MISMATCH=${typeMismatches}`);
+      if (renameTypeMismatches > 0) details.push(`RENAME_TYPE_MISMATCH=${renameTypeMismatches}`);
+      if (renameStructuralMismatches > 0) details.push(`RENAME_STRUCTURAL_MISMATCH=${renameStructuralMismatches}`);
+      if (heuristicSuggestions > 0) details.push(`HEURISTIC_SUGGESTION=${heuristicSuggestions}`);
+      if (structuralMismatches !== 1 || structuralMismatchProperty !== 'Obrigações Mensais.Status') {
+        details.push(`STRUCTURAL_MISMATCH=${structuralMismatches} [esperado: 1 em Obrigações Mensais.Status]`);
+      }
+      if (missingCount !== HOMOLOGATED_MISSING_PROPERTIES.size) {
+        details.push(`MISSING=${missingCount} [esperado: ${HOMOLOGATED_MISSING_PROPERTIES.size}]`);
+      }
+      if (unexpectedMissingProperties.length > 0) {
+        details.push(`UNEXPECTED_MISSING=${unexpectedMissingProperties.join(', ')}`);
+      }
+      if (expectedMissingButPresent.length > 0) {
+        details.push(`EXPECTED_MISSING_BUT_PRESENT=${expectedMissingButPresent.join(', ')}`);
+      }
       reasons.push(
-        `SCHEMA_NON_CONFORMANT: Divergências contra o baseline homologado detectadas (TYPE_MISMATCH=${typeMismatches}, RENAME_TYPE_MISMATCH=${renameTypeMismatches}, RENAME_STRUCTURAL_MISMATCH=${renameStructuralMismatches}, HEURISTIC_SUGGESTION=${heuristicSuggestions}, STRUCTURAL_MISMATCH=${structuralMismatches} [esperado: 1 em Obrigações Mensais.Status], MISSING=${missingCount} [esperado: 51]).`,
+        `SCHEMA_NON_CONFORMANT: Divergências contra o baseline homologado detectadas (${details.join(' | ')}).`,
       );
     }
 
@@ -317,8 +477,10 @@ export class MigrationRunner {
     const readiness: MigrationReadiness = {
       dryRunValid,
       applyReady,
-      worktreeStatus,
-      dirtyFiles: dirtyFiles.length > 0 ? dirtyFiles : undefined,
+      worktreeStatus: gitState.status,
+      gitBranch: gitState.branch,
+      gitCommitSha: gitState.commitSha,
+      dirtyFiles: gitState.dirtyFiles.length > 0 ? gitState.dirtyFiles : undefined,
       schemaConformance,
       reasons,
     };
@@ -363,7 +525,26 @@ export class MigrationRunner {
       );
     }
 
-    // Gate: Block actual mutations in this phase as per instructions
+    if (!this.client) {
+      throw new Error('APPLY_BLOCKED: Client do Notion não inicializado. NOTION_API_KEY obrigatória.');
+    }
+
+    // Gate: Physical mutations gate strictly disabled in SchemaApplyExecutor (allowRealMutations: false)
+    const executor = new SchemaApplyExecutor({
+      client: this.client,
+      journal: this.journal,
+      plan: dryRunResult.plan,
+      envVars: this.envVars,
+      allowRealMutations: false,
+    });
+
+    const runId = `run_${Date.now()}`;
+    await executor.executeDdlPlan(
+      runId,
+      dryRunResult.readiness.gitCommitSha ?? 'unknown',
+      dryRunResult.readiness.gitBranch ?? 'unknown',
+    );
+
     throw new Error(
       'MUTAÇÕES REAIS BLOQUEADAS: A execução física (apply) de modificações no Notion permanece desabilitada nesta fase. Conclua a validação do runner e o gate de aprovação antes de habilitar mutations.',
     );
@@ -382,10 +563,12 @@ export class MigrationRunner {
     lines.push(`Timestamp: ${report.timestamp}`);
     lines.push(`Mutations no Notion: ${report.mutationsExecuted} (Estritamente Read-Only)`);
     lines.push(
-      `Working Tree: ${
+      `Working Tree / Git: ${
         report.readiness.worktreeStatus === 'WORKTREE_CLEAN'
-          ? '✅ LIMPO (WORKTREE_CLEAN)'
-          : `❌ SUJO (WORKTREE_DIRTY — ${report.readiness.dirtyFiles?.join(', ') ?? 'arquivos alterados'})`
+          ? `✅ LIMPO (${report.readiness.gitBranch ?? 'branch'} @ ${report.readiness.gitCommitSha?.slice(0, 7) ?? 'sha'})`
+          : report.readiness.worktreeStatus === 'WORKTREE_DIRTY'
+          ? `❌ SUJO (WORKTREE_DIRTY — ${report.readiness.dirtyFiles?.join(', ') ?? 'arquivos alterados'})`
+          : `❌ NÃO VERIFICADO (GIT_STATE_UNVERIFIED)`
       }`,
     );
     lines.push(`Dry-Run Status: ${report.readiness.dryRunValid ? '✅ VÁLIDO' : '❌ INVÁLIDO'}`);
@@ -409,7 +592,13 @@ export class MigrationRunner {
       lines.push(
         `  • STRUCTURAL_MISMATCH: ${sc.structuralMismatches} (esperado: 1 -> ${sc.structuralMismatchProperty ?? 'N/A'})`,
       );
-      lines.push(`  • MISSING (Propriedades a criar): ${sc.missingCount} (esperado: 51)`);
+      lines.push(`  • MISSING (Propriedades a criar): ${sc.missingCount} (esperado: ${HOMOLOGATED_MISSING_PROPERTIES.size})`);
+      if (sc.unexpectedMissingProperties.length > 0) {
+        lines.push(`  • UNEXPECTED MISSING: ${sc.unexpectedMissingProperties.join(', ')}`);
+      }
+      if (sc.expectedMissingButPresent.length > 0) {
+        lines.push(`  • EXPECTED MISSING BUT PRESENT: ${sc.expectedMissingButPresent.join(', ')}`);
+      }
     }
 
     if (report.readiness.reasons.length > 0) {
@@ -502,5 +691,12 @@ export class MigrationRunner {
     lines.push('═══════════════════════════════════════════════════════════════════════════════');
 
     return lines.join('\n');
+  }
+}
+
+export class TestableMigrationRunner extends MigrationRunner {
+  constructor(options: MigrationRunnerOptions = {}, testDoubles: TestDoubles = {}) {
+    super(options);
+    this.setTestDoublesForTesting(testDoubles);
   }
 }
