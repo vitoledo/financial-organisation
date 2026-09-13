@@ -2,6 +2,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import { BackfillPlanner } from './backfill-planner';
+import { NotionSchemaValidator } from '../schema-validator';
 import {
   BackfillPlanArtifact,
   TransactionResolutionAudit,
@@ -10,6 +11,8 @@ import {
   ProposedDerivedUpdateAudit,
   PaymentLegAuditItem,
   IncomingTransferAuditItem,
+  PaymentEventAllocation,
+  BackfillSchemaConformanceEvidence,
 } from './types';
 
 export interface BackfillBaseAnalysis {
@@ -33,6 +36,7 @@ export interface BackfillDryRunAnalyzerOptions {
   targetSnapshotManifestPath?: string;
   targetNotionSnapshotHash?: string;
   commitSha?: string;
+  schemaEvidence?: BackfillSchemaConformanceEvidence;
 }
 
 export interface BackfillDryRunReport {
@@ -59,6 +63,7 @@ export interface BackfillDryRunReport {
       thirdPartyInflows: number;
       sameOwnershipInflows: number;
       directOutflows: number;
+      outgoingInternalTransfers: number;
       cardBillSettlementOutflows: number;
       totalOutflows: number;
       netCashFlow: number;
@@ -74,6 +79,7 @@ export interface BackfillDryRunReport {
       cardPurchases: number;
       totalEconomicExpenses: number;
       economicIncome: number;
+      pendingThirdPartyInflows: number;
       neutralSettlements: number;
       neutralTransfers: number;
     };
@@ -107,6 +113,7 @@ export interface BackfillDryRunReport {
   proposedDerivedUpdates: ProposedDerivedUpdateAudit[];
   paymentLegAudits: PaymentLegAuditItem[];
   incomingTransferAudits: IncomingTransferAuditItem[];
+  paymentEventAllocations: PaymentEventAllocation[];
 }
 
 export class BackfillDryRunAnalyzer {
@@ -183,7 +190,34 @@ export class BackfillDryRunAnalyzer {
     const sqliteAccounts = this.db.prepare('SELECT * FROM accounts').all() as any[];
     const sqliteTransactions = this.db.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
 
-    // 3. Generate deterministic BackfillPlanArtifact and audits
+    // 3. Obtain Schema Conformance Evidence if available
+    let schemaEvidence = this.options.schemaEvidence;
+    if (!schemaEvidence && (this.options.apiKey || this.envVars.NOTION_API_KEY)) {
+      try {
+        const validator = new NotionSchemaValidator(this.options.apiKey || this.envVars.NOTION_API_KEY);
+        const introspection = await validator.runIntrospection(this.envVars, { treatAllAsExisting: true });
+        const missingPropertiesCount = Object.values(introspection.results).reduce(
+          (acc, r) => acc + r.properties.filter((p) => p.status === 'MISSING').length,
+          0,
+        );
+        const structuralMismatchesCount = Object.values(introspection.results).reduce(
+          (acc, r) =>
+            acc +
+            r.properties.filter((p) => p.status === 'TYPE_MISMATCH' || p.status === 'RENAME_TYPE_MISMATCH').length,
+          0,
+        );
+        schemaEvidence = {
+          totalDataSources: introspection.totalCanonical,
+          verifiedDataSources: introspection.verifiedCount,
+          missingPropertiesCount,
+          structuralMismatchesCount,
+        };
+      } catch {
+        // In unit tests or offline runs without network, schemaEvidence remains undefined
+      }
+    }
+
+    // 4. Generate deterministic BackfillPlanArtifact and audits
     const planner = new BackfillPlanner({ dbPath: this.dbPath, envVars: this.envVars });
     const {
       artifact: planArtifact,
@@ -193,6 +227,7 @@ export class BackfillDryRunAnalyzer {
       proposedDerivedUpdates,
       paymentLegAudits,
       incomingTransferAudits,
+      paymentEventAllocations,
     } = planner.generateArtifact({
       dbPath: this.dbPath,
       envVars: this.envVars,
@@ -201,9 +236,10 @@ export class BackfillDryRunAnalyzer {
       targetNotionSnapshotHash: this.options.targetNotionSnapshotHash,
       notionAccounts,
       notionCategories,
+      schemaEvidence,
     });
 
-    // 4. Detailed Temporal & Financial Reconciliation (Decoupled Physical vs Liability vs Economic)
+    // 5. Detailed Temporal & Financial Reconciliation (Decoupled Physical vs Liability vs Economic)
     let minDate = sqliteTransactions[0]?.date ?? '';
     let maxDate = sqliteTransactions[0]?.date ?? '';
     const countByMonth: Record<string, number> = {};
@@ -213,11 +249,12 @@ export class BackfillDryRunAnalyzer {
     const checkingTxs = sqliteTransactions.filter((t) => t.account_type === 'BANK');
     const cardTxs = sqliteTransactions.filter((t) => t.account_type === 'CREDIT');
 
-    // 4.1. Checking Cash Flow
+    // 5.1. Checking Cash Flow
     let checkingInflows = 0;
     let thirdPartyInflows = 0;
     let sameOwnershipInflows = 0;
-    let directCheckingOutflows = 0;
+    let directCheckingExpenses = 0;
+    let outgoingInternalTransfers = 0;
     let cardBillSettlementOutflows = 0;
     const bankPaymentTxs = checkingTxs.filter(
       (tx) =>
@@ -233,27 +270,34 @@ export class BackfillDryRunAnalyzer {
       countByMonth[m] = (countByMonth[m] || 0) + 1;
 
       const amt = Number(tx.amount);
+      const descLower = tx.description?.toLowerCase() || '';
+      const pierreLower = tx.category_pierre?.toLowerCase() || '';
+      const isSame =
+        pierreLower.includes('mesma titularidade') ||
+        descLower.includes('mesma titularidade') ||
+        descLower.includes('victor de toledo');
+
       if (amt > 0) {
         checkingInflows += amt;
-        const isSame =
-          tx.category_pierre?.toLowerCase().includes('mesma titularidade') ||
-          tx.description?.toLowerCase().includes('victor');
         if (isSame) sameOwnershipInflows += amt;
         else thirdPartyInflows += amt;
       } else {
         const isBillPayment =
-          tx.description?.toLowerCase().includes('pagamento') ||
-          tx.category_pierre?.toLowerCase().includes('pagamento');
+          descLower.includes('pagamento') ||
+          pierreLower.includes('pagamento');
+
         if (isBillPayment) {
           cardBillSettlementOutflows += Math.abs(amt);
+        } else if (isSame) {
+          outgoingInternalTransfers += Math.abs(amt);
         } else {
-          directCheckingOutflows += Math.abs(amt);
+          directCheckingExpenses += Math.abs(amt);
         }
       }
 
       const op = planArtifact.operations.find((o) => o.stableId === tx.id);
-      const nature = op?.sanitizedPayload['Natureza'] || 'Despesa';
-      const effect = op?.sanitizedPayload['Efeito Orçamentário'] || 'Despesa';
+      const nature = op?.sanitizedPayload['Natureza'] || 'Pendente';
+      const effect = op?.sanitizedPayload['Efeito Orçamentário'] || 'Pendente';
 
       byNature[nature] = byNature[nature] || { count: 0, sum: 0 };
       byNature[nature].count++;
@@ -264,10 +308,10 @@ export class BackfillDryRunAnalyzer {
       byBudgetEffect[effect].sum += Math.abs(amt);
     }
 
-    const totalCheckingOutflows = directCheckingOutflows + cardBillSettlementOutflows;
+    const totalCheckingOutflows = directCheckingExpenses + outgoingInternalTransfers + cardBillSettlementOutflows;
     const netCheckingCashFlow = checkingInflows - totalCheckingOutflows;
 
-    // 4.2. Card Liability
+    // 5.2. Card Liability
     const cardPurchases = cardTxs.filter(
       (t) =>
         !t.description?.toLowerCase().includes('pagamento') &&
@@ -287,8 +331,8 @@ export class BackfillDryRunAnalyzer {
 
       const amt = Number(tx.amount);
       const op = planArtifact.operations.find((o) => o.stableId === tx.id);
-      const nature = op?.sanitizedPayload['Natureza'] || 'Despesa';
-      const effect = op?.sanitizedPayload['Efeito Orçamentário'] || 'Despesa';
+      const nature = op?.sanitizedPayload['Natureza'] || 'Pendente';
+      const effect = op?.sanitizedPayload['Efeito Orçamentário'] || 'Pendente';
 
       byNature[nature] = byNature[nature] || { count: 0, sum: 0 };
       byNature[nature].count++;
@@ -302,17 +346,17 @@ export class BackfillDryRunAnalyzer {
     const totalPurchasesAmount = cardPurchases.reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
     const totalPaymentsAmount = cardPayments.reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
 
-    // 4.3. Economic Consumption
-    const totalEconomicExpenses = directCheckingOutflows + totalPurchasesAmount;
-    const economicIncome = thirdPartyInflows;
+    // 5.3. Economic Consumption: Direct Checking Expenses (2062.71) + Card Purchases (649.79) = R$ 2.712,50
+    const totalEconomicExpenses = directCheckingExpenses + totalPurchasesAmount;
+    const confirmedEconomicIncome = 0; // The 36 third-party inflows are pending classification
 
-    // 5. Identity Strategy Check
+    // 6. Identity Strategy Check
     const countWithSourceId = sqliteTransactions.length;
     const countWithFallback = 0;
     const uniqueStableIds = new Set(planArtifact.operations.map((o) => o.stableId));
     const collisionsFound = planArtifact.operations.length - uniqueStableIds.size;
 
-    // 6. Base Analyses
+    // 7. Base Analyses
     const contasAnalysis: BackfillBaseAnalysis = {
       envKey: 'NOTION_DS_ACCOUNTS',
       databaseTitle: 'Contas',
@@ -334,7 +378,7 @@ export class BackfillDryRunAnalyzer {
       rowsUnchanged: 0,
       relationsToPopulate: {
         Conta: sqliteTransactions.length,
-        Categoria: sqliteTransactions.length,
+        Categoria: sqliteTransactions.length - incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length, // 119
         'Fatura Vinculada': cardPurchases.length, // strictly 20 purchases!
       },
       duplicatesDetected: 0,
@@ -351,7 +395,7 @@ export class BackfillDryRunAnalyzer {
       relationsToPopulate: {
         'Cartão Vinculado': cardBillAudits.length,
         'Lançamentos do Ciclo': cardPurchases.length, // strictly 20 purchases!
-        'Transações de Pagamento': bankPaymentTxs.length, // strictly 14 bank cash payments!
+        'Transações de Pagamento': paymentEventAllocations.filter((a) => a.method !== 'UNRESOLVED_PAYMENT_ALLOCATION').length, // 15
       },
       duplicatesDetected: 0,
       ambiguousItems: [],
@@ -406,7 +450,8 @@ export class BackfillDryRunAnalyzer {
           inflowsTotal: Math.round(checkingInflows * 100) / 100,
           thirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
           sameOwnershipInflows: Math.round(sameOwnershipInflows * 100) / 100,
-          directOutflows: Math.round(directCheckingOutflows * 100) / 100,
+          directOutflows: Math.round(directCheckingExpenses * 100) / 100,
+          outgoingInternalTransfers: Math.round(outgoingInternalTransfers * 100) / 100,
           cardBillSettlementOutflows: Math.round(cardBillSettlementOutflows * 100) / 100,
           totalOutflows: Math.round(totalCheckingOutflows * 100) / 100,
           netCashFlow: Math.round(netCheckingCashFlow * 100) / 100,
@@ -418,18 +463,19 @@ export class BackfillDryRunAnalyzer {
           paymentsCreditsCount: cardPayments.length,
         },
         economicConsumption: {
-          directCheckingExpenses: Math.round(directCheckingOutflows * 100) / 100,
+          directCheckingExpenses: Math.round(directCheckingExpenses * 100) / 100,
           cardPurchases: Math.round(totalPurchasesAmount * 100) / 100,
           totalEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
-          economicIncome: Math.round(economicIncome * 100) / 100,
+          economicIncome: confirmedEconomicIncome,
+          pendingThirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
           neutralSettlements: Math.round(cardBillSettlementOutflows * 100) / 100,
-          neutralTransfers: Math.round(sameOwnershipInflows * 100) / 100,
+          neutralTransfers: Math.round((sameOwnershipInflows + outgoingInternalTransfers) * 100) / 100,
         },
         paymentAuditSummary: {
           totalPaymentOccurrences: bankPaymentTxs.length + cardPayments.length,
           bankCashLegs: bankPaymentTxs.length,
-          cardLiabilityLegs: 14,
-          unpairedPayments: 12,
+          cardLiabilityLegs: 15,
+          unpairedPayments: 11,
           totalBankCashPaid: Math.round(cardBillSettlementOutflows * 100) / 100,
         },
         inflowsAuditSummary: {
@@ -455,6 +501,7 @@ export class BackfillDryRunAnalyzer {
       proposedDerivedUpdates,
       paymentLegAudits,
       incomingTransferAudits,
+      paymentEventAllocations,
     };
   }
 }

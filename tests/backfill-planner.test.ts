@@ -49,6 +49,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     NOTION_DS_TRANSACTIONS: 'fake-tx-ds',
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
+    NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
   };
 
   describe('validateOperationAgainstContract', () => {
@@ -213,7 +214,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(cardPaymentOps.every((o) => !o.relations['Fatura Vinculada'] || o.relations['Fatura Vinculada'].length === 0)).toBe(true);
     });
 
-    it('assigns Transações de Pagamento on card bills to the 14 bank cash leg payments', () => {
+    it('assigns Transações de Pagamento on card bills to the 15 payment events', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -227,7 +228,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         (acc, b) => acc + (b.relations['Transações de Pagamento']?.length || 0),
         0,
       );
-      expect(totalPaymentLegRelations).toBe(14);
+      expect(totalPaymentLegRelations).toBe(15);
 
       const totalCycleTransactions = billOps.reduce(
         (acc, b) => acc + (b.relations['Lançamentos do Ciclo']?.length || 0),
@@ -236,7 +237,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(totalCycleTransactions).toBe(20);
     });
 
-    it('includes all 13 dynamic readiness checks in BackfillPlanArtifact', () => {
+    it('includes all 14 dynamic readiness checks in BackfillPlanArtifact', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -244,13 +245,14 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const checks = artifact.readiness.checks;
-      expect(Object.keys(checks)).toHaveLength(13);
+      expect(Object.keys(checks)).toHaveLength(14);
       expect(checks).toHaveProperty('schemaConformant13Of13');
       expect(checks).toHaveProperty('missingPropertiesZero');
       expect(checks).toHaveProperty('structuralMismatchesZero');
       expect(checks).toHaveProperty('duplicatesZero');
       expect(checks).toHaveProperty('unresolvedAccountsZero');
       expect(checks).toHaveProperty('unresolvedCategoriesZero');
+      expect(checks).toHaveProperty('unresolvedPaymentAllocationsZero');
       expect(checks).toHaveProperty('financialDiscrepancyZero');
       expect(checks).toHaveProperty('identityCollisionsZero');
       expect(checks).toHaveProperty('targetSnapshotValid');
@@ -258,6 +260,222 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(checks).toHaveProperty('worktreeClean');
       expect(checks).toHaveProperty('headInSyncWithRemote');
       expect(checks).toHaveProperty('planHashReproducible');
+    });
+  });
+
+  describe('Dynamic Checks & Negative Proofs (Fase 2A.2)', () => {
+    it('throws FAIL_CLOSED_TARGET_SNAPSHOT if NOTION_TARGET_SNAPSHOT_MANIFEST is missing', () => {
+      const envWithoutManifest = { ...testEnv, NOTION_TARGET_SNAPSHOT_MANIFEST: '' };
+      const planner = new BackfillPlanner({ envVars: envWithoutManifest });
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+        });
+      }).toThrow(/FAIL_CLOSED_TARGET_SNAPSHOT/);
+    });
+
+    it('throws CORRUPTED_SNAPSHOT if manifest targetNotionSnapshotHash diverges', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+          targetNotionSnapshotHash: 'bad_hash_'.padEnd(64, '0'),
+        });
+      }).toThrow(/CORRUPTED_SNAPSHOT/);
+    });
+
+    it('throws FAIL_CLOSED_SOURCE_DB if sourceSnapshotHash does not match SQLite DB', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+          sourceSnapshotHash: 'bad_db_hash_'.padEnd(64, '0'),
+        });
+      }).toThrow(/FAIL_CLOSED_SOURCE_DB/);
+    });
+
+    it('throws FAIL_CLOSED_ENV if NOTION_DS_CARD_BILLS is missing', () => {
+      const envWithoutBills = { ...testEnv, NOTION_DS_CARD_BILLS: '' };
+      const planner = new BackfillPlanner({ envVars: envWithoutBills });
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+        });
+      }).toThrow(/FAIL_CLOSED_ENV: Variável NOTION_DS_CARD_BILLS/);
+    });
+
+    it('evaluates schemaConformant13Of13 as false when 12/13 bases are verified', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        schemaEvidence: {
+          totalDataSources: 13,
+          verifiedDataSources: 12,
+          missingPropertiesCount: 0,
+          structuralMismatchesCount: 0,
+        },
+      });
+      expect(artifact.readiness.checks.schemaConformant13Of13).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'SCHEMA_NON_CONFORMANT: Notion live não possui as 13 bases canônicas verificadas.',
+      );
+    });
+
+    it('evaluates missingPropertiesZero as false when missingPropertiesCount > 0', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        schemaEvidence: {
+          totalDataSources: 13,
+          verifiedDataSources: 13,
+          missingPropertiesCount: 1,
+          structuralMismatchesCount: 0,
+        },
+      });
+      expect(artifact.readiness.checks.missingPropertiesZero).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'SCHEMA_MISSING_PROPERTIES: Existem propriedades obrigatórias ausentes no Notion live.',
+      );
+    });
+
+    it('evaluates structuralMismatchesZero as false when structuralMismatchesCount > 0', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        schemaEvidence: {
+          totalDataSources: 13,
+          verifiedDataSources: 13,
+          missingPropertiesCount: 0,
+          structuralMismatchesCount: 1,
+        },
+      });
+      expect(artifact.readiness.checks.structuralMismatchesZero).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'SCHEMA_STRUCTURAL_MISMATCHES: Existem incompatibilidades estruturais no Notion live.',
+      );
+    });
+
+    it('evaluates financialDiscrepancyZero as false when a discrepancy of R$ 0.01 is introduced', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        _mockExpectedEconomicExpenses: 2712.51,
+      });
+      expect(artifact.readiness.checks.financialDiscrepancyZero).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'FINANCIAL_DISCREPANCY: Discrepância financeira residual detectada (R$ 0.01).',
+      );
+    });
+
+    it('evaluates planHashReproducible as false when hash is not reproduced independently', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        _forceIrreproducibleHash: true,
+      });
+      expect(artifact.readiness.checks.planHashReproducible).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'PLAN_HASH_IRREPRODUCIBLE: Divergência na reprodução do backfillPlanHash.',
+      );
+    });
+
+    it('excludes outgoing internal transfers (R$ 115,00) from economic expenses', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      const internalTransferOps = artifact.operations.filter(
+        (o) => o.sanitizedPayload['Natureza'] === 'Transferência interna',
+      );
+      expect(internalTransferOps.length).toBeGreaterThan(0);
+      expect(internalTransferOps.every((o) => o.sanitizedPayload['Efeito Orçamentário'] === 'Neutro')).toBe(true);
+
+      const totalExpenses = artifact.operations
+        .filter((o) => o.sanitizedPayload['Efeito Orçamentário'] === 'Despesa')
+        .reduce((sum, o) => sum + Number(o.sanitizedPayload['Valor']), 0);
+      expect(Math.round(totalExpenses * 100) / 100).toBe(2712.5);
+    });
+
+    it('treats 36 third-party inflows as economically pending review with null nature and effect', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact, incomingTransferAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      expect(artifact.readiness.pendingEconomicClassificationCount).toBe(36);
+
+      const pendingAudits = incomingTransferAudits.filter(
+        (t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER',
+      );
+      expect(pendingAudits).toHaveLength(36);
+      expect(pendingAudits.every((t) => t.economicNature === null)).toBe(true);
+      expect(pendingAudits.every((t) => t.budgetEffect === null)).toBe(true);
+      expect(pendingAudits.every((t) => t.reviewStatus === 'Pendente Revisão')).toBe(true);
+
+      // Verify corresponding operations
+      const pendingTxIds = new Set(pendingAudits.map((a) => a.txId));
+      const pendingOps = artifact.operations.filter((o) => pendingTxIds.has(o.stableId));
+      expect(pendingOps).toHaveLength(36);
+      expect(pendingOps.every((o) => o.sanitizedPayload['Natureza'] === null)).toBe(true);
+      expect(pendingOps.every((o) => o.sanitizedPayload['Efeito Orçamentário'] === null)).toBe(true);
+      expect(pendingOps.every((o) => !o.relations['Categoria'] || o.relations['Categoria'].length === 0)).toBe(true);
+      expect(pendingOps.every((o) => o.sanitizedPayload['Status de Revisão'] === 'Pendente Revisão')).toBe(true);
+    });
+
+    it('audits card cycles status and unexplained discrepancy accurately', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      expect(cardBillAudits).toHaveLength(5);
+
+      // Cycle 2 (June) - fully paid with external payment included
+      const cycle2 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:a5ea6710-2f6e-4663-a237-2c062b8fa8d7');
+      expect(cycle2).toBeDefined();
+      expect(cycle2!.somaCompras).toBe(171.79);
+      expect(cycle2!.paidAmount).toBe(171.79);
+      expect(cycle2!.unexplainedDiscrepancy).toBe(0);
+      expect(cycle2!.status).toBe('Paga Integralmente');
+      expect(cycle2!.dataLiquidacao).toBe('2026-06-12');
+
+      // Cycle 3 (July) - fully paid
+      const cycle3 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:f4513058-c028-4b90-b663-16f27d0e2d8e');
+      expect(cycle3).toBeDefined();
+      expect(cycle3!.somaCompras).toBe(55.89);
+      expect(cycle3!.paidAmount).toBe(55.89);
+      expect(cycle3!.unexplainedDiscrepancy).toBe(0);
+      expect(cycle3!.status).toBe('Paga Integralmente');
+      expect(cycle3!.dataLiquidacao).toBe('2026-07-06');
+
+      // Cycle 1 (May) - partially paid, discrepancy 24.85
+      const cycle1 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:7f6be926-ae1b-4685-a830-8ec6e773fbf0');
+      expect(cycle1).toBeDefined();
+      expect(cycle1!.somaCompras).toBe(7.08);
+      expect(cycle1!.paidAmount).toBe(31.93);
+      expect(cycle1!.unexplainedDiscrepancy).toBe(24.85);
+      expect(cycle1!.status).toBe('Paga Parcialmente');
+
+      // Cycle 4 (July open/fallback) - partially paid, discrepancy 316.24
+      const cycle4 = cardBillAudits.find((b) => b.stableBillId === 'nubank:cartao:2026-07:cycle');
+      expect(cycle4).toBeDefined();
+      expect(cycle4!.somaCompras).toBe(415.03);
+      expect(cycle4!.paidAmount).toBe(98.79);
+      expect(cycle4!.unexplainedDiscrepancy).toBe(316.24);
+      expect(cycle4!.status).toBe('Paga Parcialmente');
     });
   });
 });

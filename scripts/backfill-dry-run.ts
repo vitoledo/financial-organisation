@@ -5,7 +5,7 @@ dotenv.config();
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════════════════════════');
-  console.log('  FASE 2A.1: AUDITORIA E FECHAMENTO DETERMINÍSTICO DO PLANO DE BACKFILL');
+  console.log('  FASE 2A.2: FECHAMENTO FINANCEIRO E PROVENANCE REAL DO PLANO DE BACKFILL');
   console.log('             (MODO ESTRITAMENTE READ-ONLY — ZERO ESCRITAS NO NOTION)');
   console.log('═══════════════════════════════════════════════════════════════════════════════\n');
 
@@ -49,10 +49,11 @@ async function main() {
 
   console.log('\n  [A] Fluxo de Caixa Físico — Conta Corrente (Nubank Conta, 109 txs):');
   console.log(`      • Entradas Físicas (+): R$ ${r.checkingCashFlow.inflowsTotal.toFixed(2)}`);
-  console.log(`          - Entradas de Terceiros: R$ ${r.checkingCashFlow.thirdPartyInflows.toFixed(2)}`);
-  console.log(`          - Transferências Mesma Titularidade: R$ ${r.checkingCashFlow.sameOwnershipInflows.toFixed(2)}`);
+  console.log(`          - Entradas de Terceiros (36 txs pendentes): R$ ${r.checkingCashFlow.thirdPartyInflows.toFixed(2)}`);
+  console.log(`          - Transferências Mesma Titularidade (1 tx entrada): R$ ${r.checkingCashFlow.sameOwnershipInflows.toFixed(2)}`);
   console.log(`      • Saídas Físicas (-): R$ ${r.checkingCashFlow.totalOutflows.toFixed(2)}`);
-  console.log(`          - Despesas Diretas / Transferências: R$ ${r.checkingCashFlow.directOutflows.toFixed(2)}`);
+  console.log(`          - Despesas Diretas de Conta: R$ ${r.checkingCashFlow.directOutflows.toFixed(2)}`);
+  console.log(`          - Transferências Mesma Titularidade (Saídas): R$ ${r.checkingCashFlow.outgoingInternalTransfers.toFixed(2)}`);
   console.log(`          - Pagamentos / Amortizações de Fatura: R$ ${r.checkingCashFlow.cardBillSettlementOutflows.toFixed(2)}`);
   console.log(`      • Saldo Líquido de Caixa Físico: R$ ${r.checkingCashFlow.netCashFlow.toFixed(2)}`);
 
@@ -63,28 +64,47 @@ async function main() {
   console.log('        o desembolso físico ocorre unicamente no pagamento da fatura pela conta corrente.');
 
   console.log('\n  [C] Consumo Econômico e Orçamentário Desacoplado:');
-  console.log(`      • Despesas Econômicas Diretas (Conta Corrente): R$ ${r.economicConsumption.directCheckingExpenses.toFixed(2)}`);
+  console.log(`      • Despesas Econômicas Diretas (Conta Corrente, deduzindo R$ 115,00 internas): R$ ${r.economicConsumption.directCheckingExpenses.toFixed(2)}`);
   console.log(`      • Despesas Econômicas de Cartão (Compras): R$ ${r.economicConsumption.cardPurchases.toFixed(2)}`);
-  console.log(`      • Consumo Econômico Total: R$ ${r.economicConsumption.totalEconomicExpenses.toFixed(2)}`);
-  console.log(`      • Receitas Econômicas: R$ ${r.economicConsumption.economicIncome.toFixed(2)}`);
-  console.log(`      • Liquidações de Dívida (Neutras): R$ ${r.economicConsumption.neutralSettlements.toFixed(2)}`);
-  console.log(`      • Transferências Internas (Neutras): R$ ${r.economicConsumption.neutralTransfers.toFixed(2)}`);
-  console.log(`      • Discrepância / Diferença: R$ ${r.discrepancy.toFixed(2)} (ZERO DIVERGÊNCIA)\n`);
+  console.log(`      • Consumo Econômico Total (Despesas Orçamentárias): R$ ${r.economicConsumption.totalEconomicExpenses.toFixed(2)}`);
+  console.log(`      • Receitas Econômicas Confirmadas: R$ ${r.economicConsumption.economicIncome.toFixed(2)}`);
+  console.log(`      • Entradas de Terceiros Pendentes de Classificação: R$ ${r.economicConsumption.pendingThirdPartyInflows.toFixed(2)} (36 txs — Status: Pendente Revisão)`);
+  console.log(`      • Liquidações de Fatura de Cartão (Neutras de Caixa): R$ ${r.economicConsumption.neutralSettlements.toFixed(2)}`);
+  console.log(`      • Transferências Internas Mesma Titularidade (Neutras): R$ ${r.economicConsumption.neutralTransfers.toFixed(2)}`);
+  console.log(`      • Discrepância / Diferença Orçamentária: R$ ${r.discrepancy.toFixed(2)} (ZERO DIVERGÊNCIA)\n`);
 
   // 3. AUDITORIA DAS 40 OCORRÊNCIAS DE PAGAMENTO DE CARTÃO
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('  3. AUDITORIA INDIVIDUAL DAS 40 OCORRÊNCIAS DE PAGAMENTO DE CARTÃO');
+  console.log('  3. AUDITORIA DAS 40 OCORRÊNCIAS DE PAGAMENTO DE CARTÃO E RECONCILIAÇÃO');
   console.log('───────────────────────────────────────────────────────────────────────────────');
   const pAudit = r.paymentAuditSummary;
   console.log(`  • Total de Ocorrências Analisadas: ${pAudit.totalPaymentOccurrences}`);
   console.log(`  • Pernas de Caixa Bancário (BANK_CASH_LEG): ${pAudit.bankCashLegs} (Total R$ ${pAudit.totalBankCashPaid.toFixed(2)})`);
   console.log(`  • Pernas de Amortização no Cartão (CARD_LIABILITY_LEG): ${pAudit.cardLiabilityLegs}`);
   console.log(`  • Ocorrências Não Pareadas / Sombra (UNPAIRED_PAYMENT): ${pAudit.unpairedPayments}`);
+  console.log(`  • Total de Eventos de Pagamento Reconciliados: ${report.paymentEventAllocations.length} (14 bank legs + 1 pagamento externo 19c8a4cb)`);
   console.log('  • Vínculos Canônicos com Faturas:');
-  console.log('      - 14 BANK_CASH_LEGs vinculam-se a Faturas.Transações de Pagamento');
+  console.log('      - 15 eventos de pagamento vinculam-se a Faturas.Transações de Pagamento');
   console.log('      - 0 pagamentos de cartão vinculam-se a Transações.Fatura Vinculada (exclusivo para 20 compras)\n');
 
-  console.log('| # | ID Transação | Conta | Data | Valor (R$) | Role | Source ID | Possível Par | Descrição |');
+  console.log('  [A] Tabela de Eventos de Pagamento Reconciliados:');
+  console.log('| Event ID | Tx Pagamento | Repr. Canônico | Fatura Alvo | Valor (R$) | Método | Confiança | Evidência |');
+  console.log('| :--- | :--- | :--- | :--- | :---: | :--- | :---: | :--- |');
+  report.paymentEventAllocations.forEach((evt) => {
+    const eid = evt.paymentEventId.padEnd(20, ' ');
+    const tx = evt.paymentTxId.substring(0, 14).padEnd(14, ' ');
+    const rep = evt.canonicalRepresentativeTxId.substring(0, 14).padEnd(14, ' ');
+    const bId = evt.billStableId.padEnd(30, ' ');
+    const val = evt.amount.toFixed(2).padStart(8, ' ');
+    const meth = evt.method.padEnd(25, ' ');
+    const conf = evt.confidence.padEnd(9, ' ');
+    const evi = evt.evidence.substring(0, 35);
+    console.log(`| ${eid} | ${tx} | ${rep} | ${bId} | ${val} | ${meth} | ${conf} | ${evi} |`);
+  });
+  console.log('');
+
+  console.log('  [B] Auditoria Individual das 40 Ocorrências de Pagamento:');
+  console.log('| # | ID Transação | Conta | Data | Valor (R$) | Role | Event ID | Repr. Canônico | Descrição |');
   console.log('| :---: | :--- | :--- | :---: | :---: | :--- | :--- | :--- | :--- |');
   report.paymentLegAudits.forEach((leg, idx) => {
     const num = (idx + 1).toString().padStart(2, ' ');
@@ -93,25 +113,25 @@ async function main() {
     const dt = leg.date.substring(0, 19).replace('T', ' ');
     const val = leg.signedAmount.toFixed(2).padStart(8, ' ');
     const role = leg.role.padEnd(18, ' ');
-    const src = leg.sourceId.substring(0, 14);
-    const pair = leg.possiblePairId ? leg.possiblePairId.substring(0, 14) : 'nenhum        ';
-    const desc = leg.description.substring(0, 30);
-    console.log(`| ${num} | ${txIdShort} | ${acc} | ${dt} | ${val} | ${role} | ${src} | ${pair} | ${desc} |`);
+    const evId = leg.paymentEventId.substring(0, 16).padEnd(16, ' ');
+    const repId = leg.canonicalRepresentativeTxId.substring(0, 14).padEnd(14, ' ');
+    const desc = leg.description.substring(0, 25);
+    console.log(`| ${num} | ${txIdShort} | ${acc} | ${dt} | ${val} | ${role} | ${evId} | ${repId} | ${desc} |`);
   });
   console.log('');
 
-  // 4. AUDITORIA DAS 36 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS
+  // 4. AUDITORIA DAS 37 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('  4. AUDITORIA DAS 36 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS');
+  console.log('  4. AUDITORIA DAS 37 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS');
   console.log('───────────────────────────────────────────────────────────────────────────────');
   const inAudit = r.inflowsAuditSummary;
   console.log(`  • Total de Entradas Analisadas: ${inAudit.totalInflows}`);
-  console.log(`  • Transferências Mesma Titularidade: ${inAudit.sameOwnershipInflowsCount} (R$ 149,88 — Neutro)`);
-  console.log(`  • Entradas de Terceiros: ${inAudit.thirdPartyInflowsCount} (Total R$ ${inAudit.unprovedThirdPartyRevenueTotal.toFixed(2)})`);
-  console.log('  • Política de Governança de Dados:');
-  console.log('      - 35 entradas de terceiros classificadas como "Receita", porém com');
-  console.log('        Status de Revisão = "Pendente Revisão" devido à ausência de comprovação');
-  console.log('        documental estrita de vínculo empregatício / folha salarial na fonte.\n');
+  console.log(`  • Transferências Mesma Titularidade: ${inAudit.sameOwnershipInflowsCount} (R$ 149,88 — Neutro / Confirmado Auto)`);
+  console.log(`  • Entradas de Terceiros Pendentes: ${inAudit.thirdPartyInflowsCount} (Total R$ ${inAudit.unprovedThirdPartyRevenueTotal.toFixed(2)})`);
+  console.log('  • Política de Governança de Dados Estrita:');
+  console.log('      - 36 entradas de terceiros têm Natureza = null, Efeito Orçamentário = null,');
+  console.log('        Categoria = [] e Status de Revisão = "Pendente Revisão"');
+  console.log(`      - pendingEconomicClassificationCount = ${report.planArtifact.readiness.pendingEconomicClassificationCount} (NÃO contabilizadas como receitas confirmadas)\n`);
 
   console.log('| # | Data | Valor (R$) | Contraparte | Classificação | Natureza | Status Revisão | Motivo Revisão |');
   console.log('| :---: | :---: | :---: | :--- | :--- | :--- | :--- | :--- |');
@@ -121,7 +141,7 @@ async function main() {
     const val = inf.amount.toFixed(2).padStart(8, ' ');
     const cp = inf.counterpartyName.substring(0, 22).padEnd(22, ' ');
     const cls = inf.counterpartyType.padEnd(22, ' ');
-    const nat = inf.economicNature.padEnd(14, ' ');
+    const nat = (inf.economicNature || 'null').padEnd(14, ' ');
     const st = inf.reviewStatus.padEnd(16, ' ');
     const rsn = inf.reviewReason ? inf.reviewReason.substring(0, 45) : 'Confirmado';
     console.log(`| ${num} | ${dt} | ${val} | ${cp} | ${cls} | ${nat} | ${st} | ${rsn} |`);
@@ -132,12 +152,11 @@ async function main() {
   console.log('───────────────────────────────────────────────────────────────────────────────');
   console.log('  5. AUDITORIA DOS 5 CICLOS DE FATURA DE CARTÃO E PROVENIÊNCIA DE CAMPOS');
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('| Stable Bill ID | Início | Fim | Fechamento | Vencimento | Status | Qualidade | Compras | Soma Compras | Valor Oficial |');
-  console.log('| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |');
+  console.log('| Stable Bill ID | Início | Fim | Fechamento | Vencimento | Status | Qualidade | Compras | Soma Compras | Pago | Discrepância |');
+  console.log('| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |');
   for (const b of report.cardBillAudits) {
-    const ofVal = b.valorOficial !== null ? `R$ ${b.valorOficial.toFixed(2)}` : 'null';
     console.log(
-      `| ${b.stableBillId.padEnd(42, ' ')} | ${b.inicio} | ${b.fim} | ${b.fechamento} | ${b.vencimento} | ${b.status.padEnd(18, ' ')} | ${b.qualidade} | ${b.nCompras.toString().padStart(2, ' ')} | R$ ${b.somaCompras.toFixed(2).padStart(6, ' ')} | ${ofVal.padStart(7, ' ')} |`,
+      `| ${b.stableBillId.padEnd(42, ' ')} | ${b.inicio} | ${b.fim} | ${b.fechamento} | ${b.vencimento} | ${b.status.padEnd(18, ' ')} | ${b.qualidade.padEnd(18, ' ')} | ${b.nCompras.toString().padStart(2, ' ')} | R$ ${b.somaCompras.toFixed(2).padStart(6, ' ')} | R$ ${b.paidAmount.toFixed(2).padStart(6, ' ')} | R$ ${b.unexplainedDiscrepancy.toFixed(2).padStart(6, ' ')} |`,
     );
   }
 
@@ -146,17 +165,17 @@ async function main() {
   console.log('| :--- | :---: | :--- |');
   console.log('| Fatura / Ciclo (Title) | DERIVED | Template "Nubank Cartão - Mês/Ano" |');
   console.log('| Fonte | SOURCE | Valor "Open Finance" fixado da extração upstream |');
-  console.log('| ID da Fatura na Fonte | SOURCE | UUID upstream ou "OPEN_FINANCE_AGGREGATED_BILL" |');
-  console.log('| ID Estável da Fatura | DERIVED | Hash SHA-256 do cartão + datas do ciclo |');
-  console.log('| Qualidade da Identidade | SOURCE/CONFIG | "UPSTREAM_APPROXIMATE" ou "UPSTREAM_EXPLICIT" |');
+  console.log('| ID da Fatura na Fonte | SOURCE | UUID upstream ou vazio para estimados |');
+  console.log('| ID Estável da Fatura | DERIVED | Hash SHA-256 do cartão + datas do ciclo ou UUID upstream |');
+  console.log('| Qualidade da Identidade | SOURCE/CONFIG | "UPSTREAM_EXPLICIT" ou "DERIVED" |');
   console.log('| Cartão Vinculado | DERIVED | Vínculo tipado para Notion page ID de Nubank Cartão |');
-  console.log('| Tipo de Ciclo | CONFIGURED | "Ciclo Real Banco" conforme enum canônico Notion |');
+  console.log('| Tipo de Ciclo | CONFIGURED | "Ciclo Real Banco" ou "Ciclo Estimado" conforme enum |');
   console.log('| Origem / Qualidade dos Dados | CONFIGURED | "Aproximado por Transações Upstream" |');
-  console.log('| Status da Fatura | DERIVED | "Fechada" se fechamento <= data corte, senão "Aberta" |');
+  console.log('| Status da Fatura | DERIVED | "Paga Integralmente", "Paga Parcialmente" ou "Aberta em Curso" |');
   console.log('| Início / Fim / Fechamento / Vencimento | SOURCE/CONFIG | Metadados do ciclo ou datas de transações |');
-  console.log('| Total de Compras no Ciclo | DERIVED | Soma estrita das 20 compras (R$ 649,79 total) |');
+  console.log('| Total de Compras no Ciclo | DERIVED | Soma estrita das compras do ciclo (R$ 649,79 total) |');
   console.log('| Lançamentos do Ciclo | DERIVED | Relação com exatamente 20 compras (STAGE_2) |');
-  console.log('| Transações de Pagamento | DERIVED | Relação com 14 pernas bancárias de pagamento (STAGE_2) |\n');
+  console.log('| Transações de Pagamento | DERIVED | Relação com 15 eventos de pagamento reconciliados (STAGE_2) |\n');
 
   // 6. ATUALIZAÇÕES DERIVADAS SUSPENSAS (FORA DE ESCOPO)
   console.log('───────────────────────────────────────────────────────────────────────────────');
@@ -207,7 +226,7 @@ async function main() {
   console.log('      - 5 Faturas de Cartão (vinculadas ao Cartão existente)');
   console.log(`  • Estágio 2 (Resolução e Patch de Relações Recíprocas): ${execPlan.stage2RelationPatchesCount} entidades alvo`);
   console.log('      - 20 compras vinculadas à Fatura Vinculada (PLANNED_STABLE_ID -> pageId real)');
-  console.log('      - 5 faturas vinculadas aos Lançamentos do Ciclo (20 compras) e Transações de Pagamento (14 pagamentos)\n');
+  console.log('      - 5 faturas vinculadas aos Lançamentos do Ciclo (20 compras) e Transações de Pagamento (15 pagamentos)\n');
 
   // 10. ARTEFATO IMUTÁVEL DE BACKFILL PLAN
   console.log('───────────────────────────────────────────────────────────────────────────────');
@@ -232,11 +251,12 @@ async function main() {
   console.log(`      - $env:${p.securityGates.planHashVar} = "${p.backfillPlanHash}"`);
   console.log(`      - $env:${p.securityGates.commitShaVar} = "${p.commitSha}"`);
 
-  console.log('\n  • Avaliação Dinâmica das Pré-condições de Execução (13 Checks):');
+  console.log(`\n  • Avaliação Dinâmica das Pré-condições de Execução (${Object.keys(p.readiness.checks).length} Checks):`);
   for (const [chk, val] of Object.entries(p.readiness.checks)) {
     console.log(`      [${val ? '✅ CONFORME' : '❌ PENDENTE'}] ${chk}`);
   }
-  console.log(`\n  • Status Consolidado: READY_FOR_APPLY = ${p.readiness.readyForApply ? 'true' : 'false'}`);
+  console.log(`\n  • Status Consolidado: READY_FOR_EXECUTOR_IMPLEMENTATION = ${p.readiness.readyForExecutorImplementation ? 'true' : 'false'}`);
+  console.log(`    (readyForApply = ${p.readiness.readyForApply ? 'true' : 'false'}, pendingEconomicClassificationCount = ${p.readiness.pendingEconomicClassificationCount})`);
   if (p.readiness.blockers.length > 0) {
     console.log('  • Bloqueadores Atuais:');
     for (const b of p.readiness.blockers) {

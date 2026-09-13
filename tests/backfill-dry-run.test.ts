@@ -40,12 +40,13 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
   };
 
   const testEnv = {
-    NOTION_API_KEY: 'test-key',
+    NOTION_API_KEY: '',
     NOTION_DS_ACCOUNTS: 'fake-acc-ds',
     NOTION_DS_CATEGORIES: 'fake-cat-ds',
     NOTION_DS_TRANSACTIONS: 'fake-tx-ds',
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
+    NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
   };
 
   it('resolves 155/155 transactions deterministically via SOURCE_ACCOUNT_ID with 0 UNRESOLVED', async () => {
@@ -118,7 +119,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     expect(report.categoryReconciliations).toHaveLength(18);
     const totalCategorizedTxs = report.categoryReconciliations.reduce((acc, c) => acc + c.quantidade, 0);
-    expect(totalCategorizedTxs).toBe(155);
+    expect(totalCategorizedTxs).toBe(119); // 155 minus 36 pending third-party inflows
   });
 
   it('guarantees deterministic reproducibility of backfillPlanHash', () => {
@@ -174,7 +175,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     expect(run1.artifact.summary.proposedReviewCount).toBe(0);
   });
 
-  it('evaluates READY_FOR_APPLY as false due to dirty worktree and review blockers', async () => {
+  it('evaluates READY_FOR_EXECUTOR_IMPLEMENTATION and readyForApply as false due to unverified offline state', async () => {
     const analyzer = new BackfillDryRunAnalyzer({
       client: fakeClient,
       envVars: testEnv,
@@ -182,7 +183,49 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     const report = await analyzer.runAnalysis();
 
+    expect(report.planArtifact.readiness.readyForExecutorImplementation).toBe(false);
     expect(report.planArtifact.readiness.readyForApply).toBe(false);
+    expect(report.planArtifact.readiness.readyForExecutorImplementation).toBe(
+      report.planArtifact.readiness.readyForApply,
+    );
+    expect(report.planArtifact.readiness.pendingEconomicClassificationCount).toBe(36);
     expect(report.planArtifact.readiness.blockers.length).toBeGreaterThan(0);
+  });
+
+  it('reconciles decoupled checking cash flow, credit card liability, and economic consumption', async () => {
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+    });
+
+    const report = await analyzer.runAnalysis();
+    const r = report.reconciliation;
+
+    // Physical checking cash flow
+    expect(r.checkingCashFlow.directOutflows).toBe(2062.71);
+    expect(r.checkingCashFlow.outgoingInternalTransfers).toBe(115.0);
+    expect(r.checkingCashFlow.cardBillSettlementOutflows).toBe(280.46);
+    expect(r.checkingCashFlow.totalOutflows).toBe(2458.17);
+
+    // Credit card liability
+    expect(r.cardLiability.totalPurchases).toBe(649.79);
+    expect(r.cardLiability.purchasesCount).toBe(20);
+
+    // Decoupled economic consumption: Direct checking (2062.71) + Card purchases (649.79) = R$ 2.712,50
+    expect(r.economicConsumption.directCheckingExpenses).toBe(2062.71);
+    expect(r.economicConsumption.cardPurchases).toBe(649.79);
+    expect(r.economicConsumption.totalEconomicExpenses).toBe(2712.5);
+    expect(r.economicConsumption.pendingThirdPartyInflows).toBe(2294.39);
+    expect(r.discrepancy).toBe(0);
+
+    // Payment event allocations: 15 events, 0 unresolved
+    expect(report.paymentEventAllocations).toHaveLength(15);
+    expect(
+      report.paymentEventAllocations.every((a) => a.method !== 'UNRESOLVED_PAYMENT_ALLOCATION'),
+    ).toBe(true);
+
+    // Dynamic checks
+    expect(report.planArtifact.readiness.checks.unresolvedPaymentAllocationsZero).toBe(true);
+    expect(report.planArtifact.readiness.checks.financialDiscrepancyZero).toBe(true);
   });
 });

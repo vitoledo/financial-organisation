@@ -102,6 +102,17 @@ export type BackfillExecutionStage = 'STAGE_1_PAGE_CREATION' | 'STAGE_2_RELATION
 
 export type PaymentLegRole = 'BANK_CASH_LEG' | 'CARD_LIABILITY_LEG' | 'UNPAIRED_PAYMENT';
 
+export interface PaymentEventAllocation {
+  paymentEventId: string;
+  paymentTxId: string;
+  billStableId: string;
+  amount: number;
+  method: 'EXPLICIT_UPSTREAM_BILL_ID' | 'CYCLE_WINDOW_CORRELATION' | 'UNRESOLVED_PAYMENT_ALLOCATION';
+  confidence: 'VERY_HIGH' | 'HIGH' | 'UNRESOLVED';
+  evidence: string;
+  canonicalRepresentativeTxId: string;
+}
+
 export interface PaymentLegAuditItem {
   txId: string;
   account: string;
@@ -111,7 +122,11 @@ export interface PaymentLegAuditItem {
   sourceId: string;
   possiblePairId: string | null;
   role: PaymentLegRole;
+  paymentEventId: string;
+  canonicalRepresentativeTxId: string;
   targetBillStableId?: string;
+  allocationMethod?: string;
+  allocationConfidence?: string;
   description: string;
 }
 
@@ -130,8 +145,8 @@ export interface IncomingTransferAuditItem {
   description: string;
   counterpartyName: string;
   counterpartyType: InflowCategoryClassification;
-  economicNature: string;
-  budgetEffect: string;
+  economicNature: string | null;
+  budgetEffect: string | null;
   reviewStatus: 'Confirmado Auto' | 'Pendente Revisão';
   reviewReason: string | null;
   hasDocumentaryProof: boolean;
@@ -193,6 +208,8 @@ export interface CardBillAuditItem {
   valorAproximado: number;
   componentesAdicionais: number;
   diferenca: number;
+  unexplainedDiscrepancy: number;
+  paidAmount: number;
   fieldProvenance: CardBillFieldProvenance;
 }
 
@@ -216,6 +233,13 @@ export interface ProposedDerivedUpdateAudit {
   timestampFreshness: string;
   rationale: string;
   status: 'OUT_OF_SCOPE_NOT_EXECUTED' | 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW';
+}
+
+export interface BackfillSchemaConformanceEvidence {
+  totalDataSources: number;
+  verifiedDataSources: number;
+  missingPropertiesCount: number;
+  structuralMismatchesCount: number;
 }
 
 export interface BackfillPlanArtifact {
@@ -246,8 +270,10 @@ export interface BackfillPlanArtifact {
   };
   operations: BackfillOperation[];
   readiness: {
+    readyForExecutorImplementation: boolean;
     readyForApply: boolean;
     blockers: string[];
+    pendingEconomicClassificationCount: number;
     checks: {
       schemaConformant13Of13: boolean;
       missingPropertiesZero: boolean;
@@ -255,6 +281,7 @@ export interface BackfillPlanArtifact {
       duplicatesZero: boolean;
       unresolvedAccountsZero: boolean;
       unresolvedCategoriesZero: boolean;
+      unresolvedPaymentAllocationsZero: boolean;
       financialDiscrepancyZero: boolean;
       identityCollisionsZero: boolean;
       targetSnapshotValid: boolean;
