@@ -91,6 +91,67 @@ export interface TransactionResolutionAudit {
   confidenceStatus: 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'UNRESOLVED';
 }
 
+export type RelationReferenceType = 'EXISTING_PAGE_ID' | 'PLANNED_STABLE_ID';
+
+export interface TypedRelationReference {
+  type: RelationReferenceType;
+  target: string;
+}
+
+export type BackfillExecutionStage = 'STAGE_1_PAGE_CREATION' | 'STAGE_2_RELATION_PATCHING';
+
+export type PaymentLegRole = 'BANK_CASH_LEG' | 'CARD_LIABILITY_LEG' | 'UNPAIRED_PAYMENT';
+
+export interface PaymentLegAuditItem {
+  txId: string;
+  account: string;
+  accountType: 'BANK' | 'CREDIT';
+  date: string;
+  signedAmount: number;
+  sourceId: string;
+  possiblePairId: string | null;
+  role: PaymentLegRole;
+  targetBillStableId?: string;
+  description: string;
+}
+
+export type InflowCategoryClassification =
+  | 'FAMILY_TRANSFER'
+  | 'THIRD_PARTY_TRANSFER'
+  | 'SAME_OWNERSHIP_TRANSFER'
+  | 'SALARY_INCOME'
+  | 'REIMBURSEMENT'
+  | 'UNCLASSIFIED_INFLOW';
+
+export interface IncomingTransferAuditItem {
+  txId: string;
+  date: string;
+  amount: number;
+  description: string;
+  counterpartyName: string;
+  counterpartyType: InflowCategoryClassification;
+  economicNature: string;
+  budgetEffect: string;
+  reviewStatus: 'Confirmado Auto' | 'Pendente Revisão';
+  reviewReason: string | null;
+  hasDocumentaryProof: boolean;
+}
+
+export interface CardBillFieldProvenance {
+  title: 'DERIVED';
+  source: 'SOURCE' | 'CONFIGURED';
+  sourceBillId: 'SOURCE' | 'CONFIGURED';
+  stableBillId: 'DERIVED';
+  identityQuality: 'SOURCE' | 'CONFIGURED';
+  cycleType: 'SOURCE' | 'CONFIGURED';
+  valueQuality: 'DERIVED' | 'CONFIGURED';
+  status: 'DERIVED' | 'CONFIGURED';
+  dates: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
+  purchasesTotal: 'DERIVED';
+  paidAmount: 'DERIVED' | 'CONFIGURED';
+  settlementDate: 'DERIVED' | 'CONFIGURED';
+}
+
 export type BackfillOperationType = 'CREATE' | 'UPDATE';
 
 export type BackfillOperationClassification =
@@ -100,6 +161,7 @@ export type BackfillOperationClassification =
 export interface BackfillOperation {
   operationType: BackfillOperationType;
   classification: BackfillOperationClassification;
+  stage: BackfillExecutionStage;
   stableId: string;
   targetDataSource: {
     envKey: string;
@@ -107,8 +169,8 @@ export interface BackfillOperation {
     name: string;
   };
   sanitizedPayload: Record<string, any>;
-  relations: Record<string, string[]>;
-  dependencies: string[];
+  relations: Record<string, TypedRelationReference[]>;
+  dependencies: TypedRelationReference[];
   reason: string;
   expectedPriorState?: Record<string, any>;
 }
@@ -120,15 +182,18 @@ export interface CardBillAuditItem {
   fim: string;
   fechamento: string;
   vencimento: string;
+  dataLiquidacao: string | null;
   status: string;
   origem: string;
   qualidade: string;
+  tipoCiclo: string;
   nCompras: number;
   somaCompras: number;
   valorOficial: number | null;
   valorAproximado: number;
   componentesAdicionais: number;
   diferenca: number;
+  fieldProvenance: CardBillFieldProvenance;
 }
 
 export interface CategoryReconciliationItem {
@@ -150,7 +215,7 @@ export interface ProposedDerivedUpdateAudit {
   formulaSource: string;
   timestampFreshness: string;
   rationale: string;
-  status: 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW';
+  status: 'OUT_OF_SCOPE_NOT_EXECUTED' | 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW';
 }
 
 export interface BackfillPlanArtifact {
@@ -161,6 +226,16 @@ export interface BackfillPlanArtifact {
   sourceSnapshotHash: string;
   targetNotionSnapshotHash: string;
   backfillPlanHash: string;
+  explicitSnapshots: {
+    sourceDbPath: string;
+    sourceDbSha256: string;
+    targetNotionManifestPath: string;
+    targetNotionSnapshotSha256: string;
+  };
+  executionPlan: {
+    stage1CreationsCount: number;
+    stage2RelationPatchesCount: number;
+  };
   summary: {
     totalOperations: number;
     executableCreateCount: number;
@@ -178,7 +253,8 @@ export interface BackfillPlanArtifact {
       missingPropertiesZero: boolean;
       structuralMismatchesZero: boolean;
       duplicatesZero: boolean;
-      unresolvedZero: boolean;
+      unresolvedAccountsZero: boolean;
+      unresolvedCategoriesZero: boolean;
       financialDiscrepancyZero: boolean;
       identityCollisionsZero: boolean;
       targetSnapshotValid: boolean;

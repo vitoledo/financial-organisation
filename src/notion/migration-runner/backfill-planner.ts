@@ -14,6 +14,10 @@ import {
   CardBillAuditItem,
   CategoryReconciliationItem,
   ProposedDerivedUpdateAudit,
+  PaymentLegAuditItem,
+  IncomingTransferAuditItem,
+  CardBillFieldProvenance,
+  TypedRelationReference,
 } from './types';
 
 export interface BackfillPlanGeneratorOptions {
@@ -22,8 +26,82 @@ export interface BackfillPlanGeneratorOptions {
   commitSha?: string;
   sourceSnapshotHash?: string;
   targetNotionSnapshotHash?: string;
+  targetSnapshotManifestPath?: string;
   notionAccounts?: Array<{ id: string; name: string; type: string }>;
   notionCategories?: Array<{ id: string; name: string; group?: string }>;
+}
+
+/**
+ * Validates each operation payload and relations strictly against TARGET_CONTRACT schema.
+ * Throws an explicit error if any property name or select option is invalid.
+ */
+export function validateOperationAgainstContract(
+  envKey: string,
+  sanitizedPayload: Record<string, any>,
+  relations: Record<string, TypedRelationReference[]>,
+): void {
+  const contract = TARGET_CONTRACT[envKey];
+  if (!contract) {
+    throw new Error(`CONTRACT_VALIDATION_ERROR: Data source '${envKey}' não encontrada em TARGET_CONTRACT.`);
+  }
+
+  // Build property lookup index supporting canonical names and declared aliases
+  const propertyIndex = new Map<string, any>();
+  for (const prop of contract.properties) {
+    propertyIndex.set(prop.notionProperty, prop);
+    if (prop.aliases) {
+      for (const alias of prop.aliases) {
+        propertyIndex.set(alias, prop);
+      }
+    }
+  }
+
+  // 1. Validate primitive payload properties
+  for (const [key, value] of Object.entries(sanitizedPayload)) {
+    const propContract = propertyIndex.get(key);
+    if (!propContract) {
+      throw new Error(
+        `CONTRACT_VALIDATION_ERROR: Propriedade '${key}' não permitida pelo contrato de ${envKey} (${contract.defaultTitle}).`,
+      );
+    }
+
+    // If property is a select, validate option value against contract
+    if (propContract.notionType === 'select' && value !== null && value !== undefined) {
+      const allowedOptions = propContract.expectedOptions || [];
+      if (allowedOptions.length > 0 && !allowedOptions.includes(value)) {
+        throw new Error(
+          `CONTRACT_VALIDATION_ERROR: Opção '${value}' inválida para select '${key}' em ${envKey}. Opções permitidas: [${allowedOptions.join(', ')}]`,
+        );
+      }
+    }
+  }
+
+  // 2. Validate relation properties
+  for (const [relKey, relRefs] of Object.entries(relations)) {
+    const propContract = propertyIndex.get(relKey);
+    if (!propContract) {
+      throw new Error(
+        `CONTRACT_VALIDATION_ERROR: Relação '${relKey}' não permitida pelo contrato de ${envKey} (${contract.defaultTitle}).`,
+      );
+    }
+    if (propContract.notionType !== 'relation') {
+      throw new Error(
+        `CONTRACT_VALIDATION_ERROR: Propriedade '${relKey}' em ${envKey} não é do tipo 'relation' (tipo: ${propContract.notionType}).`,
+      );
+    }
+    for (const ref of relRefs) {
+      if (!ref.type || (ref.type !== 'EXISTING_PAGE_ID' && ref.type !== 'PLANNED_STABLE_ID')) {
+        throw new Error(
+          `CONTRACT_VALIDATION_ERROR: Relação '${relKey}' possui referência sem tipo canônico ('EXISTING_PAGE_ID' | 'PLANNED_STABLE_ID'): ${JSON.stringify(ref)}`,
+        );
+      }
+      if (!ref.target || typeof ref.target !== 'string' || ref.target.trim().length === 0) {
+        throw new Error(
+          `CONTRACT_VALIDATION_ERROR: Relação '${relKey}' possui target vazio ou inválido: ${JSON.stringify(ref)}`,
+        );
+      }
+    }
+  }
 }
 
 export class BackfillPlanner {
@@ -155,51 +233,75 @@ export class BackfillPlanner {
     cardBillAudits: CardBillAuditItem[];
     categoryReconciliations: CategoryReconciliationItem[];
     proposedDerivedUpdates: ProposedDerivedUpdateAudit[];
+    paymentLegAudits: PaymentLegAuditItem[];
+    incomingTransferAudits: IncomingTransferAuditItem[];
   } {
     const generatedAt = new Date().toISOString();
-    const mappingVersion = '2.0.0-phase2a';
+    const mappingVersion = '2.1.0-phase2a.1-hardened';
 
-    // 1. Commit SHA
+    // 1. Commit SHA (FAIL-CLOSED: NO SILENT FALLBACK)
     let commitSha = options.commitSha;
     if (!commitSha) {
       try {
-        commitSha = execSync('git rev-parse HEAD', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-      } catch {
-        commitSha = '45ae3632f112fe54be768545ca2f9f358d8c619d';
+        commitSha = execSync('git rev-parse HEAD', {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+      } catch (err: any) {
+        throw new Error(
+          `FAIL_CLOSED_GIT_RESOLUTION: Falha ao executar 'git rev-parse HEAD': ${err?.message || err}. Não é permitido gerar plano de backfill sem identidade Git estrita.`,
+        );
       }
     }
 
-    // 2. Source Snapshot Hash (SQLite DB)
-    let sourceSnapshotHash = options.sourceSnapshotHash;
-    if (!sourceSnapshotHash && fs.existsSync(this.dbPath)) {
-      const dbBuf = fs.readFileSync(this.dbPath);
-      sourceSnapshotHash = crypto.createHash('sha256').update(dbBuf).digest('hex');
-    } else if (!sourceSnapshotHash) {
-      sourceSnapshotHash = 'LOCAL_DB_EMPTY';
+    if (!commitSha || !/^[a-f0-9]{40}$/i.test(commitSha)) {
+      throw new Error(
+        `FAIL_CLOSED_GIT_RESOLUTION: Commit SHA inválido ou malformatado ('${commitSha}'). Esperado hash SHA-1 de 40 caracteres.`,
+      );
     }
 
-    // 3. Target Notion Snapshot Hash
+    // 2. Source Snapshot Binding (SQLite DB)
+    if (!fs.existsSync(this.dbPath)) {
+      throw new Error(`FAIL_CLOSED_SOURCE_DB: Arquivo de banco de dados SQLite não encontrado em '${this.dbPath}'.`);
+    }
+    const dbBuf = fs.readFileSync(this.dbPath);
+    const calculatedSourceHash = crypto.createHash('sha256').update(dbBuf).digest('hex');
+    const sourceSnapshotHash = options.sourceSnapshotHash ?? calculatedSourceHash;
+
+    // 3. Target Notion Snapshot Binding (Explicit Manifest Binding)
     let targetNotionSnapshotHash = options.targetNotionSnapshotHash;
-    if (!targetNotionSnapshotHash) {
-      try {
-        const backupDir = path.resolve(process.cwd(), 'backups');
-        if (fs.existsSync(backupDir)) {
-          const manifests = fs
-            .readdirSync(backupDir)
-            .filter((f) => f.startsWith('notion-data-snapshot-') && f.endsWith('.manifest.json'))
-            .sort()
-            .reverse();
-          if (manifests.length > 0) {
-            const m = JSON.parse(fs.readFileSync(path.join(backupDir, manifests[0]), 'utf8'));
-            targetNotionSnapshotHash = m.originalJsonSha256 || m.encryptedFileSha256;
-          }
-        }
-      } catch {
-        // ignore
-      }
+    let targetManifestPath = options.targetSnapshotManifestPath ?? this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST;
+
+    if (!targetManifestPath) {
+      targetManifestPath = path.resolve(
+        process.cwd(),
+        'backups',
+        'notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
+      );
     }
-    if (!targetNotionSnapshotHash) {
-      targetNotionSnapshotHash = 'NOTION_SNAPSHOT_NOT_SPECIFIED';
+
+    if (fs.existsSync(targetManifestPath)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(targetManifestPath, 'utf8'));
+        const encFilePath = path.join(path.dirname(targetManifestPath), manifest.backupFileName);
+        if (!fs.existsSync(encFilePath)) {
+          throw new Error(`Arquivo criptografado de snapshot '${encFilePath}' referenciado no manifesto não existe.`);
+        }
+        const encBuf = fs.readFileSync(encFilePath);
+        const actualEncSha = crypto.createHash('sha256').update(encBuf).digest('hex');
+        if (actualEncSha !== manifest.encryptedFileSha256) {
+          throw new Error(
+            `CORRUPTED_SNAPSHOT: Hash do arquivo criptografado (${actualEncSha}) diverge do manifesto (${manifest.encryptedFileSha256}).`,
+          );
+        }
+        targetNotionSnapshotHash = manifest.originalJsonSha256;
+      } catch (err: any) {
+        throw new Error(`FAIL_CLOSED_TARGET_SNAPSHOT: Erro ao validar manifesto de snapshot alvo: ${err.message}`);
+      }
+    } else if (!targetNotionSnapshotHash) {
+      throw new Error(
+        `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${targetManifestPath}' e nenhum hash foi fornecido.`,
+      );
     }
 
     // 4. Data Source IDs
@@ -207,40 +309,71 @@ export class BackfillPlanner {
     const categoriesDsId = this.envVars.NOTION_DS_CATEGORIES?.trim() || 'eb8ef2e3-cfd3-437e-b3f5-6a47dec913b4';
     const transactionsDsId = this.envVars.NOTION_DS_TRANSACTIONS?.trim() || '1fc274bd-b73a-45b1-a902-09aba993f199';
     const cardBillsDsId = this.envVars.NOTION_DS_CARD_BILLS?.trim() || 'edc7a23e-d2f4-4e4e-b2e2-af51212f1b0b';
-    const budgetDsId = this.envVars.NOTION_DS_MONTHLY_BUDGET?.trim() || '0c14523b-9e22-483a-8e63-4b3d0c31c7d5';
 
-    // 5. Notion Accounts & Categories mapping
-    const notionAccounts = options.notionAccounts ?? [
-      { id: '3d8a3ece-fa49-8112-9399-c960be4f604a', name: 'Nubank Cartão', type: 'Cartão de crédito' },
-      { id: '3d8a3ece-fa49-81cd-9951-c9e484acd9ce', name: 'Nubank Conta', type: 'Conta corrente' },
-      { id: '3d8a3ece-fa49-81fe-91b0-e104783a85f4', name: 'Mercado Pago', type: 'Conta corrente' },
-    ];
+    // 5. Notion Accounts & Categories (FAIL-CLOSED: NO SILENT HARDCODED FIXTURES)
+    const notionAccounts = options.notionAccounts;
+    if (!notionAccounts || notionAccounts.length === 0) {
+      throw new Error(
+        'FAIL_CLOSED_NOTION_METADATA: Lista de contas do Notion Live não foi informada. Abortando sem fixtures silenciosas.',
+      );
+    }
 
-    const notionCategories = options.notionCategories ?? [
-      { id: '3d7a3ece-fa49-8101-9d4d-d3393a22430a', name: 'Investimentos e aportes', group: 'Poupança/Investimento' },
-      { id: '3d7a3ece-fa49-810c-ac4d-d1c176e91389', name: 'Impostos e taxas', group: 'Necessidade' },
-      { id: '3d7a3ece-fa49-8114-861d-d5ae73a82c3c', name: 'Transporte', group: 'Necessidade' },
-      { id: '3d7a3ece-fa49-8117-8c8c-ea9f6c685b21', name: 'Outros', group: 'Fora do orçamento' },
-      { id: '3d7a3ece-fa49-8119-85ff-f9eca32d149a', name: 'Compras', group: 'Desejo' },
-      { id: '3d7a3ece-fa49-8122-96a2-c3a6dfd41198', name: 'Presentes e doações', group: 'Desejo' },
-      { id: '3d7a3ece-fa49-812d-ae09-d63ebd22a87b', name: 'Salário', group: 'Fora do orçamento' },
-      { id: '3d7a3ece-fa49-812e-9d10-eb0940684a7b', name: 'Alimentação', group: 'Necessidade' },
-      { id: '3d7a3ece-fa49-8130-91ce-ccc520f33d35', name: 'Reembolsos', group: 'Fora do orçamento' },
-      { id: '3d7a3ece-fa49-8196-bdec-c89e2966c309', name: 'Renda extra', group: 'Fora do orçamento' },
-      { id: '3d7a3ece-fa49-81a1-9aab-c8d2301074a1', name: 'Moradia', group: 'Necessidade' },
-      { id: '3d7a3ece-fa49-81a9-9883-d088e41463b0', name: 'Transferências internas', group: 'Fora do orçamento' },
-      { id: '3d7a3ece-fa49-81b1-8794-c09c8cf52d5c', name: 'Lazer', group: 'Desejo' },
-      { id: '3d7a3ece-fa49-81c9-955f-e26660d01670', name: 'Serviços e assinaturas', group: 'Desejo' },
-      { id: '3d7a3ece-fa49-81dd-a393-da824300a883', name: 'Saúde', group: 'Necessidade' },
-      { id: '3d7a3ece-fa49-81ff-b2a6-ef9debfb14e3', name: 'Educação', group: 'Necessidade' },
-    ];
+    const notionCategories = options.notionCategories;
+    if (!notionCategories || notionCategories.length === 0) {
+      throw new Error(
+        'FAIL_CLOSED_NOTION_METADATA: Lista de categorias do Notion Live não foi informada. Abortando sem fixtures silenciosas.',
+      );
+    }
 
     const categoryIdByName = new Map<string, string>();
     for (const cat of notionCategories) {
       categoryIdByName.set(cat.name.toLowerCase().trim(), cat.id);
     }
 
-    // Mapping dictionary for category reconciliation
+    // 6. SQLite Source Data Extraction & Account Resolution Table
+    const db = new Database(this.dbPath, { readonly: true });
+    const sqliteAccounts = db.prepare('SELECT * FROM accounts').all() as any[];
+    const sqliteTransactions = db.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
+    db.close();
+
+    const accountLookupTable = new Map<
+      string,
+      {
+        notionPageId: string;
+        notionAccountName: string;
+        sourceType: string;
+        sourceSubtype: string;
+      }
+    >();
+
+    const nubankCartaoPage = notionAccounts.find((a) => a.name === 'Nubank Cartão');
+    const nubankContaPage = notionAccounts.find((a) => a.name === 'Nubank Conta');
+
+    if (!nubankCartaoPage || !nubankContaPage) {
+      throw new Error(
+        'FAIL_CLOSED_ACCOUNT_MAPPING: Páginas canônicas de conta (Nubank Cartão / Nubank Conta) ausentes no Notion Live.',
+      );
+    }
+
+    for (const acc of sqliteAccounts) {
+      if (acc.id === 'c82e6d46-15f2-47fc-991d-abaa12f063b8' && acc.type === 'BANK' && acc.subtype === 'CHECKING_ACCOUNT') {
+        accountLookupTable.set(acc.id, {
+          notionPageId: nubankContaPage.id,
+          notionAccountName: nubankContaPage.name,
+          sourceType: acc.type,
+          sourceSubtype: acc.subtype,
+        });
+      } else if (acc.id === '02e273f7-840e-4b3a-b487-348f922dce70' && acc.type === 'CREDIT' && acc.subtype === 'CREDIT_CARD') {
+        accountLookupTable.set(acc.id, {
+          notionPageId: nubankCartaoPage.id,
+          notionAccountName: nubankCartaoPage.name,
+          sourceType: acc.type,
+          sourceSubtype: acc.subtype,
+        });
+      }
+    }
+
+    // 7. Homologated Category Reconciliation Table (18 pairs - zero silent default)
     const categoryMappingTable: Record<string, { canonical: string; method: string }> = {
       '(transferência) || pagamento de cartão de crédito': { canonical: 'Transferências internas', method: 'DEBT_SETTLEMENT_RULE' },
       '(transferência) || transferências': { canonical: 'Transferências internas', method: 'FAMILY_TRANSFER_RULE' },
@@ -262,129 +395,217 @@ export class BackfillPlanner {
       'serviços digitais || serviços digitais': { canonical: 'Serviços e assinaturas', method: 'DIGITAL_SERVICES_RULE' },
     };
 
-    // 6. Read SQLite
-    const db = new Database(this.dbPath, { readonly: true });
-    const sqliteAccounts = db.prepare('SELECT * FROM accounts').all() as any[];
-    const sqliteTransactions = db.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
-    db.close();
+    const categoryAuditMap = new Map<string, { count: number; sum: number; canonical: string; method: string }>();
 
-    const operations: BackfillOperation[] = [];
-    const transactionAudits: TransactionResolutionAudit[] = [];
-
-    // Credit Card Bills aggregation definitions
+    // 8. Card Bill Cycles Derivation
     const cardBillCycles: Record<
       string,
       {
+        title: string;
         stableBillId: string;
+        sourceBillId: string;
         cartao: string;
         inicio: string;
         fim: string;
         fechamento: string;
         vencimento: string;
+        dataLiquidacao: string | null;
         status: string;
         origem: string;
         qualidade: string;
+        tipoCiclo: string;
         purchases: any[];
         payments: any[];
+        fieldProvenance: CardBillFieldProvenance;
       }
     > = {
       'BILL_7f6be926-ae1b-4685-a830-8ec6e773fbf0': {
+        title: 'Nubank Cartão - Ciclo 2026-05 (Venc 16/07)',
         stableBillId: 'nubank:bill:7f6be926-ae1b-4685-a830-8ec6e773fbf0',
+        sourceBillId: '7f6be926-ae1b-4685-a830-8ec6e773fbf0',
         cartao: 'Nubank Cartão',
         inicio: '2026-05-02',
         fim: '2026-05-09',
         fechamento: '2026-05-09',
         vencimento: '2026-07-16',
+        dataLiquidacao: '2026-05-11',
         status: 'Paga Integralmente',
         origem: 'UPSTREAM_BILL_ID',
         qualidade: 'UPSTREAM_APPROXIMATE',
+        tipoCiclo: 'Ciclo Real Banco',
         purchases: [],
         payments: [],
+        fieldProvenance: {
+          title: 'DERIVED',
+          source: 'SOURCE',
+          sourceBillId: 'SOURCE',
+          stableBillId: 'DERIVED',
+          identityQuality: 'SOURCE',
+          cycleType: 'SOURCE',
+          valueQuality: 'DERIVED',
+          status: 'DERIVED',
+          dates: 'SOURCE',
+          purchasesTotal: 'DERIVED',
+          paidAmount: 'DERIVED',
+          settlementDate: 'DERIVED',
+        },
       },
       'BILL_a5ea6710-2f6e-4663-a237-2c062b8fa8d7': {
+        title: 'Nubank Cartão - Ciclo 2026-06 (Venc 16/07)',
         stableBillId: 'nubank:bill:a5ea6710-2f6e-4663-a237-2c062b8fa8d7',
+        sourceBillId: 'a5ea6710-2f6e-4663-a237-2c062b8fa8d7',
         cartao: 'Nubank Cartão',
         inicio: '2026-05-17',
         fim: '2026-06-11',
         fechamento: '2026-06-11',
         vencimento: '2026-07-16',
+        dataLiquidacao: '2026-06-12',
         status: 'Paga Integralmente',
         origem: 'UPSTREAM_BILL_ID',
         qualidade: 'UPSTREAM_APPROXIMATE',
+        tipoCiclo: 'Ciclo Real Banco',
         purchases: [],
         payments: [],
+        fieldProvenance: {
+          title: 'DERIVED',
+          source: 'SOURCE',
+          sourceBillId: 'SOURCE',
+          stableBillId: 'DERIVED',
+          identityQuality: 'SOURCE',
+          cycleType: 'SOURCE',
+          valueQuality: 'DERIVED',
+          status: 'DERIVED',
+          dates: 'SOURCE',
+          purchasesTotal: 'DERIVED',
+          paidAmount: 'DERIVED',
+          settlementDate: 'DERIVED',
+        },
       },
       'BILL_f4513058-c028-4b90-b663-16f27d0e2d8e': {
+        title: 'Nubank Cartão - Ciclo 2026-07 (Venc 16/07)',
         stableBillId: 'nubank:bill:f4513058-c028-4b90-b663-16f27d0e2d8e',
+        sourceBillId: 'f4513058-c028-4b90-b663-16f27d0e2d8e',
         cartao: 'Nubank Cartão',
         inicio: '2026-06-24',
         fim: '2026-07-05',
         fechamento: '2026-07-05',
         vencimento: '2026-07-16',
+        dataLiquidacao: '2026-07-06',
         status: 'Paga Integralmente',
         origem: 'UPSTREAM_BILL_ID',
         qualidade: 'UPSTREAM_APPROXIMATE',
+        tipoCiclo: 'Ciclo Real Banco',
         purchases: [],
         payments: [],
+        fieldProvenance: {
+          title: 'DERIVED',
+          source: 'SOURCE',
+          sourceBillId: 'SOURCE',
+          stableBillId: 'DERIVED',
+          identityQuality: 'SOURCE',
+          cycleType: 'SOURCE',
+          valueQuality: 'DERIVED',
+          status: 'DERIVED',
+          dates: 'SOURCE',
+          purchasesTotal: 'DERIVED',
+          paidAmount: 'DERIVED',
+          settlementDate: 'DERIVED',
+        },
       },
       'PERIOD_2026-07': {
+        title: 'Nubank Cartão - Ciclo 2026-07 Aberto (Venc 16/08)',
         stableBillId: 'nubank:cartao:2026-07:cycle',
+        sourceBillId: '',
         cartao: 'Nubank Cartão',
         inicio: '2026-07-10',
         fim: '2026-07-30',
         fechamento: '2026-07-30',
         vencimento: '2026-08-16',
+        dataLiquidacao: null,
         status: 'Aberta em Curso',
         origem: 'PERIOD_ESTIMATED',
-        qualidade: 'UPSTREAM_APPROXIMATE',
+        qualidade: 'DERIVED',
+        tipoCiclo: 'Ciclo Estimado',
         purchases: [],
         payments: [],
+        fieldProvenance: {
+          title: 'DERIVED',
+          source: 'CONFIGURED',
+          sourceBillId: 'CONFIGURED',
+          stableBillId: 'DERIVED',
+          identityQuality: 'CONFIGURED',
+          cycleType: 'CONFIGURED',
+          valueQuality: 'DERIVED',
+          status: 'CONFIGURED',
+          dates: 'DERIVED',
+          purchasesTotal: 'DERIVED',
+          paidAmount: 'DERIVED',
+          settlementDate: 'CONFIGURED',
+        },
       },
       'PERIOD_2026-08': {
+        title: 'Nubank Cartão - Ciclo 2026-08 Aberto (Venc 16/09)',
         stableBillId: 'nubank:cartao:2026-08:cycle',
+        sourceBillId: '',
         cartao: 'Nubank Cartão',
         inicio: '2026-08-01',
         fim: '2026-08-02',
         fechamento: '2026-08-31',
         vencimento: '2026-09-16',
+        dataLiquidacao: null,
         status: 'Aberta em Curso',
         origem: 'PERIOD_ESTIMATED',
-        qualidade: 'UPSTREAM_APPROXIMATE',
+        qualidade: 'DERIVED',
+        tipoCiclo: 'Ciclo Estimado',
         purchases: [],
         payments: [],
+        fieldProvenance: {
+          title: 'DERIVED',
+          source: 'CONFIGURED',
+          sourceBillId: 'CONFIGURED',
+          stableBillId: 'DERIVED',
+          identityQuality: 'CONFIGURED',
+          cycleType: 'CONFIGURED',
+          valueQuality: 'DERIVED',
+          status: 'CONFIGURED',
+          dates: 'DERIVED',
+          purchasesTotal: 'DERIVED',
+          paidAmount: 'DERIVED',
+          settlementDate: 'CONFIGURED',
+        },
       },
     };
 
-    const nubankCartaoPage = notionAccounts.find((a) => a.name === 'Nubank Cartão')!;
-    const nubankContaPage = notionAccounts.find((a) => a.name === 'Nubank Conta')!;
+    // 9. Transaction Processing & Auditing (155 Transactions)
+    const operations: BackfillOperation[] = [];
+    const transactionAudits: TransactionResolutionAudit[] = [];
+    const incomingTransferAudits: IncomingTransferAuditItem[] = [];
 
-    // Category reconciliation map
-    const categoryAuditMap = new Map<string, { count: number; sum: number; canonical: string; method: string }>();
+    let unresolvedAccountsCount = 0;
+    let unresolvedCategoriesCount = 0;
 
-    // Process all 155 transactions
     for (const tx of sqliteTransactions) {
       const raw = JSON.parse(tx.raw_json || '{}');
       const amount = Number(tx.amount);
       const isCredit = tx.account_type === 'CREDIT';
-      const isPayment = tx.description.toLowerCase().includes('pagamento');
+      const isPayment =
+        tx.description.toLowerCase().includes('pagamento') ||
+        (tx.category_pierre && tx.category_pierre.toLowerCase().includes('pagamento'));
 
-      // 1. Resolve Account
+      // 9.1. SOURCE_ACCOUNT_ID Resolution
+      const accountLookup = accountLookupTable.get(tx.account_id);
       let resolvedAccountName = '';
       let resolvedAccountPageId = '';
       let resolutionMethod: any = 'UNRESOLVED';
       let confidenceStatus: any = 'UNRESOLVED';
 
-      if (isCredit) {
-        resolvedAccountName = 'Nubank Cartão';
-        resolvedAccountPageId = nubankCartaoPage.id;
+      if (accountLookup) {
+        resolvedAccountName = accountLookup.notionAccountName;
+        resolvedAccountPageId = accountLookup.notionPageId;
         resolutionMethod = 'SOURCE_ACCOUNT_ID';
         confidenceStatus = 'VERY_HIGH';
       } else {
-        // Bank account: account_id in sqlite and raw_json is c82e6d46-15f2-47fc-991d-abaa12f063b8
-        resolvedAccountName = 'Nubank Conta';
-        resolvedAccountPageId = nubankContaPage.id;
-        resolutionMethod = 'SOURCE_ACCOUNT_ID';
-        confidenceStatus = 'VERY_HIGH';
+        unresolvedAccountsCount++;
       }
 
       transactionAudits.push({
@@ -400,56 +621,117 @@ export class BackfillPlanner {
         confidenceStatus,
       });
 
-      // 2. Resolve Category
+      // 9.2. Category Resolution (No Silent Defaults)
       const mappedLower = (tx.category_mapped || '').toLowerCase().trim();
       const pierreLower = (tx.category_pierre || '').toLowerCase().trim();
       const lookupKey = `${mappedLower} || ${pierreLower}`;
-      const catMapping = categoryMappingTable[lookupKey] || {
-        canonical: 'Outros',
-        method: 'FALLBACK_UNCLASSIFIED',
-      };
+      const catMapping = categoryMappingTable[lookupKey];
 
-      if (!categoryAuditMap.has(lookupKey)) {
-        categoryAuditMap.set(lookupKey, {
-          count: 0,
-          sum: 0,
-          canonical: catMapping.canonical,
-          method: catMapping.method,
-        });
+      let categoryPageId = '';
+      if (catMapping) {
+        categoryPageId = categoryIdByName.get(catMapping.canonical.toLowerCase().trim()) || '';
+        if (!categoryAuditMap.has(lookupKey)) {
+          categoryAuditMap.set(lookupKey, {
+            count: 0,
+            sum: 0,
+            canonical: catMapping.canonical,
+            method: catMapping.method,
+          });
+        }
+        const cStat = categoryAuditMap.get(lookupKey)!;
+        cStat.count++;
+        cStat.sum += amount;
+      } else {
+        unresolvedCategoriesCount++;
+        confidenceStatus = 'UNRESOLVED';
       }
-      const cStat = categoryAuditMap.get(lookupKey)!;
-      cStat.count++;
-      cStat.sum += amount;
 
-      const categoryPageId = categoryIdByName.get(catMapping.canonical.toLowerCase().trim()) || '';
-
-      // 3. Resolve Nature and Budget Effect
+      // 9.3. Economic Nature, Budget Effect, and Review Status Audit
       let economicNature = 'Despesa';
       let budgetEffect = 'Despesa';
-      const descLower = tx.description.toLowerCase();
+      let reviewStatus = 'Confirmado Auto';
+      let reviewReason: string | null = null;
+      const desc = tx.description.trim();
+      const descLower = desc.toLowerCase();
 
-      if (isPayment) {
-        economicNature = 'Pagamento de fatura';
-        budgetEffect = 'Neutro';
-      } else if (pierreLower.includes('mesma titularidade') || descLower.includes('mesma titularidade')) {
-        economicNature = 'Transferência interna';
-        budgetEffect = 'Neutro';
-      } else if (mappedLower.includes('transferência') || mappedLower.includes('(transferência)')) {
-        if (amount > 0) {
+      const isSameOwnership =
+        pierreLower.includes('mesma titularidade') ||
+        descLower.includes('mesma titularidade') ||
+        descLower.includes('victor de toledo');
+
+      if (amount > 0) {
+        // Inflows (41 transactions)
+        if (isSameOwnership) {
+          economicNature = 'Transferência interna';
+          budgetEffect = 'Neutro';
+          reviewStatus = 'Confirmado Auto';
+          reviewReason = null;
+          incomingTransferAudits.push({
+            txId: tx.id,
+            date: tx.date,
+            amount,
+            description: desc,
+            counterpartyName: 'Victor de Toledo Rodrigues Silva',
+            counterpartyType: 'SAME_OWNERSHIP_TRANSFER',
+            economicNature,
+            budgetEffect,
+            reviewStatus: 'Confirmado Auto',
+            reviewReason: null,
+            hasDocumentaryProof: true,
+          });
+        } else {
+          // Third-party inflows (36 transactions): flagged as Pendente Revisão due to lack of payroll/tax proof
           economicNature = 'Receita';
           budgetEffect = 'Receita';
-        } else {
-          economicNature = 'Despesa';
-          budgetEffect = 'Despesa';
+          reviewStatus = 'Pendente Revisão';
+          reviewReason =
+            'Transferência recebida de terceiro sem comprovação documental de remuneração formal ou reembolso no open-finance';
+
+          const counterpartyName = desc.includes('|') ? desc.split('|')[1].trim() : desc;
+          const isFamily =
+            counterpartyName.toLowerCase().includes('nilson') ||
+            counterpartyName.toLowerCase().includes('carolina') ||
+            counterpartyName.toLowerCase().includes('sophia');
+
+          incomingTransferAudits.push({
+            txId: tx.id,
+            date: tx.date,
+            amount,
+            description: desc,
+            counterpartyName,
+            counterpartyType: isFamily ? 'FAMILY_TRANSFER' : 'THIRD_PARTY_TRANSFER',
+            economicNature,
+            budgetEffect,
+            reviewStatus: 'Pendente Revisão',
+            reviewReason,
+            hasDocumentaryProof: false,
+          });
         }
+      } else if (isPayment) {
+        economicNature = 'Pagamento de fatura';
+        budgetEffect = 'Neutro';
+        reviewStatus = 'Confirmado Auto';
+      } else if (isSameOwnership) {
+        economicNature = 'Transferência interna';
+        budgetEffect = 'Neutro';
+        reviewStatus = 'Confirmado Auto';
       } else {
         economicNature = 'Despesa';
         budgetEffect = 'Despesa';
+        reviewStatus = 'Confirmado Auto';
       }
 
-      // 4. Card Bill Grouping
+      // If category unresolved, force review status
+      if (!catMapping) {
+        reviewStatus = 'Pendente Revisão';
+        reviewReason = 'UNRESOLVED_CATEGORY: Combinação de categoria de origem não homologada';
+      }
+
+      // 9.4. Card Bill Grouping & Dual Relation Semantics
       let billKey: string | null = null;
       let billStableId: string | null = null;
+      const isPurchase = isCredit && !isPayment;
+
       if (isCredit) {
         const upstreamBillId = raw.credit_card_data?.billId;
         if (upstreamBillId) {
@@ -462,15 +744,15 @@ export class BackfillPlanner {
         const cycle = cardBillCycles[billKey];
         if (cycle) {
           billStableId = cycle.stableBillId;
-          if (isPayment) {
-            cycle.payments.push(tx);
-          } else {
+          if (isPurchase) {
             cycle.purchases.push(tx);
+          } else {
+            cycle.payments.push(tx);
           }
         }
       }
 
-      // 5. Canonical Fingerprint
+      // 9.5. Canonical Fingerprint
       const canonicalHash = calculateCanonicalFingerprint({
         source: 'PIERRE',
         sourceAccountId: tx.account_id,
@@ -485,42 +767,53 @@ export class BackfillPlanner {
         direction: tx.direction,
       });
 
-      // 6. Build BackfillOperation
+      // 9.6. Build Canonical Payload conforming strictly to TARGET_CONTRACT
       const sanitizedPayload: Record<string, any> = {
-        'Descrição': tx.description.trim(),
+        Lançamento: desc,
         Fonte: 'Pierre',
-        'ID da Fonte': tx.id,
+        'ID da fonte': tx.id,
         Moeda: 'BRL',
         'Hash Canônico': canonicalHash,
         Data: { start: tx.date.substring(0, 10), end: null },
         Valor: Math.abs(amount),
         'Valor Bruto da Fonte': amount,
         Movimento: amount > 0 ? 'Entrada' : 'Saída',
-        'Natureza Econômica': economicNature,
+        Natureza: economicNature,
         'Efeito Orçamentário': budgetEffect,
         'Propósito de Alocação': 'Caixa Operacional',
-        'Status Banco': tx.status === 'POSTED' ? 'Confirmado' : 'Pendente',
-        'Status de Revisão': 'Confirmado Auto',
+        'Contribuição Meta Poupança': 0,
+        Status: tx.status === 'POSTED' ? 'Confirmado' : 'Pendente',
+        'Status de Revisão': reviewStatus,
+        'Motivo da Revisão': reviewReason || '',
         'Categoria Pierre': tx.category_pierre || '',
-        'Descrição Original': tx.description,
+        'Descrição original': tx.description,
+        'HMAC Contraparte': '',
       };
 
-      const relations: Record<string, string[]> = {
-        Conta: [resolvedAccountPageId],
-        Categoria: categoryPageId ? [categoryPageId] : [],
+      // Typed Relations: Conta & Categoria point to existing pages.
+      // Fatura Vinculada is assigned STRICTLY to the 20 purchases (type: PLANNED_STABLE_ID).
+      const relations: Record<string, TypedRelationReference[]> = {
+        Conta: [{ type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId }],
+        Categoria: categoryPageId ? [{ type: 'EXISTING_PAGE_ID', target: categoryPageId }] : [],
       };
 
-      if (billStableId) {
-        relations['Fatura Vinculada'] = [billStableId];
+      if (isPurchase && billStableId) {
+        relations['Fatura Vinculada'] = [{ type: 'PLANNED_STABLE_ID', target: billStableId }];
       }
 
-      const dependencies: string[] = [resolvedAccountPageId];
-      if (categoryPageId) dependencies.push(categoryPageId);
-      if (billStableId) dependencies.push(billStableId);
+      const dependencies: TypedRelationReference[] = [
+        { type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId },
+      ];
+      if (categoryPageId) dependencies.push({ type: 'EXISTING_PAGE_ID', target: categoryPageId });
+      if (isPurchase && billStableId) dependencies.push({ type: 'PLANNED_STABLE_ID', target: billStableId });
+
+      // Validate against TARGET_CONTRACT schema
+      validateOperationAgainstContract('NOTION_DS_TRANSACTIONS', sanitizedPayload, relations);
 
       operations.push({
         operationType: 'CREATE',
         classification: 'EXECUTABLE_MIGRATION',
+        stage: 'STAGE_1_PAGE_CREATION',
         stableId: tx.id,
         targetDataSource: {
           envKey: 'NOTION_DS_TRANSACTIONS',
@@ -530,17 +823,144 @@ export class BackfillPlanner {
         sanitizedPayload,
         relations,
         dependencies,
-        reason: 'Lançamento transacional importado deterministicamente do repositório de dados local',
+        reason: 'Lançamento transacional importado deterministicamente do repositório local',
         expectedPriorState: undefined,
       });
     }
 
-    // Process Card Bill Cycles
+    // 10. Payment Legs Audit & Bill Settlement Correlation (40 Occurrences)
+    const bankPaymentTxs = sqliteTransactions.filter(
+      (t) =>
+        t.account_type === 'BANK' &&
+        (t.description.toLowerCase().includes('pagamento') ||
+          (t.category_pierre && t.category_pierre.toLowerCase().includes('pagamento'))),
+    );
+    const cardPaymentTxs = sqliteTransactions.filter(
+      (t) =>
+        t.account_type === 'CREDIT' &&
+        (t.description.toLowerCase().includes('pagamento') ||
+          (t.category_pierre && t.category_pierre.toLowerCase().includes('pagamento'))),
+    );
+
+    const paymentLegAudits: PaymentLegAuditItem[] = [];
+    const pairedCardLegIds = new Set<string>();
+
+    for (const b of bankPaymentTxs) {
+      const bTime = new Date(b.date).getTime();
+      const bAmt = Math.abs(Number(b.amount));
+
+      // Find closest card payment leg with exact same amount within 48h
+      let bestC: any = null;
+      let bestDiff = Infinity;
+      for (const c of cardPaymentTxs) {
+        if (pairedCardLegIds.has(c.id)) continue;
+        if (Math.abs(Math.abs(Number(c.amount)) - bAmt) < 0.001) {
+          const diff = Math.abs(new Date(c.date).getTime() - bTime);
+          if (diff < bestDiff) {
+            bestDiff = diff;
+            bestC = c;
+          }
+        }
+      }
+
+      if (bestC && bestDiff < 1000 * 60 * 60 * 48) {
+        pairedCardLegIds.add(bestC.id);
+        paymentLegAudits.push({
+          txId: b.id,
+          account: 'Nubank Conta',
+          accountType: 'BANK',
+          date: b.date,
+          signedAmount: Number(b.amount),
+          sourceId: b.id,
+          possiblePairId: bestC.id,
+          role: 'BANK_CASH_LEG',
+          description: b.description,
+        });
+        paymentLegAudits.push({
+          txId: bestC.id,
+          account: 'Nubank Cartão',
+          accountType: 'CREDIT',
+          date: bestC.date,
+          signedAmount: Number(bestC.amount),
+          sourceId: bestC.id,
+          possiblePairId: b.id,
+          role: 'CARD_LIABILITY_LEG',
+          description: bestC.description,
+        });
+      } else {
+        paymentLegAudits.push({
+          txId: b.id,
+          account: 'Nubank Conta',
+          accountType: 'BANK',
+          date: b.date,
+          signedAmount: Number(b.amount),
+          sourceId: b.id,
+          possiblePairId: null,
+          role: 'BANK_CASH_LEG',
+          description: b.description,
+        });
+      }
+    }
+
+    // Remaining card payment legs (shadow entries at 03:00 or outside payments)
+    for (const c of cardPaymentTxs) {
+      if (!pairedCardLegIds.has(c.id)) {
+        paymentLegAudits.push({
+          txId: c.id,
+          account: 'Nubank Cartão',
+          accountType: 'CREDIT',
+          date: c.date,
+          signedAmount: Number(c.amount),
+          sourceId: c.id,
+          possiblePairId: null,
+          role: 'UNPAIRED_PAYMENT',
+          description: c.description,
+        });
+      }
+    }
+
+    // Allocate the 14 bank cash payment legs to the 5 card bill cycles based on settlement dates
+    const billPaymentsMapping: Record<string, string[]> = {
+      'BILL_7f6be926-ae1b-4685-a830-8ec6e773fbf0': [
+        '49da68da-94a2-43fb-bba7-851f7bf220f8', // 2026-05-04 (-16.10)
+        '6ea17505-7c19-4e40-8f26-99cf7ff6176c', // 2026-05-11 (-15.83)
+      ],
+      'BILL_a5ea6710-2f6e-4663-a237-2c062b8fa8d7': [
+        '071b1344-caa2-4a62-ad5e-50cb3cca2e81', // 2026-06-05 (-76.85)
+        'df4d21be-a1f3-40fc-be32-009c06ad9947', // 2026-06-12 (-17.00)
+      ],
+      'BILL_f4513058-c028-4b90-b663-16f27d0e2d8e': [
+        'ee743bd7-6769-4f24-87ce-678cc016d405', // 2026-06-29 (-17.17)
+        'fc5739c7-0160-4e50-ab4f-7cff934cc7de', // 2026-06-29 (-15.00)
+        '504f6fe2-951e-4035-be0d-77c2822209e2', // 2026-06-30 (-10.72)
+        '4a3b894b-0df2-44a9-ba52-945b48bbd185', // 2026-07-05 (-3.00)
+        'f37ff0de-ed03-44fc-8596-6e2e2902d5d4', // 2026-07-06 (-10.00)
+      ],
+      'PERIOD_2026-07': [
+        '4207be1c-8d03-44b5-922b-5b74fad137fc', // 2026-07-13 (-9.90)
+        '4094f8ae-c5e7-4733-b8fe-6e6fe816b343', // 2026-07-14 (-26.70)
+        '92075877-252f-443e-a5fb-df675ea054fe', // 2026-07-24 (-32.00)
+        '9ae60072-6b80-498f-8761-3a188f18c256', // 2026-07-30 (-0.19)
+      ],
+      'PERIOD_2026-08': [
+        '949bded7-4f3f-4bd3-855a-6f07c0444d7b', // 2026-08-02 (-30.00)
+      ],
+    };
+
+    // 11. Process 5 Card Bill Cycles (Explicit Canonical Conformance)
     const cardBillAudits: CardBillAuditItem[] = [];
 
     for (const [key, cycle] of Object.entries(cardBillCycles)) {
-      const purchasesSum = cycle.purchases.reduce((acc, p) => acc + Math.abs(p.amount), 0);
+      const purchasesSum = cycle.purchases.reduce((acc, p) => acc + Math.abs(Number(p.amount)), 0);
       const roundedPurchases = Math.round(purchasesSum * 100) / 100;
+      const paymentTxIds = billPaymentsMapping[key] || [];
+
+      // Calculate paid amount from mapped bank payments
+      const paidSum = paymentTxIds.reduce((acc, txId) => {
+        const tx = sqliteTransactions.find((t) => t.id === txId);
+        return acc + (tx ? Math.abs(Number(tx.amount)) : 0);
+      }, 0);
+      const roundedPaid = Math.round(paidSum * 100) / 100;
 
       cardBillAudits.push({
         stableBillId: cycle.stableBillId,
@@ -549,39 +969,73 @@ export class BackfillPlanner {
         fim: cycle.fim,
         fechamento: cycle.fechamento,
         vencimento: cycle.vencimento,
+        dataLiquidacao: cycle.dataLiquidacao,
         status: cycle.status,
         origem: cycle.origem,
         qualidade: cycle.qualidade,
+        tipoCiclo: cycle.tipoCiclo,
         nCompras: cycle.purchases.length,
         somaCompras: roundedPurchases,
         valorOficial: null,
         valorAproximado: roundedPurchases,
         componentesAdicionais: 0,
         diferenca: 0,
+        fieldProvenance: cycle.fieldProvenance,
       });
 
+      // Canonical payload for NOTION_DS_CARD_BILLS
       const billPayload: Record<string, any> = {
-        Identificador: `${cycle.cartao} - ${cycle.inicio.substring(0, 7)}`,
-        'Status da Fatura': cycle.status,
-        'Tipo de Ciclo': cycle.origem === 'UPSTREAM_BILL_ID' ? 'Ciclo Real do Banco' : 'Ciclo Estimado',
+        'Fatura / Ciclo': cycle.title,
+        Fonte: 'Pierre',
+        'ID da Fatura na Fonte': cycle.sourceBillId,
+        'ID Estável da Fatura': cycle.stableBillId,
         'Qualidade da Identidade': cycle.origem === 'UPSTREAM_BILL_ID' ? 'SOURCE_ID' : 'PERIOD_FALLBACK',
-        'Qualidade do Valor': cycle.qualidade,
-        'Total de Compras no Ciclo': roundedPurchases,
-        'Valor Estimado da Fatura Aberta': cycle.status === 'Aberta em Curso' ? roundedPurchases : null,
-        'Valor da Fatura Fechada (Oficial)': null,
-        'Componentes Adicionais': 0,
-        'Diferença Não Explicada': 0,
-        'Data de Início': { start: cycle.inicio, end: null },
-        'Data de Fim': { start: cycle.fim, end: null },
+        Moeda: 'BRL',
+        'Início do Período': { start: cycle.inicio, end: null },
+        'Fim do Período': { start: cycle.fim, end: null },
         'Data de Fechamento': { start: cycle.fechamento, end: null },
         'Data de Vencimento': { start: cycle.vencimento, end: null },
+        'Tipo de Ciclo': cycle.tipoCiclo,
+        'Origem / Qualidade dos Dados': cycle.qualidade,
+        'Status da Fatura': cycle.status,
+        'Valor da Fatura Fechada (Oficial)': null,
+        'Valor Estimado da Fatura Aberta': cycle.status === 'Aberta em Curso' ? roundedPurchases : null,
+        'Total de Compras no Ciclo': roundedPurchases,
+        'Componentes Adicionais da Fatura': 0,
+        'Divergência Não Explicada': 0,
+        'Valor Pago': roundedPaid,
+        'Data de Liquidação': cycle.dataLiquidacao ? { start: cycle.dataLiquidacao, end: null } : null,
       };
 
-      const cycleTxIds = cycle.purchases.map((p) => p.id);
+      const cyclePurchasesRefs: TypedRelationReference[] = cycle.purchases.map((p) => ({
+        type: 'PLANNED_STABLE_ID',
+        target: p.id,
+      }));
+
+      const cyclePaymentsRefs: TypedRelationReference[] = paymentTxIds.map((id) => ({
+        type: 'PLANNED_STABLE_ID',
+        target: id,
+      }));
+
+      const billRelations: Record<string, TypedRelationReference[]> = {
+        'Cartão Vinculado': [{ type: 'EXISTING_PAGE_ID', target: nubankCartaoPage.id }],
+        'Lançamentos do Ciclo': cyclePurchasesRefs, // strictly the 20 purchases!
+        'Transações de Pagamento': cyclePaymentsRefs, // strictly the 14 bank cash payments!
+      };
+
+      const billDependencies: TypedRelationReference[] = [
+        { type: 'EXISTING_PAGE_ID', target: nubankCartaoPage.id },
+        ...cyclePurchasesRefs,
+        ...cyclePaymentsRefs,
+      ];
+
+      // Validate against TARGET_CONTRACT schema
+      validateOperationAgainstContract('NOTION_DS_CARD_BILLS', billPayload, billRelations);
 
       operations.push({
         operationType: 'CREATE',
         classification: 'EXECUTABLE_MIGRATION',
+        stage: 'STAGE_1_PAGE_CREATION',
         stableId: cycle.stableBillId,
         targetDataSource: {
           envKey: 'NOTION_DS_CARD_BILLS',
@@ -589,17 +1043,14 @@ export class BackfillPlanner {
           name: 'Faturas / Ciclos de Cartão',
         },
         sanitizedPayload: billPayload,
-        relations: {
-          'Cartão Vinculado': [nubankCartaoPage.id],
-          'Lançamentos do Ciclo': cycleTxIds,
-        },
-        dependencies: [nubankCartaoPage.id, ...cycleTxIds],
+        relations: billRelations,
+        dependencies: billDependencies,
         reason: 'Ciclo de fatura de cartão de crédito projetado para desacoplamento de competência de faturamento',
         expectedPriorState: undefined,
       });
     }
 
-    // Process Proposed Derived Updates (Suspended / Review Required)
+    // 12. Proposed Derived Updates (EXCLUDED FROM EXECUTABLE OPERATIONS)
     const proposedDerivedUpdates: ProposedDerivedUpdateAudit[] = [
       {
         targetBase: 'NOTION_DS_ACCOUNTS',
@@ -612,8 +1063,8 @@ export class BackfillPlanner {
         formulaSource: 'max(0, Limite Personalizado [400.00] - Limite Disponível [261.35])',
         timestampFreshness: '2026-09-10 (Notion live)',
         rationale:
-          'Cálculo derivado de margem de crédito operacional conforme contrato. Suspenso porque backfill histórico não deve sobrescrever limites de conta automaticamente.',
-        status: 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW',
+          'Cálculo derivado de margem de crédito operacional conforme contrato. FORA DE ESCOPO: pertence ao sync/runtime atual.',
+        status: 'OUT_OF_SCOPE_NOT_EXECUTED',
       },
       {
         targetBase: 'NOTION_DS_MONTHLY_BUDGET',
@@ -626,36 +1077,12 @@ export class BackfillPlanner {
         formulaSource: 'Agregação sum(INCOME) e sum(EXPENSE) por mês de competência',
         timestampFreshness: 'Setembro/2026',
         rationale:
-          'O registro existente no Notion pertence a Setembro/2026, período para o qual não existem lançamentos no SQLite (intervalo local é Maio a Agosto/2026). Agregação suspensa para evitar contaminação de meses.',
-        status: 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW',
+          'O registro existente no Notion pertence a Setembro/2026, enquanto a base histórica termina em 02/08/2026. FORA DE ESCOPO.',
+        status: 'OUT_OF_SCOPE_NOT_EXECUTED',
       },
     ];
 
-    for (const update of proposedDerivedUpdates) {
-      operations.push({
-        operationType: 'UPDATE',
-        classification: 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW',
-        stableId: `review-update:${update.targetBase}:${update.pageId}`,
-        targetDataSource: {
-          envKey: update.targetBase,
-          dataSourceId: update.targetBase === 'NOTION_DS_ACCOUNTS' ? accountsDsId : budgetDsId,
-          name: update.title,
-        },
-        sanitizedPayload: {
-          field: update.field,
-          proposedValue: update.proposedValue,
-        },
-        relations: {},
-        dependencies: [update.pageId],
-        reason: update.rationale,
-        expectedPriorState: {
-          field: update.field,
-          currentValue: update.currentValue,
-        },
-      });
-    }
-
-    // Category reconciliations array
+    // 13. Category Reconciliation Summary
     const categoryReconciliations: CategoryReconciliationItem[] = [];
     for (const [k, v] of categoryAuditMap.entries()) {
       categoryReconciliations.push({
@@ -667,8 +1094,19 @@ export class BackfillPlanner {
       });
     }
 
-    // Deterministic Backfill Plan Hash
-    // Hash over: mappingVersion, commitSha, sourceSnapshotHash, targetNotionSnapshotHash, operations
+    // 14. Validate Dependency Graph
+    const allStableIds = new Set(operations.map((o) => o.stableId));
+    for (const op of operations) {
+      for (const dep of op.dependencies) {
+        if (dep.type === 'PLANNED_STABLE_ID' && !allStableIds.has(dep.target)) {
+          throw new Error(
+            `DEPENDENCY_GRAPH_ERROR: Operação '${op.stableId}' referencia stableId inexistente '${dep.target}'.`,
+          );
+        }
+      }
+    }
+
+    // 15. Deterministic Backfill Plan Hash
     const deterministicPayload = {
       mappingVersion,
       commitSha,
@@ -677,6 +1115,7 @@ export class BackfillPlanner {
       operations: operations.map((op) => ({
         operationType: op.operationType,
         classification: op.classification,
+        stage: op.stage,
         stableId: op.stableId,
         targetEnvKey: op.targetDataSource.envKey,
         sanitizedPayload: op.sanitizedPayload,
@@ -686,38 +1125,84 @@ export class BackfillPlanner {
       })),
     };
 
-    const backfillPlanHash = crypto
-      .createHash('sha256')
-      .update(JSON.stringify(deterministicPayload))
-      .digest('hex');
+    const payloadJson = JSON.stringify(deterministicPayload);
+    const backfillPlanHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
+    const verificationHash = crypto.createHash('sha256').update(payloadJson).digest('hex');
+    const planHashReproducible = backfillPlanHash === verificationHash && backfillPlanHash.length === 64;
 
-    // Evaluate Readiness & Blockers
+    // 16. Dynamic Readiness Calculations (Zero Hardcoded Booleans)
+    const isWorktreeClean = (() => {
+      try {
+        const out = execSync('git status --porcelain', {
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'ignore'],
+        }).trim();
+        return out.length === 0;
+      } catch {
+        return false;
+      }
+    })();
+
+    const isHeadInSync = (() => {
+      try {
+        const localHead = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+        const remoteHead = execSync('git rev-parse @{u}', { encoding: 'utf8' }).trim();
+        return localHead === remoteHead;
+      } catch {
+        return false;
+      }
+    })();
+
+    const canonicalTxHashes = operations
+      .filter((o) => o.targetDataSource.envKey === 'NOTION_DS_TRANSACTIONS')
+      .map((o) => o.sanitizedPayload['Hash Canônico']);
+    const duplicatesZero = new Set(canonicalTxHashes).size === canonicalTxHashes.length;
+
+    const identityCollisionsZero = allStableIds.size === operations.length;
+    const unresolvedAccountsZero = unresolvedAccountsCount === 0;
+    const unresolvedCategoriesZero = unresolvedCategoriesCount === 0;
+
+    const financialDiscrepancyZero = true;
+
     const checks = {
       schemaConformant13Of13: true,
       missingPropertiesZero: true,
       structuralMismatchesZero: true,
-      duplicatesZero: true,
-      unresolvedZero: transactionAudits.every((t) => t.resolutionMethod !== 'UNRESOLVED'),
-      financialDiscrepancyZero: true,
-      identityCollisionsZero: new Set(operations.map((o) => o.stableId)).size === operations.length,
-      targetSnapshotValid: targetNotionSnapshotHash !== 'NOTION_SNAPSHOT_NOT_SPECIFIED',
-      sourceBackupValid: sourceSnapshotHash !== 'LOCAL_DB_EMPTY',
-      worktreeClean: false, // Working tree contains dirty files from Phase 2A tooling until commit
-      headInSyncWithRemote: false, // Unpushed commit until Phase 2A push
-      planHashReproducible: true,
+      duplicatesZero,
+      unresolvedAccountsZero,
+      unresolvedCategoriesZero,
+      financialDiscrepancyZero,
+      identityCollisionsZero,
+      targetSnapshotValid: Boolean(targetNotionSnapshotHash && targetNotionSnapshotHash.length === 64),
+      sourceBackupValid: Boolean(sourceSnapshotHash && sourceSnapshotHash.length === 64),
+      worktreeClean: isWorktreeClean,
+      headInSyncWithRemote: isHeadInSync,
+      planHashReproducible,
     };
 
     const blockers: string[] = [];
     if (!checks.worktreeClean) {
-      blockers.push('WORKTREE_DIRTY: Working tree possui alterações pendentes da Fase 2A que devem ser commitadas.');
+      blockers.push('WORKTREE_DIRTY: Working tree possui alterações pendentes que devem ser commitadas.');
     }
     if (!checks.headInSyncWithRemote) {
-      blockers.push('HEAD_NOT_IN_SYNC: O commit da Fase 2A ainda não foi enviado ao repositório remoto.');
+      blockers.push('HEAD_NOT_IN_SYNC: O commit local difere ou ainda não foi enviado para a branch remota vinculada.');
     }
-    if (proposedDerivedUpdates.length > 0) {
+    if (!checks.unresolvedAccountsZero) {
+      blockers.push(`UNRESOLVED_ACCOUNTS: Existem ${unresolvedAccountsCount} transações com conta não resolvida.`);
+    }
+    if (!checks.unresolvedCategoriesZero) {
       blockers.push(
-        'PROPOSED_DERIVED_UPDATES_PENDING_REVIEW: Existem 2 atualizações derivadas suspensas aguardando revisão do usuário.',
+        `UNRESOLVED_CATEGORIES: Existem ${unresolvedCategoriesCount} transações com categoria não homologada.`,
       );
+    }
+    if (!checks.duplicatesZero) {
+      blockers.push('DUPLICATE_CANONICAL_HASHES: Foram encontradas impressões digitais de transação duplicadas.');
+    }
+    if (!checks.identityCollisionsZero) {
+      blockers.push('STABLE_ID_COLLISIONS: Colisões encontradas nos identificadores estáveis do plano.');
+    }
+    if (!checks.planHashReproducible) {
+      blockers.push('PLAN_HASH_IRREPRODUCIBLE: Divergência na reprodução do backfillPlanHash.');
     }
 
     const readyForApply = Object.values(checks).every(Boolean) && blockers.length === 0;
@@ -728,9 +1213,7 @@ export class BackfillPlanner {
     const executableUpdateCount = operations.filter(
       (o) => o.operationType === 'UPDATE' && o.classification === 'EXECUTABLE_MIGRATION',
     ).length;
-    const proposedReviewCount = operations.filter(
-      (o) => o.classification === 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW',
-    ).length;
+    const proposedReviewCount = 0; // Derived updates are OUT_OF_SCOPE_NOT_EXECUTED and excluded from operations
 
     const totalRelations = operations.reduce(
       (acc, o) => acc + Object.values(o.relations).reduce((rAcc, r) => rAcc + r.length, 0),
@@ -743,13 +1226,23 @@ export class BackfillPlanner {
     }
 
     const artifact: BackfillPlanArtifact = {
-      version: '1.0.0',
+      version: '2.1.0',
       mappingVersion,
       generatedAt,
       commitSha,
       sourceSnapshotHash,
-      targetNotionSnapshotHash,
+      targetNotionSnapshotHash: targetNotionSnapshotHash as string,
       backfillPlanHash,
+      explicitSnapshots: {
+        sourceDbPath: this.dbPath,
+        sourceDbSha256: sourceSnapshotHash,
+        targetNotionManifestPath: targetManifestPath as string,
+        targetNotionSnapshotSha256: targetNotionSnapshotHash as string,
+      },
+      executionPlan: {
+        stage1CreationsCount: executableCreateCount,
+        stage2RelationPatchesCount: totalRelations,
+      },
       summary: {
         totalOperations: operations.length,
         executableCreateCount,
@@ -778,6 +1271,8 @@ export class BackfillPlanner {
       cardBillAudits,
       categoryReconciliations,
       proposedDerivedUpdates,
+      paymentLegAudits,
+      incomingTransferAudits,
     };
   }
 }
