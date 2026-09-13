@@ -208,6 +208,8 @@ export interface CardBillAuditItem {
   valorAproximado: number;
   componentesAdicionais: number;
   diferenca: number;
+  purchasePaymentDelta: number;
+  officialBillDiscrepancy: number | null;
   unexplainedDiscrepancy: number;
   paidAmount: number;
   fieldProvenance: CardBillFieldProvenance;
@@ -249,6 +251,7 @@ export interface BackfillPlanArtifact {
   commitSha: string;
   sourceSnapshotHash: string;
   targetNotionSnapshotHash: string;
+  upstreamBillEnrichmentHash?: string;
   backfillPlanHash: string;
   explicitSnapshots: {
     sourceDbPath: string;
@@ -282,10 +285,16 @@ export interface BackfillPlanArtifact {
       unresolvedAccountsZero: boolean;
       unresolvedCategoriesZero: boolean;
       unresolvedPaymentAllocationsZero: boolean;
+      paymentPairingAmbiguitiesZero: boolean;
+      paymentAllocationsResolved: boolean;
+      billReconciliationEvidenceSufficient: boolean;
       financialDiscrepancyZero: boolean;
       identityCollisionsZero: boolean;
       targetSnapshotValid: boolean;
       sourceBackupValid: boolean;
+      ciphertextIntegrityValid: boolean;
+      manifestIntegrityValid: boolean;
+      plaintextRestoreVerified: boolean;
       worktreeClean: boolean;
       headInSyncWithRemote: boolean;
       planHashReproducible: boolean;
@@ -297,6 +306,12 @@ export interface BackfillPlanArtifact {
     planHashVar: 'FINANCIAL_BACKFILL_PLAN_HASH';
     commitShaVar: 'FINANCIAL_BACKFILL_COMMIT_SHA';
   };
+}
+
+export interface BackfillPlannerConfig {
+  sourceAccountMapping: Record<string, 'CHECKING' | 'CREDIT'>;
+  sameOwnershipCategoryKeywords?: string[];
+  defaultDueDay?: number;
 }
 
 export interface InputFingerprint {

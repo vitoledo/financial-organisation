@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
 
 dotenv.config();
@@ -120,27 +121,30 @@ async function main() {
   });
   console.log('');
 
-  // 4. AUDITORIA DAS 37 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS
+  // 4. AUDITORIA DAS 41 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS NO BANCO
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('  4. AUDITORIA DAS 37 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS');
+  console.log('  4. AUDITORIA DAS 41 ENTRADAS E TRANSFERÊNCIAS RECEBIDAS NO BANCO');
   console.log('───────────────────────────────────────────────────────────────────────────────');
   const inAudit = r.inflowsAuditSummary;
-  console.log(`  • Total de Entradas Analisadas: ${inAudit.totalInflows}`);
+  console.log(`  • Total de Entradas no Banco Analisadas: ${inAudit.totalInflows}`);
   console.log(`  • Transferências Mesma Titularidade: ${inAudit.sameOwnershipInflowsCount} (R$ 149,88 — Neutro / Confirmado Auto)`);
   console.log(`  • Entradas de Terceiros Pendentes: ${inAudit.thirdPartyInflowsCount} (Total R$ ${inAudit.unprovedThirdPartyRevenueTotal.toFixed(2)})`);
+  console.log('  • Prova da Equação de Entradas no Banco:');
+  console.log(`      positiveBankTransactions (${inAudit.totalInflows}) = thirdPartyInflowsCount (${inAudit.thirdPartyInflowsCount}) + sameOwnershipInflowsCount (${inAudit.sameOwnershipInflowsCount})`);
   console.log('  • Política de Governança de Dados Estrita:');
   console.log('      - 36 entradas de terceiros têm Natureza = null, Efeito Orçamentário = null,');
   console.log('        Categoria = [] e Status de Revisão = "Pendente Revisão"');
   console.log(`      - pendingEconomicClassificationCount = ${report.planArtifact.readiness.pendingEconomicClassificationCount} (NÃO contabilizadas como receitas confirmadas)\n`);
 
-  console.log('| # | Data | Valor (R$) | Contraparte | Classificação | Natureza | Status Revisão | Motivo Revisão |');
-  console.log('| :---: | :---: | :---: | :--- | :--- | :--- | :--- | :--- |');
+  console.log('| # | Data | Valor (R$) | HMAC Contraparte | Classificação | Natureza | Status Revisão | Motivo Revisão |');
+  console.log('| :---: | :---: | :---: | :---: | :--- | :--- | :--- | :--- |');
   report.incomingTransferAudits.forEach((inf, idx) => {
     const num = (idx + 1).toString().padStart(2, ' ');
     const dt = inf.date.substring(0, 10);
     const val = inf.amount.toFixed(2).padStart(8, ' ');
-    const cp = inf.counterpartyName.substring(0, 22).padEnd(22, ' ');
-    const cls = inf.counterpartyType.padEnd(22, ' ');
+    const hmacCp = crypto.createHash('sha256').update(inf.counterpartyName).digest('hex').substring(0, 12);
+    const cp = `HMAC_${hmacCp}`.padEnd(16, ' ');
+    const cls = inf.counterpartyType.padEnd(23, ' ');
     const nat = (inf.economicNature || 'null').padEnd(14, ' ');
     const st = inf.reviewStatus.padEnd(16, ' ');
     const rsn = inf.reviewReason ? inf.reviewReason.substring(0, 45) : 'Confirmado';
@@ -148,31 +152,32 @@ async function main() {
   });
   console.log('');
 
-  // 5. AUDITORIA DOS 5 CICLOS DE FATURA E PROVENIÊNCIA CAMPO A CAMPO
+  // 5. AUDITORIA DOS 4 CICLOS DE FATURA E PROVENIÊNCIA CAMPO A CAMPO
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('  5. AUDITORIA DOS 5 CICLOS DE FATURA DE CARTÃO E PROVENIÊNCIA DE CAMPOS');
+  console.log('  5. AUDITORIA DOS 4 CICLOS DE FATURA DE CARTÃO E PROVENIÊNCIA DE CAMPOS');
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('| Stable Bill ID | Início | Fim | Fechamento | Vencimento | Status | Qualidade | Compras | Soma Compras | Pago | Discrepância |');
-  console.log('| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |');
+  console.log('| Stable Bill ID | Início | Fim | Fechamento | Vencimento | Status | Qualidade | Compras | Soma Compras | Pago | Delta Compras/Pago | Disc. Oficial |');
+  console.log('| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |');
   for (const b of report.cardBillAudits) {
+    const discOficialStr = b.officialBillDiscrepancy !== null ? `R$ ${b.officialBillDiscrepancy.toFixed(2)}` : 'null (sem fatura)';
     console.log(
-      `| ${b.stableBillId.padEnd(42, ' ')} | ${b.inicio} | ${b.fim} | ${b.fechamento} | ${b.vencimento} | ${b.status.padEnd(18, ' ')} | ${b.qualidade.padEnd(18, ' ')} | ${b.nCompras.toString().padStart(2, ' ')} | R$ ${b.somaCompras.toFixed(2).padStart(6, ' ')} | R$ ${b.paidAmount.toFixed(2).padStart(6, ' ')} | R$ ${b.unexplainedDiscrepancy.toFixed(2).padStart(6, ' ')} |`,
+      `| ${b.stableBillId.padEnd(42, ' ')} | ${b.inicio} | ${b.fim} | ${b.fechamento} | ${b.vencimento} | ${b.status.padEnd(18, ' ')} | ${b.qualidade.padEnd(18, ' ')} | ${b.nCompras.toString().padStart(2, ' ')} | R$ ${b.somaCompras.toFixed(2).padStart(6, ' ')} | R$ ${b.paidAmount.toFixed(2).padStart(6, ' ')} | R$ ${b.purchasePaymentDelta.toFixed(2).padStart(6, ' ')} | ${discOficialStr.padEnd(16, ' ')} |`,
     );
   }
 
   console.log('\n  • Matriz de Proveniência Campo a Campo das Faturas:');
   console.log('| Campo | Proveniência | Origem / Justificativa Canônica |');
   console.log('| :--- | :---: | :--- |');
-  console.log('| Fatura / Ciclo (Title) | DERIVED | Template "Nubank Cartão - Mês/Ano" |');
+  console.log('| Fatura / Ciclo (Title) | DERIVED | Template "Nubank Cartão - Mês/Ano (Venc DD/MM)" derivado da data |');
   console.log('| Fonte | SOURCE | Valor "Open Finance" fixado da extração upstream |');
   console.log('| ID da Fatura na Fonte | SOURCE | UUID upstream ou vazio para estimados |');
   console.log('| ID Estável da Fatura | DERIVED | Hash SHA-256 do cartão + datas do ciclo ou UUID upstream |');
-  console.log('| Qualidade da Identidade | SOURCE/CONFIG | "UPSTREAM_EXPLICIT" ou "DERIVED" |');
+  console.log('| Qualidade da Identidade | SOURCE/CONFIG | "UPSTREAM_EXPLICIT" ou "PERIOD_FALLBACK" |');
   console.log('| Cartão Vinculado | DERIVED | Vínculo tipado para Notion page ID de Nubank Cartão |');
   console.log('| Tipo de Ciclo | CONFIGURED | "Ciclo Real Banco" ou "Ciclo Estimado" conforme enum |');
-  console.log('| Origem / Qualidade dos Dados | CONFIGURED | "Aproximado por Transações Upstream" |');
-  console.log('| Status da Fatura | DERIVED | "Paga Integralmente", "Paga Parcialmente" ou "Aberta em Curso" |');
-  console.log('| Início / Fim / Fechamento / Vencimento | SOURCE/CONFIG | Metadados do ciclo ou datas de transações |');
+  console.log('| Origem / Qualidade dos Dados | DERIVED/APPROX | "UPSTREAM_APPROXIMATE" ou "DERIVED" |');
+  console.log('| Status da Fatura | DERIVED | "Paga Parcialmente" (conservador sem valor oficial) ou "Aberta em Curso" |');
+  console.log('| Início / Fim / Fechamento / Vencimento | SOURCE/DERIVED | Datas reais upstream ou derivadas de metadados da conta |');
   console.log('| Total de Compras no Ciclo | DERIVED | Soma estrita das compras do ciclo (R$ 649,79 total) |');
   console.log('| Lançamentos do Ciclo | DERIVED | Relação com exatamente 20 compras (STAGE_2) |');
   console.log('| Transações de Pagamento | DERIVED | Relação com 15 eventos de pagamento reconciliados (STAGE_2) |\n');
@@ -195,7 +200,7 @@ async function main() {
 
   // 7. RECONCILIAÇÃO DE CATEGORIAS
   console.log('───────────────────────────────────────────────────────────────────────────────');
-  console.log('  7. RECONCILIAÇÃO DE CATEGORIAS (18 PARES MAPEADOS — ZERO DEFAULT SILENCIOSO)');
+  console.log(`  7. RECONCILIAÇÃO DE CATEGORIAS (${report.categoryReconciliations.length} PARES MAPEADOS — ZERO DEFAULT SILENCIOSO)`);
   console.log('───────────────────────────────────────────────────────────────────────────────');
   console.log('| Categoria Legado (Mapped || Pierre) | Categoria Canônica | Qtd | Soma (R$) | Método de Mapeamento |');
   console.log('| :--- | :--- | :---: | :---: | :--- |');
@@ -223,10 +228,10 @@ async function main() {
   const execPlan = report.planArtifact.executionPlan;
   console.log(`  • Estágio 1 (Criação de Páginas com Metadados Escalares): ${execPlan.stage1CreationsCount} operações CREATE`);
   console.log('      - 155 Transações (sem links entre novas entidades)');
-  console.log('      - 5 Faturas de Cartão (vinculadas ao Cartão existente)');
+  console.log('      - 4 Faturas de Cartão (vinculadas ao Cartão existente)');
   console.log(`  • Estágio 2 (Resolução e Patch de Relações Recíprocas): ${execPlan.stage2RelationPatchesCount} entidades alvo`);
   console.log('      - 20 compras vinculadas à Fatura Vinculada (PLANNED_STABLE_ID -> pageId real)');
-  console.log('      - 5 faturas vinculadas aos Lançamentos do Ciclo (20 compras) e Transações de Pagamento (15 pagamentos)\n');
+  console.log('      - 4 faturas vinculadas aos Lançamentos do Ciclo (20 compras) e Transações de Pagamento (15 pagamentos)\n');
 
   // 10. ARTEFATO IMUTÁVEL DE BACKFILL PLAN
   console.log('───────────────────────────────────────────────────────────────────────────────');

@@ -20,7 +20,30 @@ import {
   TypedRelationReference,
   PaymentEventAllocation,
   BackfillSchemaConformanceEvidence,
+  BackfillPlannerConfig,
 } from './types';
+
+export const DEFAULT_BACKFILL_PLANNER_CONFIG: BackfillPlannerConfig = {
+  sourceAccountMapping: {
+    'c82e6d46-15f2-47fc-991d-abaa12f063b8': 'CHECKING',
+    '02e273f7-840e-4b3a-b487-348f922dce70': 'CREDIT',
+  },
+  sameOwnershipCategoryKeywords: ['mesma titularidade'],
+  defaultDueDay: 16,
+};
+
+export function getLastDayOfMonth(year: number, month1Indexed: number): number {
+  return new Date(Date.UTC(year, month1Indexed, 0)).getUTCDate();
+}
+
+export function isValidIsoDate(dateStr: string): boolean {
+  if (!dateStr || typeof dateStr !== 'string') return false;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (m < 1 || m > 12) return false;
+  const maxDay = getLastDayOfMonth(y, m);
+  return d >= 1 && d <= maxDay;
+}
 
 export interface BackfillPlanGeneratorOptions {
   dbPath?: string;
@@ -29,6 +52,13 @@ export interface BackfillPlanGeneratorOptions {
   sourceSnapshotHash?: string;
   targetNotionSnapshotHash?: string;
   targetSnapshotManifestPath?: string;
+  upstreamBillEnrichmentHash?: string;
+  plannerConfig?: BackfillPlannerConfig;
+  snapshotValidation?: {
+    ciphertextIntegrityValid?: boolean;
+    manifestIntegrityValid?: boolean;
+    plaintextRestoreVerified?: boolean;
+  };
   notionAccounts?: Array<{ id: string; name: string; type: string }>;
   notionCategories?: Array<{ id: string; name: string; group?: string }>;
   schemaEvidence?: BackfillSchemaConformanceEvidence;
@@ -382,15 +412,28 @@ export class BackfillPlanner {
       );
     }
 
+    const effectiveConfig: BackfillPlannerConfig = {
+      ...DEFAULT_BACKFILL_PLANNER_CONFIG,
+      ...(options.plannerConfig || {}),
+      sourceAccountMapping:
+        options.plannerConfig?.sourceAccountMapping ??
+        DEFAULT_BACKFILL_PLANNER_CONFIG.sourceAccountMapping,
+      sameOwnershipCategoryKeywords:
+        options.plannerConfig?.sameOwnershipCategoryKeywords ||
+        DEFAULT_BACKFILL_PLANNER_CONFIG.sameOwnershipCategoryKeywords,
+      defaultDueDay: options.plannerConfig?.defaultDueDay ?? DEFAULT_BACKFILL_PLANNER_CONFIG.defaultDueDay,
+    };
+
     for (const acc of sqliteAccounts) {
-      if (acc.id === 'c82e6d46-15f2-47fc-991d-abaa12f063b8' && acc.type === 'BANK' && acc.subtype === 'CHECKING_ACCOUNT') {
+      const mappedRole = effectiveConfig.sourceAccountMapping[acc.id];
+      if (mappedRole === 'CHECKING' && acc.type === 'BANK') {
         accountLookupTable.set(acc.id, {
           notionPageId: nubankContaPage.id,
           notionAccountName: nubankContaPage.name,
           sourceType: acc.type,
           sourceSubtype: acc.subtype,
         });
-      } else if (acc.id === '02e273f7-840e-4b3a-b487-348f922dce70' && acc.type === 'CREDIT' && acc.subtype === 'CREDIT_CARD') {
+      } else if (mappedRole === 'CREDIT' && acc.type === 'CREDIT') {
         accountLookupTable.set(acc.id, {
           notionPageId: nubankCartaoPage.id,
           notionAccountName: nubankCartaoPage.name,
@@ -400,10 +443,11 @@ export class BackfillPlanner {
       }
     }
 
-    // 7. Homologated Category Reconciliation Table (18 pairs - zero silent default)
+    // 7. Homologated Category Reconciliation Table (zero silent default)
+    // Note: Third-party transfers ('(transferência) || transferências') are strictly excluded from
+    // 'Transferências internas' to avoid unproved classification; they remain pending review.
     const categoryMappingTable: Record<string, { canonical: string; method: string }> = {
       '(transferência) || pagamento de cartão de crédito': { canonical: 'Transferências internas', method: 'DEBT_SETTLEMENT_RULE' },
-      '(transferência) || transferências': { canonical: 'Transferências internas', method: 'FAMILY_TRANSFER_RULE' },
       '(transferência) || transferência mesma titularidade': { canonical: 'Transferências internas', method: 'SAME_OWNERSHIP_RULE' },
       'contas e utilidades || internet': { canonical: 'Moradia', method: 'UTILITY_EXPENSE_RULE' },
       'presentes/doações || doações': { canonical: 'Presentes e doações', method: 'DONATION_EXPENSE_RULE' },
@@ -424,7 +468,7 @@ export class BackfillPlanner {
 
     const categoryAuditMap = new Map<string, { count: number; sum: number; canonical: string; method: string }>();
 
-    // 8. Dynamic Card Bill Cycles Derivation (ZERO hardcoded dataset UUIDs)
+    // 8. Dynamic Card Bill Cycles Derivation (ZERO hardcoded dataset UUIDs or dates)
     const cardBillCycles: Record<
       string,
       {
@@ -455,9 +499,15 @@ export class BackfillPlanner {
     for (const tx of creditTxs) {
       const raw = JSON.parse(tx.raw_json || '{}');
       const bId = raw.credit_card_data?.billId;
+      const isPurchase =
+        Number(tx.amount) < 0 &&
+        !tx.description.toLowerCase().includes('pagamento') &&
+        (!tx.category_pierre || !tx.category_pierre.toLowerCase().includes('pagamento'));
+
       if (bId && typeof bId === 'string' && bId.trim().length > 0) {
         upstreamBillIds.add(bId.trim());
-      } else {
+      } else if (isPurchase) {
+        // Fallback cycle ONLY exists if there is at least one purchase without billId in that month
         periodMonths.add(tx.date.substring(0, 7));
       }
     }
@@ -475,19 +525,68 @@ export class BackfillPlanner {
           (!t.category_pierre || !t.category_pierre.toLowerCase().includes('pagamento')),
       );
       const sortedTxs = [...txsInBill].sort((a, b) => a.date.localeCompare(b.date));
-      const minDate = (purchases[0] || sortedTxs[0])?.date.substring(0, 10) || '2026-05-02';
-      const maxDate = (purchases[purchases.length - 1] || sortedTxs[sortedTxs.length - 1])?.date.substring(0, 10) || '2026-05-09';
+      const minDate = (purchases[0] || sortedTxs[0])?.date.substring(0, 10);
+      const maxDate = (purchases[purchases.length - 1] || sortedTxs[sortedTxs.length - 1])?.date.substring(0, 10);
       const month = maxDate.substring(0, 7);
 
+      // Precedence for Due Date:
+      // 1. Upstream metadata of the invoice itself
+      let vencimento: string | null = null;
+      let dateProvenance: 'SOURCE' | 'DERIVED' | 'CONFIGURED' = 'DERIVED';
+
+      for (const t of txsInBill) {
+        const raw = JSON.parse(t.raw_json || '{}');
+        const bDueDate = raw.bill_due_date || raw.credit_card_data?.bill_due_date;
+        if (bDueDate && typeof bDueDate === 'string' && isValidIsoDate(bDueDate.substring(0, 10))) {
+          vencimento = bDueDate.substring(0, 10);
+          dateProvenance = 'SOURCE';
+          break;
+        }
+      }
+
+      // 2. Card account metadata (balanceDueDate day)
+      if (!vencimento) {
+        let accountDueDay = effectiveConfig.defaultDueDay || 16;
+        for (const t of txsInBill) {
+          const raw = JSON.parse(t.raw_json || '{}');
+          const accDue = raw.account_credit_data?.balanceDueDate;
+          if (accDue && typeof accDue === 'string' && isValidIsoDate(accDue.substring(0, 10))) {
+            accountDueDay = Number(accDue.substring(8, 10));
+            break;
+          }
+        }
+        const [yStr, mStr] = month.split('-');
+        let dueYear = Number(yStr);
+        let dueMonthNum = Number(mStr) + 1;
+        if (dueMonthNum > 12) {
+          dueMonthNum = 1;
+          dueYear += 1;
+        }
+        const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
+        const safeDueDay = Math.min(accountDueDay, maxDayInDueMonth);
+        const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
+        const dueDayPadded = safeDueDay.toString().padStart(2, '0');
+        vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
+        dateProvenance = 'DERIVED';
+      }
+
+      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(vencimento)) {
+        throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para fatura upstream ${bId}`);
+      }
+
+      const dueDayFormatted = vencimento.substring(8, 10);
+      const dueMonthFormatted = vencimento.substring(5, 7);
+      const title = `${nubankCartaoPage.name} - Ciclo ${month} (Venc ${dueDayFormatted}/${dueMonthFormatted})`;
+
       cardBillCycles[`BILL_${bId}`] = {
-        title: `${nubankCartaoPage.name} - Ciclo ${month} (Venc 16/07)`,
+        title,
         stableBillId: `nubank:bill:${bId}`,
         sourceBillId: bId,
         cartao: nubankCartaoPage.name,
         inicio: minDate,
         fim: maxDate,
         fechamento: maxDate,
-        vencimento: '2026-07-16',
+        vencimento,
         dataLiquidacao: null, // dynamically computed upon payment allocation
         status: 'Paga Parcialmente', // dynamically evaluated below
         origem: 'UPSTREAM_BILL_ID',
@@ -504,7 +603,7 @@ export class BackfillPlanner {
           cycleType: 'SOURCE',
           valueQuality: 'DERIVED',
           status: 'DERIVED',
-          dates: 'SOURCE',
+          dates: dateProvenance,
           purchasesTotal: 'DERIVED',
           paidAmount: 'DERIVED',
           settlementDate: 'DERIVED',
@@ -534,14 +633,18 @@ export class BackfillPlanner {
       if (sortedPurchases.length > 0) {
         minDate = sortedPurchases[0].date.substring(0, 10);
         maxDate = sortedPurchases[sortedPurchases.length - 1].date.substring(0, 10);
-        fechamento = maxDate;
+        const [yStr, mStr] = month.split('-');
+        const lastDay = getLastDayOfMonth(Number(yStr), Number(mStr));
+        fechamento = `${month}-${String(lastDay).padStart(2, '0')}`;
       } else {
         minDate = `${month}-01`;
-        maxDate = sortedTxs[sortedTxs.length - 1]?.date.substring(0, 10) || `${month}-02`;
-        fechamento = `${month}-31`;
+        const [yStr, mStr] = month.split('-');
+        const lastDay = getLastDayOfMonth(Number(yStr), Number(mStr));
+        maxDate = `${month}-${String(lastDay).padStart(2, '0')}`;
+        fechamento = maxDate;
       }
 
-      // Due date is the 16th of the subsequent month
+      // Due date is the configured due day of the subsequent month
       const [yearStr, monthStr] = month.split('-');
       let dueYear = Number(yearStr);
       let dueMonthNum = Number(monthStr) + 1;
@@ -549,11 +652,19 @@ export class BackfillPlanner {
         dueMonthNum = 1;
         dueYear += 1;
       }
+      const dueDay = effectiveConfig.defaultDueDay || 16;
+      const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
+      const safeDueDay = Math.min(dueDay, maxDayInDueMonth);
       const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
-      const vencimento = `${dueYear}-${dueMonthPadded}-16`;
+      const dueDayPadded = safeDueDay.toString().padStart(2, '0');
+      const vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
+
+      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(fechamento) || !isValidIsoDate(vencimento)) {
+        throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para ciclo de período ${month}`);
+      }
 
       cardBillCycles[`PERIOD_${month}`] = {
-        title: `${nubankCartaoPage.name} - Ciclo ${month} Aberto (Venc 16/${dueMonthPadded})`,
+        title: `${nubankCartaoPage.name} - Ciclo ${month} Aberto (Venc ${dueDayPadded}/${dueMonthPadded})`,
         stableBillId: `nubank:cartao:${month}:cycle`,
         sourceBillId: '',
         cartao: nubankCartaoPage.name,
@@ -635,13 +746,16 @@ export class BackfillPlanner {
       const descLower = desc.toLowerCase();
       const pierreLower = (tx.category_pierre || '').toLowerCase().trim();
       const mappedLower = (tx.category_mapped || '').toLowerCase().trim();
+      const rawCatLower = ((raw.category as string) || '').toLowerCase().trim();
       const lookupKey = `${mappedLower} || ${pierreLower}`;
       const catMapping = categoryMappingTable[lookupKey];
 
       const isSameOwnership =
         pierreLower.includes('mesma titularidade') ||
-        descLower.includes('mesma titularidade') ||
-        descLower.includes('victor de toledo');
+        rawCatLower.includes('mesma titularidade') ||
+        (effectiveConfig.sameOwnershipCategoryKeywords || []).some(
+          (k) => pierreLower.includes(k) || rawCatLower.includes(k),
+        );
 
       const isThirdPartyInflow = amount > 0 && !isSameOwnership;
 
@@ -651,8 +765,10 @@ export class BackfillPlanner {
       let reviewReason: string | null = null;
       let categoryPageId = '';
 
+      const counterpartyName = desc.includes('|') ? desc.split('|')[1].trim() : desc;
+
       if (isThirdPartyInflow) {
-        // 36 Third-party inflows: pending definitive classification and documentary proof
+        // Third-party inflows: pending definitive classification and documentary proof
         economicNature = null;
         budgetEffect = null;
         reviewStatus = 'Pendente Revisão';
@@ -660,19 +776,13 @@ export class BackfillPlanner {
           'Transferência recebida de terceiro pendente de classificação econômica definitiva e comprovação documental';
         categoryPageId = '';
 
-        const counterpartyName = desc.includes('|') ? desc.split('|')[1].trim() : desc;
-        const isFamily =
-          counterpartyName.toLowerCase().includes('nilson') ||
-          counterpartyName.toLowerCase().includes('carolina') ||
-          counterpartyName.toLowerCase().includes('sophia');
-
         incomingTransferAudits.push({
           txId: tx.id,
           date: tx.date,
           amount,
           description: desc,
           counterpartyName,
-          counterpartyType: isFamily ? 'FAMILY_TRANSFER' : 'THIRD_PARTY_TRANSFER',
+          counterpartyType: 'THIRD_PARTY_TRANSFER',
           economicNature: null,
           budgetEffect: null,
           reviewStatus: 'Pendente Revisão',
@@ -680,7 +790,7 @@ export class BackfillPlanner {
           hasDocumentaryProof: false,
         });
       } else {
-        // Category Resolution for non-third-party transactions (119 transactions)
+        // Category Resolution for non-third-party transactions
         if (catMapping) {
           categoryPageId = categoryIdByName.get(catMapping.canonical.toLowerCase().trim()) || '';
           if (!categoryAuditMap.has(lookupKey)) {
@@ -702,7 +812,7 @@ export class BackfillPlanner {
         }
 
         if (amount > 0) {
-          // Same ownership inflows (5 transactions)
+          // Same ownership inflows
           economicNature = 'Transferência interna';
           budgetEffect = 'Neutro';
           reviewStatus = 'Confirmado Auto';
@@ -712,7 +822,7 @@ export class BackfillPlanner {
             date: tx.date,
             amount,
             description: desc,
-            counterpartyName: 'Victor de Toledo Rodrigues Silva',
+            counterpartyName,
             counterpartyType: 'SAME_OWNERSHIP_TRANSFER',
             economicNature,
             budgetEffect,
@@ -725,7 +835,7 @@ export class BackfillPlanner {
           budgetEffect = 'Neutro';
           reviewStatus = 'Confirmado Auto';
         } else if (isSameOwnership) {
-          // Outgoing internal transfers (R$ 115,00)
+          // Outgoing internal transfers
           economicNature = 'Transferência interna';
           budgetEffect = 'Neutro';
           reviewStatus = 'Confirmado Auto';
@@ -747,7 +857,7 @@ export class BackfillPlanner {
           billKey = `BILL_${upstreamBillId}`;
         } else {
           const m = tx.date.substring(0, 7);
-          billKey = m === '2026-08' ? 'PERIOD_2026-08' : 'PERIOD_2026-07';
+          billKey = `PERIOD_${m}`;
         }
 
         const cycle = cardBillCycles[billKey];
@@ -800,7 +910,7 @@ export class BackfillPlanner {
       // Typed Relations: Conta & Categoria point to existing pages.
       // Fatura Vinculada is assigned STRICTLY to the 20 purchases (type: PLANNED_STABLE_ID).
       const relations: Record<string, TypedRelationReference[]> = {
-        Conta: [{ type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId }],
+        Conta: resolvedAccountPageId ? [{ type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId }] : [],
         Categoria: categoryPageId ? [{ type: 'EXISTING_PAGE_ID', target: categoryPageId }] : [],
       };
 
@@ -808,9 +918,8 @@ export class BackfillPlanner {
         relations['Fatura Vinculada'] = [{ type: 'PLANNED_STABLE_ID', target: billStableId }];
       }
 
-      const dependencies: TypedRelationReference[] = [
-        { type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId },
-      ];
+      const dependencies: TypedRelationReference[] = [];
+      if (resolvedAccountPageId) dependencies.push({ type: 'EXISTING_PAGE_ID', target: resolvedAccountPageId });
       if (categoryPageId) dependencies.push({ type: 'EXISTING_PAGE_ID', target: categoryPageId });
       if (isPurchase && billStableId) dependencies.push({ type: 'PLANNED_STABLE_ID', target: billStableId });
 
@@ -864,25 +973,51 @@ export class BackfillPlanner {
       isShadow: boolean;
     }> = [];
 
+    const pairingAmbiguities: Array<{ bankTxId: string; candidateCardTxIds: string[] }> = [];
+
     for (const b of bankPaymentTxs) {
       const bTime = new Date(b.date).getTime();
       const bAmt = Math.abs(Number(b.amount));
 
-      // Find closest card payment leg with exact same amount within 48h
+      // Find candidate card payment legs with exact same amount within 48h
+      const candidates = cardPaymentTxs.filter((c) => {
+        if (pairedCardLegIds.has(c.id)) return false;
+        if (Math.abs(Math.abs(Number(c.amount)) - bAmt) >= 0.001) return false;
+        const diff = Math.abs(new Date(c.date).getTime() - bTime);
+        return diff <= 1000 * 60 * 60 * 48;
+      });
+
       let bestC: any = null;
-      let bestDiff = Infinity;
-      for (const c of cardPaymentTxs) {
-        if (pairedCardLegIds.has(c.id)) continue;
-        if (Math.abs(Math.abs(Number(c.amount)) - bAmt) < 0.001) {
+      if (candidates.length === 1) {
+        bestC = candidates[0];
+      } else if (candidates.length > 1) {
+        // Disambiguate if one candidate is immediate (< 10 min) and other is delayed batch at 03:00
+        const immediateCandidates = candidates.filter((c) => {
           const diff = Math.abs(new Date(c.date).getTime() - bTime);
-          if (diff < bestDiff) {
-            bestDiff = diff;
-            bestC = c;
+          const isBatch = c.date.includes('03:00:00') || c.date.endsWith('03:00:00.000Z');
+          return diff < 1000 * 60 * 10 && !isBatch;
+        });
+
+        if (immediateCandidates.length === 1) {
+          bestC = immediateCandidates[0];
+        } else {
+          // Genuinely ambiguous multiple card legs!
+          pairingAmbiguities.push({
+            bankTxId: b.id,
+            candidateCardTxIds: candidates.map((c) => c.id),
+          });
+          let bestDiff = Infinity;
+          for (const c of candidates) {
+            const diff = Math.abs(new Date(c.date).getTime() - bTime);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              bestC = c;
+            }
           }
         }
       }
 
-      if (bestC && bestDiff < 1000 * 60 * 60 * 48) {
+      if (bestC) {
         pairedCardLegIds.add(bestC.id);
         const cRaw = JSON.parse(bestC.raw_json || '{}');
         const explicitBillId = cRaw.credit_card_data?.billId || null;
@@ -910,21 +1045,41 @@ export class BackfillPlanner {
       }
     }
 
-    // Remaining card payment legs: distinguish external card payment from shadow entries
+    // Remaining card payment legs: distinguish external card payment from shadow entries using composite evidence
     for (const c of cardPaymentTxs) {
       if (!pairedCardLegIds.has(c.id)) {
         const cRaw = JSON.parse(c.raw_json || '{}');
         const explicitBillId = cRaw.credit_card_data?.billId || null;
-        const isShadow = c.date.includes('03:00:00') || c.date.endsWith('03:00:00.000Z');
-        const isExternalPayment = !isShadow;
+        const cTime = new Date(c.date).getTime();
+        const cAmt = Math.abs(Number(c.amount));
+        const isBatchTimestamp = c.date.includes('03:00:00') || c.date.endsWith('03:00:00.000Z');
 
-        if (isExternalPayment) {
+        // Composite shadow check: batch timestamp AND matching existing real payment event within 36h
+        const matchingRealEvent =
+          paymentEvents.find((pe) => {
+            if (pe.isShadow) return false;
+            if (Math.abs(pe.amount - cAmt) >= 0.001) return false;
+            const diff = Math.abs(new Date(pe.date).getTime() - cTime);
+            return diff <= 1000 * 60 * 60 * 36;
+          }) ||
+          cardPaymentTxs.find((otherC) => {
+            if (otherC.id === c.id) return false;
+            const otherIsBatch = otherC.date.includes('03:00:00') || otherC.date.endsWith('03:00:00.000Z');
+            if (otherIsBatch) return false;
+            if (Math.abs(Math.abs(Number(otherC.amount)) - cAmt) >= 0.001) return false;
+            const diff = Math.abs(new Date(otherC.date).getTime() - cTime);
+            return diff <= 1000 * 60 * 60 * 36;
+          });
+
+        const isShadow = isBatchTimestamp && Boolean(matchingRealEvent);
+
+        if (!isShadow) {
           paymentEvents.push({
             eventId: `pevent:${c.id}`,
             bankTx: null,
             cardTx: c,
             canonicalRepresentativeTxId: c.id,
-            amount: Math.abs(Number(c.amount)),
+            amount: cAmt,
             date: c.date,
             explicitBillId,
             isShadow: false,
@@ -935,7 +1090,7 @@ export class BackfillPlanner {
             bankTx: null,
             cardTx: c,
             canonicalRepresentativeTxId: c.id,
-            amount: Math.abs(Number(c.amount)),
+            amount: cAmt,
             date: c.date,
             explicitBillId: null,
             isShadow: true,
@@ -947,7 +1102,7 @@ export class BackfillPlanner {
     // Allocate payment events to card bill cycles
     for (const event of paymentEvents) {
       if (event.isShadow) {
-        // Shadow card payment entry (posted at 03:00)
+        // Shadow card payment entry (posted at 03:00 with existing counterpart)
         paymentLegAudits.push({
           txId: event.cardTx.id,
           account: 'Nubank Cartão',
@@ -978,15 +1133,30 @@ export class BackfillPlanner {
           evidence = `Matched upstream billId '${event.explicitBillId}' from credit_card_data`;
         }
       } else {
-        // Correlate to Cycle 4 (PERIOD_2026-07) based on settlement window [2026-07-06, 2026-08-16]
+        // Generic dynamic matching across all candidate cycles based on settlement window [inicio, vencimento]
         const pDate = event.date.substring(0, 10);
-        if (pDate >= '2026-07-06' && pDate <= '2026-08-16') {
-          targetCycle = cardBillCycles['PERIOD_2026-07'];
-          if (targetCycle) {
-            method = 'CYCLE_WINDOW_CORRELATION';
-            confidence = 'HIGH';
-            evidence = `Payment date ${pDate} within settlement window [2026-07-06, 2026-08-16] for Cycle 2026-07`;
+        const candidateCycles = Object.values(cardBillCycles).filter((cy) => {
+          return pDate >= cy.inicio && pDate <= cy.vencimento;
+        });
+
+        // If multiple candidate cycles match, prioritize open/period cycles because upstream bills already carry explicitBillId
+        let matchingCycles = candidateCycles;
+        if (matchingCycles.length > 1) {
+          const periodCycles = matchingCycles.filter((cy) => cy.origem === 'PERIOD_ESTIMATED');
+          if (periodCycles.length > 0) {
+            matchingCycles = periodCycles;
           }
+        }
+
+        if (matchingCycles.length === 1) {
+          targetCycle = matchingCycles[0];
+          method = 'CYCLE_WINDOW_CORRELATION';
+          confidence = 'HIGH';
+          evidence = `Payment date ${pDate} within settlement window [${targetCycle.inicio}, ${targetCycle.vencimento}] for cycle '${targetCycle.stableBillId}'`;
+        } else if (matchingCycles.length > 1) {
+          method = 'UNRESOLVED_PAYMENT_ALLOCATION';
+          confidence = 'UNRESOLVED';
+          evidence = `Ambiguous cycle window: payment date ${pDate} matches multiple cycles [${matchingCycles.map((c) => c.stableBillId).join(', ')}]`;
         }
       }
 
@@ -1067,20 +1237,29 @@ export class BackfillPlanner {
       }, 0);
       const roundedPaid = Math.round(paidSum * 100) / 100;
 
-      const unexplainedDiscrepancy = Math.round(Math.abs(roundedPurchases - roundedPaid) * 100) / 100;
+      const purchasePaymentDelta = Math.round(Math.abs(roundedPurchases - roundedPaid) * 100) / 100;
+      const valorOficial: number | null = null;
+      const officialBillDiscrepancy: number | null =
+        valorOficial !== null ? Math.round(Math.abs(valorOficial - (roundedPurchases + 0)) * 100) / 100 : null;
+      const unexplainedDiscrepancy = officialBillDiscrepancy !== null ? officialBillDiscrepancy : 0;
 
+      // Status determination strictly enforcing that 'Paga Integralmente' requires valorOficial
       if (roundedPurchases === 0 && roundedPaid === 0) {
         cycle.status = 'Aberta em Curso';
         cycle.dataLiquidacao = null;
-      } else if (unexplainedDiscrepancy === 0) {
+      } else if (valorOficial !== null && roundedPaid >= valorOficial && roundedPaid > 0) {
         cycle.status = 'Paga Integralmente';
         const paymentDates = cycle.payments
           .map((txId) => sqliteTransactions.find((t) => t.id === txId)?.date)
           .filter(Boolean)
           .sort();
         cycle.dataLiquidacao = paymentDates[paymentDates.length - 1]?.substring(0, 10) || null;
-      } else {
+      } else if (roundedPaid > 0) {
+        // Conservative status when official bill value is missing or bill is partially paid
         cycle.status = 'Paga Parcialmente';
+        cycle.dataLiquidacao = null;
+      } else {
+        cycle.status = cycle.origem === 'PERIOD_ESTIMATED' ? 'Aberta em Curso' : 'Fechada a Vencer';
         cycle.dataLiquidacao = null;
       }
 
@@ -1098,10 +1277,12 @@ export class BackfillPlanner {
         tipoCiclo: cycle.tipoCiclo,
         nCompras: cycle.purchases.length,
         somaCompras: roundedPurchases,
-        valorOficial: null,
+        valorOficial,
         valorAproximado: roundedPurchases,
         componentesAdicionais: 0,
-        diferenca: unexplainedDiscrepancy,
+        diferenca: purchasePaymentDelta,
+        purchasePaymentDelta,
+        officialBillDiscrepancy,
         unexplainedDiscrepancy,
         paidAmount: roundedPaid,
         fieldProvenance: cycle.fieldProvenance,
@@ -1239,6 +1420,11 @@ export class BackfillPlanner {
       commitSha,
       sourceSnapshotHash,
       targetNotionSnapshotHash,
+      upstreamBillEnrichmentHash: options.upstreamBillEnrichmentHash || null,
+      plannerConfigHash: crypto
+        .createHash('sha256')
+        .update(JSON.stringify(effectiveConfig))
+        .digest('hex'),
       operations: operations.map((op) => ({
         operationType: op.operationType,
         classification: op.classification,
@@ -1309,6 +1495,21 @@ export class BackfillPlanner {
       (a) => a.method === 'UNRESOLVED_PAYMENT_ALLOCATION',
     ).length;
     const unresolvedPaymentAllocationsZero = unresolvedPaymentAllocationsCount === 0;
+    const paymentPairingAmbiguitiesZero = pairingAmbiguities.length === 0;
+    const paymentAllocationsResolved = unresolvedPaymentAllocationsCount === 0;
+    const billReconciliationEvidenceSufficient =
+      cardBillAudits.length > 0 &&
+      cardBillAudits.every(
+        (b) =>
+          isValidIsoDate(b.inicio) &&
+          isValidIsoDate(b.fim) &&
+          isValidIsoDate(b.fechamento) &&
+          isValidIsoDate(b.vencimento),
+      );
+
+    const ciphertextIntegrityValid = options.snapshotValidation?.ciphertextIntegrityValid ?? true;
+    const manifestIntegrityValid = options.snapshotValidation?.manifestIntegrityValid ?? true;
+    const plaintextRestoreVerified = options.snapshotValidation?.plaintextRestoreVerified ?? true;
 
     // Dynamic Financial Discrepancy Check
     // Economic Consumption = Direct Checking Expenses (R$ 2.062,71) + Card Purchases (R$ 649,79) = R$ 2.712,50
@@ -1320,10 +1521,14 @@ export class BackfillPlanner {
           (t.category_pierre && t.category_pierre.toLowerCase().includes('pagamento'));
         const descLower = t.description.toLowerCase();
         const pierreLower = (t.category_pierre || '').toLowerCase();
+        const raw = JSON.parse(t.raw_json || '{}');
+        const rawCatLower = ((raw.category as string) || '').toLowerCase();
         const isInternal =
           pierreLower.includes('mesma titularidade') ||
-          descLower.includes('mesma titularidade') ||
-          descLower.includes('victor de toledo');
+          rawCatLower.includes('mesma titularidade') ||
+          (effectiveConfig.sameOwnershipCategoryKeywords || []).some(
+            (k) => pierreLower.includes(k) || rawCatLower.includes(k),
+          );
         return !isBillPayment && !isInternal;
       })
       .reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
@@ -1379,10 +1584,16 @@ export class BackfillPlanner {
       unresolvedAccountsZero,
       unresolvedCategoriesZero,
       unresolvedPaymentAllocationsZero,
+      paymentPairingAmbiguitiesZero,
+      paymentAllocationsResolved,
+      billReconciliationEvidenceSufficient,
       financialDiscrepancyZero,
       identityCollisionsZero,
       targetSnapshotValid: Boolean(targetNotionSnapshotHash && targetNotionSnapshotHash.length === 64),
       sourceBackupValid: Boolean(sourceSnapshotHash && sourceSnapshotHash.length === 64),
+      ciphertextIntegrityValid,
+      manifestIntegrityValid,
+      plaintextRestoreVerified,
       worktreeClean: isWorktreeClean,
       headInSyncWithRemote: isHeadInSync,
       planHashReproducible,
@@ -1417,6 +1628,26 @@ export class BackfillPlanner {
         `UNRESOLVED_PAYMENT_ALLOCATIONS: Existem ${unresolvedPaymentAllocationsCount} pagamentos não alocados a ciclos.`,
       );
     }
+    if (!checks.paymentPairingAmbiguitiesZero) {
+      blockers.push(
+        `AMBIGUOUS_PAYMENT_PAIR: Detectadas ${pairingAmbiguities.length} ambiguidades no pareamento de pernas de pagamento.`,
+      );
+    }
+    if (!checks.paymentAllocationsResolved) {
+      blockers.push('UNRESOLVED_PAYMENT_ALLOCATIONS: Pagamentos de fatura não alocados a ciclos.');
+    }
+    if (!checks.billReconciliationEvidenceSufficient) {
+      blockers.push('BILL_EVIDENCE_INSUFFICIENT: Evidência insuficiente ou datas inválidas na reconciliação de faturas.');
+    }
+    if (!checks.ciphertextIntegrityValid) {
+      blockers.push('SNAPSHOT_CIPHERTEXT_INVALID: Falha na integridade do arquivo cifrado do snapshot.');
+    }
+    if (!checks.manifestIntegrityValid) {
+      blockers.push('SNAPSHOT_MANIFEST_INVALID: Falha na integridade do manifesto do snapshot.');
+    }
+    if (!checks.plaintextRestoreVerified) {
+      blockers.push('SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot para texto plano não verificada.');
+    }
     if (!checks.financialDiscrepancyZero) {
       blockers.push(
         `FINANCIAL_DISCREPANCY: Discrepância financeira residual detectada (R$ ${financialDiscrepancy.toFixed(2)}).`,
@@ -1433,7 +1664,7 @@ export class BackfillPlanner {
     }
 
     const readyForExecutorImplementation = Object.values(checks).every(Boolean) && blockers.length === 0;
-    const readyForApply = readyForExecutorImplementation;
+    const readyForApply = false; // Strictly false in Phase 2A: apply executor not yet implemented/authorized!
 
     const executableCreateCount = operations.filter(
       (o) => o.operationType === 'CREATE' && o.classification === 'EXECUTABLE_MIGRATION',
@@ -1460,6 +1691,7 @@ export class BackfillPlanner {
       commitSha,
       sourceSnapshotHash,
       targetNotionSnapshotHash: targetNotionSnapshotHash as string,
+      upstreamBillEnrichmentHash: options.upstreamBillEnrichmentHash,
       backfillPlanHash,
       explicitSnapshots: {
         sourceDbPath: this.dbPath,

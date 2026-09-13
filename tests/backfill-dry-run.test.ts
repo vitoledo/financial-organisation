@@ -82,10 +82,10 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     const report = await analyzer.runAnalysis();
 
-    expect(report.cardBillAudits).toHaveLength(5);
+    expect(report.cardBillAudits).toHaveLength(4);
     expect(report.cardBillAudits.every((b) => b.valorOficial === null)).toBe(true);
     expect(report.cardBillAudits.filter((b) => b.qualidade === 'UPSTREAM_APPROXIMATE')).toHaveLength(3);
-    expect(report.cardBillAudits.filter((b) => b.qualidade === 'DERIVED')).toHaveLength(2);
+    expect(report.cardBillAudits.filter((b) => b.qualidade === 'DERIVED')).toHaveLength(1);
 
     const totalPurchasesAcrossBills = report.cardBillAudits.reduce((acc, b) => acc + b.somaCompras, 0);
     expect(Math.round(totalPurchasesAcrossBills * 100) / 100).toBe(649.79);
@@ -109,7 +109,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     ).toBe(true);
   });
 
-  it('reconciles 18 category pairs without silent generic defaults', async () => {
+  it('reconciles 17 category pairs without silent generic defaults', async () => {
     const analyzer = new BackfillDryRunAnalyzer({
       client: fakeClient,
       envVars: testEnv,
@@ -117,9 +117,9 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     const report = await analyzer.runAnalysis();
 
-    expect(report.categoryReconciliations).toHaveLength(18);
+    expect(report.categoryReconciliations).toHaveLength(17);
     const totalCategorizedTxs = report.categoryReconciliations.reduce((acc, c) => acc + c.quantidade, 0);
-    expect(totalCategorizedTxs).toBe(119); // 155 minus 36 pending third-party inflows
+    expect(totalCategorizedTxs).toBe(106); // 155 minus 36 pending third-party inflows minus 13 third-party transfers pending review
   });
 
   it('guarantees deterministic reproducibility of backfillPlanHash', () => {
@@ -170,7 +170,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     expect(run1.artifact.backfillPlanHash).toBe(run2.artifact.backfillPlanHash);
     expect(run1.artifact.operations).toEqual(run2.artifact.operations);
-    expect(run1.artifact.summary.executableCreateCount).toBe(160);
+    expect(run1.artifact.summary.executableCreateCount).toBe(159);
     expect(run1.artifact.summary.executableUpdateCount).toBe(0);
     expect(run1.artifact.summary.proposedReviewCount).toBe(0);
   });
@@ -185,9 +185,6 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     expect(report.planArtifact.readiness.readyForExecutorImplementation).toBe(false);
     expect(report.planArtifact.readiness.readyForApply).toBe(false);
-    expect(report.planArtifact.readiness.readyForExecutorImplementation).toBe(
-      report.planArtifact.readiness.readyForApply,
-    );
     expect(report.planArtifact.readiness.pendingEconomicClassificationCount).toBe(36);
     expect(report.planArtifact.readiness.blockers.length).toBeGreaterThan(0);
   });

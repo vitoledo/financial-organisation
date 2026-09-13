@@ -272,10 +272,11 @@ export class BackfillDryRunAnalyzer {
       const amt = Number(tx.amount);
       const descLower = tx.description?.toLowerCase() || '';
       const pierreLower = tx.category_pierre?.toLowerCase() || '';
+      const raw = JSON.parse(tx.raw_json || '{}');
+      const rawCatLower = ((raw.category as string) || '').toLowerCase();
       const isSame =
         pierreLower.includes('mesma titularidade') ||
-        descLower.includes('mesma titularidade') ||
-        descLower.includes('victor de toledo');
+        rawCatLower.includes('mesma titularidade');
 
       if (amt > 0) {
         checkingInflows += amt;

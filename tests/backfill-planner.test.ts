@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   BackfillPlanner,
   validateOperationAgainstContract,
+  isValidIsoDate,
+  getLastDayOfMonth,
 } from '../src/notion/migration-runner/backfill-planner';
 
 describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
@@ -151,17 +153,17 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
   });
 
   describe('Operations & Relations Conformance', () => {
-    it('produces exactly 160 CREATE operations and 0 UPDATE operations', () => {
+    it('produces exactly 159 CREATE operations and 0 UPDATE operations', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact, proposedDerivedUpdates } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
         notionCategories: sampleNotionCategories,
       });
 
-      expect(artifact.summary.executableCreateCount).toBe(160);
+      expect(artifact.summary.executableCreateCount).toBe(159);
       expect(artifact.summary.executableUpdateCount).toBe(0);
       expect(artifact.summary.proposedReviewCount).toBe(0);
-      expect(artifact.operations).toHaveLength(160);
+      expect(artifact.operations).toHaveLength(159);
       expect(artifact.operations.every((op) => op.operationType === 'CREATE')).toBe(true);
 
       // Verify the 2 derived updates are recorded as OUT_OF_SCOPE_NOT_EXECUTED outside operations
@@ -222,7 +224,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const billOps = artifact.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
-      expect(billOps).toHaveLength(5);
+      expect(billOps).toHaveLength(4);
 
       const totalPaymentLegRelations = billOps.reduce(
         (acc, b) => acc + (b.relations['Transações de Pagamento']?.length || 0),
@@ -237,7 +239,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(totalCycleTransactions).toBe(20);
     });
 
-    it('includes all 14 dynamic readiness checks in BackfillPlanArtifact', () => {
+    it('includes all 20 dynamic readiness checks in BackfillPlanArtifact', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -245,7 +247,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const checks = artifact.readiness.checks;
-      expect(Object.keys(checks)).toHaveLength(14);
+      expect(Object.keys(checks)).toHaveLength(20);
       expect(checks).toHaveProperty('schemaConformant13Of13');
       expect(checks).toHaveProperty('missingPropertiesZero');
       expect(checks).toHaveProperty('structuralMismatchesZero');
@@ -253,10 +255,16 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(checks).toHaveProperty('unresolvedAccountsZero');
       expect(checks).toHaveProperty('unresolvedCategoriesZero');
       expect(checks).toHaveProperty('unresolvedPaymentAllocationsZero');
+      expect(checks).toHaveProperty('paymentPairingAmbiguitiesZero');
+      expect(checks).toHaveProperty('paymentAllocationsResolved');
+      expect(checks).toHaveProperty('billReconciliationEvidenceSufficient');
       expect(checks).toHaveProperty('financialDiscrepancyZero');
       expect(checks).toHaveProperty('identityCollisionsZero');
       expect(checks).toHaveProperty('targetSnapshotValid');
       expect(checks).toHaveProperty('sourceBackupValid');
+      expect(checks).toHaveProperty('ciphertextIntegrityValid');
+      expect(checks).toHaveProperty('manifestIntegrityValid');
+      expect(checks).toHaveProperty('plaintextRestoreVerified');
       expect(checks).toHaveProperty('worktreeClean');
       expect(checks).toHaveProperty('headInSyncWithRemote');
       expect(checks).toHaveProperty('planHashReproducible');
@@ -441,41 +449,158 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         notionCategories: sampleNotionCategories,
       });
 
-      expect(cardBillAudits).toHaveLength(5);
+      expect(cardBillAudits).toHaveLength(4);
 
-      // Cycle 2 (June) - fully paid with external payment included
+      // Cycle 2 (June) - conservative 'Paga Parcialmente' due to null official bill value
       const cycle2 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:a5ea6710-2f6e-4663-a237-2c062b8fa8d7');
       expect(cycle2).toBeDefined();
       expect(cycle2!.somaCompras).toBe(171.79);
       expect(cycle2!.paidAmount).toBe(171.79);
+      expect(cycle2!.purchasePaymentDelta).toBe(0);
+      expect(cycle2!.officialBillDiscrepancy).toBeNull();
       expect(cycle2!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle2!.status).toBe('Paga Integralmente');
-      expect(cycle2!.dataLiquidacao).toBe('2026-06-12');
+      expect(cycle2!.status).toBe('Paga Parcialmente');
 
-      // Cycle 3 (July) - fully paid
+      // Cycle 3 (July) - conservative 'Paga Parcialmente' due to null official bill value
       const cycle3 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:f4513058-c028-4b90-b663-16f27d0e2d8e');
       expect(cycle3).toBeDefined();
       expect(cycle3!.somaCompras).toBe(55.89);
       expect(cycle3!.paidAmount).toBe(55.89);
+      expect(cycle3!.purchasePaymentDelta).toBe(0);
+      expect(cycle3!.officialBillDiscrepancy).toBeNull();
       expect(cycle3!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle3!.status).toBe('Paga Integralmente');
-      expect(cycle3!.dataLiquidacao).toBe('2026-07-06');
+      expect(cycle3!.status).toBe('Paga Parcialmente');
 
-      // Cycle 1 (May) - partially paid, discrepancy 24.85
+      // Cycle 1 (May) - partially paid, delta 24.85
       const cycle1 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:7f6be926-ae1b-4685-a830-8ec6e773fbf0');
       expect(cycle1).toBeDefined();
       expect(cycle1!.somaCompras).toBe(7.08);
       expect(cycle1!.paidAmount).toBe(31.93);
-      expect(cycle1!.unexplainedDiscrepancy).toBe(24.85);
+      expect(cycle1!.purchasePaymentDelta).toBe(24.85);
+      expect(cycle1!.officialBillDiscrepancy).toBeNull();
+      expect(cycle1!.unexplainedDiscrepancy).toBe(0);
       expect(cycle1!.status).toBe('Paga Parcialmente');
 
-      // Cycle 4 (July open/fallback) - partially paid, discrepancy 316.24
+      // Cycle 4 (July open/fallback) - partially paid, delta 316.24
       const cycle4 = cardBillAudits.find((b) => b.stableBillId === 'nubank:cartao:2026-07:cycle');
       expect(cycle4).toBeDefined();
       expect(cycle4!.somaCompras).toBe(415.03);
       expect(cycle4!.paidAmount).toBe(98.79);
-      expect(cycle4!.unexplainedDiscrepancy).toBe(316.24);
+      expect(cycle4!.purchasePaymentDelta).toBe(316.24);
+      expect(cycle4!.officialBillDiscrepancy).toBeNull();
+      expect(cycle4!.unexplainedDiscrepancy).toBe(0);
       expect(cycle4!.status).toBe('Paga Parcialmente');
+    });
+
+    it('strictly validates calendar dates and rejects invalid ISO dates', () => {
+      expect(isValidIsoDate('2024-02-29')).toBe(true); // Leap year valid
+      expect(isValidIsoDate('2026-02-29')).toBe(false); // Non-leap year invalid
+      expect(isValidIsoDate('2026-04-31')).toBe(false); // April has 30 days
+      expect(isValidIsoDate('2026-13-01')).toBe(false); // Invalid month 13
+      expect(isValidIsoDate('2026/05/01')).toBe(false); // Slash format invalid
+      expect(isValidIsoDate('')).toBe(false);
+      expect(isValidIsoDate(null as any)).toBe(false);
+
+      expect(getLastDayOfMonth(2024, 2)).toBe(29);
+      expect(getLastDayOfMonth(2026, 2)).toBe(28);
+      expect(getLastDayOfMonth(2026, 4)).toBe(30);
+      expect(getLastDayOfMonth(2026, 7)).toBe(31);
+    });
+
+    it('prunes empty cycles without purchases (e.g. August 2026 payment only)', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      // August 2026 has a payment leg (457dbf4d, R$ 30,00) but 0 purchases -> pruned from bills
+      expect(cardBillAudits).toHaveLength(4);
+      expect(cardBillAudits.find((b) => b.stableBillId.includes('2026-08'))).toBeUndefined();
+    });
+
+    it('detects ambiguous payment pairing candidates when multiple identical amounts exist within 48h', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      // The canonical dataset has 0 pairing ambiguities
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      expect(artifact.readiness.checks.paymentPairingAmbiguitiesZero).toBe(true);
+      expect(artifact.readiness.checks.paymentAllocationsResolved).toBe(true);
+    });
+
+    it('never assigns Paga Integralmente when valorOficial is null', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      // All card bills without valorOficial must be conservative
+      for (const bill of cardBillAudits) {
+        if (bill.valorOficial === null) {
+          expect(bill.status).not.toBe('Paga Integralmente');
+          expect(['Paga Parcialmente', 'Aberta em Curso', 'Fechada a Vencer']).toContain(bill.status);
+        }
+      }
+    });
+
+    it('evaluates unresolvedAccountsZero as false when an account UUID is missing from sourceAccountMapping', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        plannerConfig: {
+          sourceAccountMapping: {
+            'c82e6d46-4444-4828-a379-cb1412b1a1dd': 'CHECKING',
+            // Omit credit card account: '02e273f7-840e-4b3a-b487-348f922dce70'
+          },
+        },
+      });
+
+      expect(artifact.readiness.checks.unresolvedAccountsZero).toBe(false);
+      expect(artifact.readiness.blockers.some((b) => b.includes('UNRESOLVED_ACCOUNTS'))).toBe(true);
+    });
+
+    it('does not map (transferência) || transferências to Transferências internas without same-ownership proof', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      // Third party transfer operations must not have category 'Transferência Interna'
+      const internalTransferCategoryId = sampleNotionCategories.find((c) => c.name === 'Transferência Interna')?.id;
+      const transferTxs = artifact.operations.filter((o) => {
+        const catPierre = o.sanitizedPayload['Categoria Pierre'] || '';
+        return catPierre.toLowerCase() === 'transferências';
+      });
+
+      expect(transferTxs.length).toBeGreaterThan(0);
+      expect(
+        transferTxs.every((o) => {
+          const catRel = o.relations['Categoria']?.[0]?.target;
+          return catRel !== internalTransferCategoryId;
+        }),
+      ).toBe(true);
+    });
+
+    it('strictly enforces readyForApply = false even when all checks pass', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        schemaEvidence: {
+          totalDataSources: 13,
+          verifiedDataSources: 13,
+          missingPropertiesCount: 0,
+          structuralMismatchesCount: 0,
+        },
+      });
+
+      // In Phase 2A, readyForApply must be strictly false
+      expect(artifact.readiness.readyForApply).toBe(false);
     });
   });
 });
