@@ -72,6 +72,130 @@ export interface BackfillPlan {
   pipelines: BackfillPipeline[];
 }
 
+export type AccountResolutionState =
+  | 'SOURCE_ACCOUNT_ID'
+  | 'LEGACY_ACCOUNT_MAPPING'
+  | 'DETERMINISTIC_RULE'
+  | 'UNRESOLVED';
+
+export interface TransactionResolutionAudit {
+  sourceTransactionId: string;
+  date: string;
+  amount: number;
+  sanitizedDescription: string;
+  flowDirection: 'Entrada' | 'Saída';
+  originalAccountId: string;
+  resolvedAccountName: string;
+  resolvedAccountPageId: string;
+  resolutionMethod: AccountResolutionState;
+  confidenceStatus: 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'UNRESOLVED';
+}
+
+export type BackfillOperationType = 'CREATE' | 'UPDATE';
+
+export type BackfillOperationClassification =
+  | 'EXECUTABLE_MIGRATION'
+  | 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW';
+
+export interface BackfillOperation {
+  operationType: BackfillOperationType;
+  classification: BackfillOperationClassification;
+  stableId: string;
+  targetDataSource: {
+    envKey: string;
+    dataSourceId: string;
+    name: string;
+  };
+  sanitizedPayload: Record<string, any>;
+  relations: Record<string, string[]>;
+  dependencies: string[];
+  reason: string;
+  expectedPriorState?: Record<string, any>;
+}
+
+export interface CardBillAuditItem {
+  stableBillId: string;
+  cartao: string;
+  inicio: string;
+  fim: string;
+  fechamento: string;
+  vencimento: string;
+  status: string;
+  origem: string;
+  qualidade: string;
+  nCompras: number;
+  somaCompras: number;
+  valorOficial: number | null;
+  valorAproximado: number;
+  componentesAdicionais: number;
+  diferenca: number;
+}
+
+export interface CategoryReconciliationItem {
+  categoriaLegado: string;
+  categoriaCanonica: string;
+  quantidade: number;
+  soma: number;
+  metodoMapeamento: string;
+}
+
+export interface ProposedDerivedUpdateAudit {
+  targetBase: string;
+  pageId: string;
+  title: string;
+  field: string;
+  currentValue: any;
+  proposedValue: any;
+  difference: string;
+  formulaSource: string;
+  timestampFreshness: string;
+  rationale: string;
+  status: 'PROPOSED_DERIVED_UPDATE_REQUIRES_REVIEW';
+}
+
+export interface BackfillPlanArtifact {
+  version: string;
+  mappingVersion: string;
+  generatedAt: string;
+  commitSha: string;
+  sourceSnapshotHash: string;
+  targetNotionSnapshotHash: string;
+  backfillPlanHash: string;
+  summary: {
+    totalOperations: number;
+    executableCreateCount: number;
+    executableUpdateCount: number;
+    proposedReviewCount: number;
+    totalRelations: number;
+    byTargetDataSource: Record<string, number>;
+  };
+  operations: BackfillOperation[];
+  readiness: {
+    readyForApply: boolean;
+    blockers: string[];
+    checks: {
+      schemaConformant13Of13: boolean;
+      missingPropertiesZero: boolean;
+      structuralMismatchesZero: boolean;
+      duplicatesZero: boolean;
+      unresolvedZero: boolean;
+      financialDiscrepancyZero: boolean;
+      identityCollisionsZero: boolean;
+      targetSnapshotValid: boolean;
+      sourceBackupValid: boolean;
+      worktreeClean: boolean;
+      headInSyncWithRemote: boolean;
+      planHashReproducible: boolean;
+    };
+  };
+  securityGates: {
+    enabledVar: 'FINANCIAL_BACKFILL_ENABLED';
+    expectedEnabledValue: 'I_UNDERSTAND_BACKFILL_MUTATIONS';
+    planHashVar: 'FINANCIAL_BACKFILL_PLAN_HASH';
+    commitShaVar: 'FINANCIAL_BACKFILL_COMMIT_SHA';
+  };
+}
+
 export interface InputFingerprint {
   commitSha: string;
   notionApiVersion: string;
@@ -279,6 +403,7 @@ export interface DdlStepExecutionResult {
   createdId?: string;
   detail: string;
   durationMs: number;
+  isPhysicalWrite?: boolean;
 }
 
 export interface DdlApplyExecutionSummary {
@@ -289,6 +414,7 @@ export interface DdlApplyExecutionSummary {
   totalSteps: number;
   verifiedCount: number;
   noOpCount: number;
+  physicalWritesExecuted: number;
   startedAt: string;
   completedAt: string;
   stepResults: DdlStepExecutionResult[];

@@ -664,7 +664,7 @@ export class MigrationRunner {
         planHash: providedPlanHash,
         runId,
         summary,
-        mutationsExecuted: summary.verifiedCount,
+        mutationsExecuted: summary.physicalWritesExecuted,
         plan: dryRunResult.plan,
       };
     } else {
@@ -784,7 +784,7 @@ export class MigrationRunner {
         planHash: providedPlanHash,
         runId,
         summary,
-        mutationsExecuted: summary.verifiedCount,
+        mutationsExecuted: summary.physicalWritesExecuted,
         plan,
       };
     }
@@ -1409,7 +1409,7 @@ export class MigrationRunner {
       lines.push(`Total de Passos: ${report.summary.totalSteps}`);
       lines.push(`Passos Verificados (VERIFIED): ${report.summary.verifiedCount}`);
       lines.push(`Passos Idempotentes (NO_OP_VERIFIED): ${report.summary.noOpCount}`);
-      lines.push(`Mutations Executadas no Notion: ${report.mutationsExecuted}`);
+      lines.push(`Writes Físicos Executados no Notion: ${report.mutationsExecuted}`);
       lines.push('\n═══════════════════════════════════════════════════════════════════════════════');
       lines.push('  EXECUÇÃO DDL CONCLUÍDA COM SUCESSO NO NOTION');
       lines.push('═══════════════════════════════════════════════════════════════════════════════');

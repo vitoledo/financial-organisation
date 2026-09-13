@@ -2965,7 +2965,8 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         expect(report.summary.totalSteps).toBe(54);
         expect(report.summary.verifiedCount).toBe(54);
         expect(report.summary.noOpCount).toBe(0);
-        expect(report.mutationsExecuted).toBe(54);
+        expect(report.mutationsExecuted).toBe(53); // 53 physical writes (Step 53 is read-only GET)
+        expect(report.summary.physicalWritesExecuted).toBe(53);
         expect(fakeNotion.writeCallsCount).toBeGreaterThan(50);
 
         // Check report formatting
@@ -3785,7 +3786,8 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
         expect(report.summary.totalSteps).toBe(54);
         expect(report.summary.verifiedCount).toBe(54);
         expect(report.summary.noOpCount).toBe(0);
-        expect(report.mutationsExecuted).toBe(54);
+        expect(report.mutationsExecuted).toBe(43); // 43 physical writes (Steps 1..10 skipped, Step 53 is read-only GET)
+        expect(report.summary.physicalWritesExecuted).toBe(43);
 
         // Steps 1..10 MUST have received ZERO write calls!
         expect(fakeNotion.writeCallsByProperty['Limite Operacional Usado']).toBeUndefined();

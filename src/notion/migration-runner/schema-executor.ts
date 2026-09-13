@@ -77,6 +77,7 @@ export class SchemaApplyExecutor {
               createdId: existingStatus.createdId,
               detail: `Passo já registrado e verificado como ${existingStatus.status} no journal SQLite. Revalidação live confirmada.`,
               durationMs: Date.now() - stepStartTime,
+              isPhysicalWrite: false,
             });
 
             if (step.operation === 'RESOLVE_DATA_SOURCE_ID' && existingStatus.createdId) {
@@ -134,6 +135,8 @@ export class SchemaApplyExecutor {
 
       this.journal.completeRun(runId);
 
+      const physicalWritesExecuted = stepResults.filter((r) => r.isPhysicalWrite === true).length;
+
       return {
         runId,
         planHash,
@@ -142,6 +145,7 @@ export class SchemaApplyExecutor {
         totalSteps: steps.length,
         verifiedCount: stepResults.filter((r) => r.status === 'VERIFIED').length,
         noOpCount: stepResults.filter((r) => r.status === 'NO_OP_VERIFIED').length,
+        physicalWritesExecuted,
         startedAt,
         completedAt: new Date().toISOString(),
         stepResults,
@@ -359,6 +363,7 @@ export class SchemaApplyExecutor {
         property: 'Status',
         detail: 'Opções Revisão Necessária e Cancelada já existem no Notion. Operação registrada como NO_OP_VERIFIED.',
         durationMs: Date.now() - startTime,
+        isPhysicalWrite: false,
       };
     }
 
@@ -419,8 +424,9 @@ export class SchemaApplyExecutor {
       status: 'VERIFIED',
       targetDataSource: step.targetDataSource.name,
       property: 'Status',
-      detail: `Opções atualizadas com sucesso para ${postOptions.length} itens preservando IDs legados.`,
+      detail: `Opções de Status atualizadas com sucesso para ${postOptions.length} opções canônicas.`,
       durationMs: Date.now() - startTime,
+      isPhysicalWrite: true,
     };
   }
 
@@ -471,6 +477,7 @@ export class SchemaApplyExecutor {
         createdId: existingProp.id,
         detail: `Propriedade '${propName}' já existe com tipo e configuração compatíveis no Notion. Registrado como NO_OP_VERIFIED.`,
         durationMs: Date.now() - startTime,
+        isPhysicalWrite: false,
       };
     }
 
@@ -512,6 +519,7 @@ export class SchemaApplyExecutor {
       createdId: createdProp.id,
       detail: `Propriedade '${propName}' criada com sucesso (ID: ${createdProp.id}).`,
       durationMs: Date.now() - startTime,
+      isPhysicalWrite: true,
     };
   }
 
@@ -618,6 +626,7 @@ export class SchemaApplyExecutor {
           createdId: existingDbId,
           detail: `Database existente reconciliada com sucesso sob a página-mãe (ID: ${existingDbId}).`,
           durationMs: Date.now() - startTime,
+          isPhysicalWrite: false,
         };
       }
     }
@@ -667,6 +676,7 @@ export class SchemaApplyExecutor {
       createdId: dbId,
       detail: `Database '${step.targetDataSource.name}' criada com sucesso via initial_data_source (ID: ${dbId}).`,
       durationMs: Date.now() - startTime,
+      isPhysicalWrite: true,
     };
   }
 
@@ -732,6 +742,7 @@ export class SchemaApplyExecutor {
       createdId: resolvedDsId,
       detail: `Data Source ID resolvido com sucesso via GET /v1/databases/${dbId}: ${resolvedDsId} e ${Object.keys(initialProps).length} propriedades iniciais validadas estruturalmente.`,
       durationMs: Date.now() - startTime,
+      isPhysicalWrite: false,
     };
   }
 
@@ -802,6 +813,7 @@ export class SchemaApplyExecutor {
           createdId: existingRelProp.id,
           detail: `Dual relation 'Fatura Vinculada' já existe exatamente vinculada a '${resolvedCardBillsDsId}' e schema final de 23 propriedades confirmado. Registrado como NO_OP_VERIFIED.`,
           durationMs: Date.now() - startTime,
+          isPhysicalWrite: false,
         };
       }
 
@@ -884,6 +896,7 @@ export class SchemaApplyExecutor {
       createdId: createdRel?.id,
       detail: `Dual relation 'Fatura Vinculada' criada com sucesso, sincronizada com 'Lançamentos do Ciclo' e schema final de 23 propriedades confirmado (ID: ${createdRel?.id}).`,
       durationMs: Date.now() - startTime,
+      isPhysicalWrite: true,
     };
   }
 }

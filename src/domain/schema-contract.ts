@@ -480,8 +480,8 @@ export const TARGET_CONTRACT: Record<string, DataSourceContract> = {
   },
 
   // ===========================================================================
-  // 13ª BASE: PROPOSTA DE SCHEMA PARA CRIAÇÃO EXTERNA PELO USUÁRIO NO NOTION
-  // (Esta base NÃO existe atualmente; o introspector NUNCA tenta consultá-la)
+  // 13ª BASE: FATURAS / CICLOS DE CARTÃO
+  // (Criada na migração DDL pelo executor; schema planner trata como base a provisionar)
   // ===========================================================================
   NOTION_DS_CARD_BILLS: {
     envKey: 'NOTION_DS_CARD_BILLS',
