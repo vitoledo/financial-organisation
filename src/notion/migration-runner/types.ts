@@ -164,10 +164,10 @@ export interface CardBillFieldProvenance {
   periodStart: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
   periodEnd: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
   closingDate: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
-  dueDate: 'SOURCE' | 'CONFIGURED' | 'DERIVED';
+  dueDate: 'SOURCE' | 'CONFIGURED' | 'DERIVED' | null;
   settlementDate: 'DERIVED' | 'CONFIGURED' | null;
   officialAmount: 'SOURCE' | 'DERIVED' | null;
-  estimatedAmount: 'DERIVED';
+  estimatedAmount: 'DERIVED' | 'SOURCE' | 'CONFIGURED' | null;
   purchasesTotal: 'DERIVED';
   paidAmount: 'DERIVED' | 'CONFIGURED';
 }
@@ -201,7 +201,7 @@ export interface CardBillAuditItem {
   inicio: string;
   fim: string;
   fechamento: string;
-  vencimento: string;
+  vencimento: string | null;
   dataLiquidacao: string | null;
   status: string | null;
   origem: string;
@@ -210,8 +210,8 @@ export interface CardBillAuditItem {
   nCompras: number;
   somaCompras: number;
   valorOficial: number | null;
-  valorAproximado: number;
-  componentesAdicionais: number;
+  valorAproximado: number | null;
+  componentesAdicionais: number | null;
   diferenca: number;
   purchasePaymentDelta: number;
   officialBillDiscrepancy: number | null;
@@ -261,6 +261,9 @@ export interface BackfillPlanArtifact {
   explicitSnapshots: {
     sourceDbPath: string;
     sourceDbSha256: string;
+    sourceSnapshotManifestPath?: string;
+    sourceSnapshotCiphertextSha256?: string;
+    sourceSnapshotPlaintextSha256?: string;
     targetNotionManifestPath: string;
     targetNotionSnapshotSha256: string;
   };
@@ -286,6 +289,10 @@ export interface BackfillPlanArtifact {
     confirmedEconomicExpenses: number;
     pendingEconomicOutflows: number;
     physicalCashOutflows: number;
+    confirmedDirectCheckingExpenses?: number;
+    pendingThirdPartyOutflows?: number;
+    sameOwnershipOutgoingTransfers?: number;
+    cardBillSettlementCashOutflows?: number;
     checks: {
       schemaConformant13Of13: boolean;
       missingPropertiesZero: boolean;
@@ -309,7 +316,11 @@ export interface BackfillPlanArtifact {
       sourceBackupValid: boolean;
       ciphertextIntegrityValid: boolean;
       manifestIntegrityValid: boolean;
+      manifestStructureAndHashReferencesValid: boolean;
       plaintextRestoreVerified: boolean;
+      sourceSnapshotCiphertextValid: boolean;
+      sourceSnapshotManifestValid: boolean;
+      sourceSnapshotRestoreVerified: boolean;
       worktreeClean: boolean;
       headInSyncWithRemote: boolean;
       planHashReproducible: boolean;

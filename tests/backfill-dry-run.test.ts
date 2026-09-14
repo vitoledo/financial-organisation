@@ -47,6 +47,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
+    SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
     BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
     MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
     COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
@@ -97,7 +98,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     expect(totalPurchasesCount).toBe(20);
   });
 
-  it('suspends derived updates under OUT_OF_SCOPE_NOT_EXECUTED', async () => {
+  it('suspends derived updates with zero updates to execute (Phase 2A.5 clean state)', async () => {
     const analyzer = new BackfillDryRunAnalyzer({
       client: fakeClient,
       envVars: testEnv,
@@ -105,11 +106,8 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     const report = await analyzer.runAnalysis();
 
-    expect(report.proposedDerivedUpdates).toHaveLength(2);
-    expect(report.summary.totalRowsToUpdate).toBe(0); // zero executable updates!
-    expect(
-      report.proposedDerivedUpdates.every((u) => u.status === 'OUT_OF_SCOPE_NOT_EXECUTED'),
-    ).toBe(true);
+    expect(report.proposedDerivedUpdates).toHaveLength(0);
+    expect(report.summary.totalRowsToUpdate).toBe(0); // strictly zero executable updates!
   });
 
   it('reconciles 17 category pairs without silent generic defaults', async () => {
@@ -233,5 +231,35 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     // Dynamic checks
     expect(report.planArtifact.readiness.checks.unresolvedPaymentAllocationsZero).toBe(true);
     expect(report.planArtifact.readiness.checks.financialDiscrepancyZero).toBe(true);
+  });
+
+  it('throws FAIL_CLOSED_TARGET_SNAPSHOT when NOTION_TARGET_SNAPSHOT_MANIFEST is missing', async () => {
+    const envWithoutTarget = { ...testEnv, NOTION_TARGET_SNAPSHOT_MANIFEST: '' };
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: envWithoutTarget,
+    });
+
+    await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_TARGET_SNAPSHOT/);
+  });
+
+  it('throws FAIL_CLOSED_SOURCE_SNAPSHOT when SOURCE_SQLITE_SNAPSHOT_MANIFEST is missing', async () => {
+    const envWithoutSource = { ...testEnv, SOURCE_SQLITE_SNAPSHOT_MANIFEST: '' };
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: envWithoutSource,
+    });
+
+    await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT/);
+  });
+
+  it('throws FAIL_CLOSED_SOURCE_SNAPSHOT when SOURCE_SQLITE_SNAPSHOT_MANIFEST points to non-existent file', async () => {
+    const envWithMissingSource = { ...testEnv, SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/non-existent.json' };
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: envWithMissingSource,
+    });
+
+    await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT/);
   });
 });

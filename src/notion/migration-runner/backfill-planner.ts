@@ -26,8 +26,33 @@ import {
 export const DEFAULT_BACKFILL_PLANNER_CONFIG: BackfillPlannerConfig = {
   sourceAccountMapping: {},
   sameOwnershipCategoryKeywords: ['mesma titularidade'],
-  defaultDueDay: 16,
 };
+
+export function buildSemanticPlannerConfig(config: BackfillPlannerConfig): Record<string, any> {
+  const sortedSourceMapping: Record<string, 'CHECKING' | 'CREDIT'> = {};
+  for (const k of Object.keys(config.sourceAccountMapping || {}).sort()) {
+    sortedSourceMapping[k] = config.sourceAccountMapping[k];
+  }
+
+  const sortedKeywords = [...(config.sameOwnershipCategoryKeywords || [])].sort();
+
+  const semantic: Record<string, any> = {
+    sourceAccountMapping: sortedSourceMapping,
+    sameOwnershipCategoryKeywords: sortedKeywords,
+    hmacKeyVersion: config.hmacKeyVersion || 'v1',
+  };
+
+  if (typeof config.defaultDueDay === 'number') {
+    semantic.defaultDueDay = config.defaultDueDay;
+  }
+
+  return semantic;
+}
+
+export function calculateSemanticConfigHash(config: BackfillPlannerConfig): string {
+  const semantic = buildSemanticPlannerConfig(config);
+  return crypto.createHash('sha256').update(JSON.stringify(semantic)).digest('hex');
+}
 
 export function generateCounterpartyPseudonym(
   counterpartyName: string,
@@ -59,6 +84,7 @@ export function resolvePlannerConfig(
 
   let sourceAccountMapping: Record<string, 'CHECKING' | 'CREDIT'> = {};
   let mappingHash = '';
+  let fileDueDay: number | undefined = undefined;
 
   if (userConfig?.sourceAccountMapping && Object.keys(userConfig.sourceAccountMapping).length > 0) {
     sourceAccountMapping = { ...userConfig.sourceAccountMapping };
@@ -67,7 +93,22 @@ export function resolvePlannerConfig(
     const raw = fs.readFileSync(mappingPath, 'utf8');
     mappingHash = crypto.createHash('sha256').update(raw).digest('hex');
     try {
-      sourceAccountMapping = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.sourceAccountMapping && typeof parsed.sourceAccountMapping === 'object') {
+          sourceAccountMapping = { ...parsed.sourceAccountMapping };
+          if (typeof parsed.defaultDueDay === 'number') {
+            fileDueDay = parsed.defaultDueDay;
+          }
+        } else {
+          const entries = { ...parsed };
+          if (typeof entries.defaultDueDay === 'number') {
+            fileDueDay = entries.defaultDueDay;
+            delete entries.defaultDueDay;
+          }
+          sourceAccountMapping = entries;
+        }
+      }
     } catch (err: any) {
       throw new Error(`FAIL_CLOSED_ACCOUNT_MAPPING_CONFIG: JSON inválido no arquivo ${mappingPath}: ${err.message}`);
     }
@@ -86,10 +127,16 @@ export function resolvePlannerConfig(
     }
   }
 
+  const effectiveDueDay =
+    userConfig?.defaultDueDay !== undefined
+      ? userConfig.defaultDueDay
+      : fileDueDay;
+
   const effectiveConfig: BackfillPlannerConfig = {
     ...DEFAULT_BACKFILL_PLANNER_CONFIG,
     ...(userConfig || {}),
     sourceAccountMapping,
+    defaultDueDay: effectiveDueDay,
     accountMappingConfigPath: mappingPath,
     accountMappingConfigHash: mappingHash,
     counterpartyHmacKey:
@@ -104,7 +151,6 @@ export function resolvePlannerConfig(
     sameOwnershipCategoryKeywords:
       userConfig?.sameOwnershipCategoryKeywords ||
       DEFAULT_BACKFILL_PLANNER_CONFIG.sameOwnershipCategoryKeywords,
-    defaultDueDay: userConfig?.defaultDueDay ?? DEFAULT_BACKFILL_PLANNER_CONFIG.defaultDueDay,
   };
 
   return { effectiveConfig, mappingHash, mappingPath };
@@ -135,7 +181,14 @@ export interface BackfillPlanGeneratorOptions {
   snapshotValidation?: {
     ciphertextIntegrityValid?: boolean;
     manifestIntegrityValid?: boolean;
+    manifestStructureAndHashReferencesValid?: boolean;
     plaintextRestoreVerified?: boolean;
+    sourceSnapshotCiphertextValid?: boolean;
+    sourceSnapshotManifestValid?: boolean;
+    sourceSnapshotRestoreVerified?: boolean;
+    sourceSnapshotPlaintextSha256?: string;
+    sourceSnapshotEncryptedSha256?: string;
+    sourceSnapshotManifestPath?: string;
   };
   notionAccounts?: Array<{ id: string; name: string; type: string }>;
   notionCategories?: Array<{ id: string; name: string; group?: string }>;
@@ -381,12 +434,15 @@ export class BackfillPlanner {
     }
     const dbBuf = fs.readFileSync(this.dbPath);
     const calculatedSourceHash = crypto.createHash('sha256').update(dbBuf).digest('hex');
-    if (options.sourceSnapshotHash && options.sourceSnapshotHash !== calculatedSourceHash) {
+    const sourceSnapshotHash =
+      options.snapshotValidation?.sourceSnapshotPlaintextSha256 ||
+      calculatedSourceHash;
+
+    if (options.sourceSnapshotHash && options.sourceSnapshotHash !== sourceSnapshotHash) {
       throw new Error(
-        `FAIL_CLOSED_SOURCE_DB: Hash do banco SQLite (${calculatedSourceHash}) diverge do hash esperado (${options.sourceSnapshotHash}).`,
+        `FAIL_CLOSED_SOURCE_DB: Hash do banco SQLite (${sourceSnapshotHash}) diverge do hash esperado (${options.sourceSnapshotHash}).`,
       );
     }
-    const sourceSnapshotHash = calculatedSourceHash;
 
     // 3. Target Notion Snapshot Binding (Explicit Manifest Binding - FAIL-CLOSED)
     const targetManifestPath = options.targetSnapshotManifestPath ?? this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
@@ -550,7 +606,7 @@ export class BackfillPlanner {
         inicio: string;
         fim: string;
         fechamento: string;
-        vencimento: string;
+        vencimento: string | null;
         dataLiquidacao: string | null;
         status: string | null;
         origem: string;
@@ -603,7 +659,7 @@ export class BackfillPlanner {
       // Precedence for Due Date:
       // 1. Upstream metadata of the invoice itself
       let vencimento: string | null = null;
-      let dueDateProvenance: 'SOURCE' | 'CONFIGURED' | 'DERIVED' = 'DERIVED';
+      let dueDateProvenance: 'SOURCE' | 'CONFIGURED' | 'DERIVED' | null = null;
 
       for (const t of txsInBill) {
         const raw = JSON.parse(t.raw_json || '{}');
@@ -628,30 +684,44 @@ export class BackfillPlanner {
           }
         }
         if (accountDueDay === null) {
-          accountDueDay = effectiveConfig.defaultDueDay || 16;
-          dueDateProvenance = 'CONFIGURED';
+          if (typeof effectiveConfig.defaultDueDay === 'number') {
+            accountDueDay = effectiveConfig.defaultDueDay;
+            dueDateProvenance = 'CONFIGURED';
+          } else {
+            dueDateProvenance = null;
+          }
         }
-        const [yStr, mStr] = month.split('-');
-        let dueYear = Number(yStr);
-        let dueMonthNum = Number(mStr) + 1;
-        if (dueMonthNum > 12) {
-          dueMonthNum = 1;
-          dueYear += 1;
+
+        if (accountDueDay !== null) {
+          const [yStr, mStr] = month.split('-');
+          let dueYear = Number(yStr);
+          let dueMonthNum = Number(mStr) + 1;
+          if (dueMonthNum > 12) {
+            dueMonthNum = 1;
+            dueYear += 1;
+          }
+          const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
+          const safeDueDay = Math.min(accountDueDay, maxDayInDueMonth);
+          const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
+          const dueDayPadded = safeDueDay.toString().padStart(2, '0');
+          vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
+        } else {
+          vencimento = null;
         }
-        const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
-        const safeDueDay = Math.min(accountDueDay, maxDayInDueMonth);
-        const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
-        const dueDayPadded = safeDueDay.toString().padStart(2, '0');
-        vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
       }
 
-      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(vencimento)) {
+      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || (vencimento !== null && !isValidIsoDate(vencimento))) {
         throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para fatura upstream ${bId}`);
       }
 
-      const dueDayFormatted = vencimento.substring(8, 10);
-      const dueMonthFormatted = vencimento.substring(5, 7);
-      const title = `${nubankCartaoPage.name} - Ciclo ${month} (Venc ${dueDayFormatted}/${dueMonthFormatted})`;
+      let title: string;
+      if (vencimento !== null) {
+        const dueDayFormatted = vencimento.substring(8, 10);
+        const dueMonthFormatted = vencimento.substring(5, 7);
+        title = `${nubankCartaoPage.name} - Ciclo ${month} (Venc ${dueDayFormatted}/${dueMonthFormatted})`;
+      } else {
+        title = `${nubankCartaoPage.name} - Ciclo ${month}`;
+      }
 
       cardBillCycles[`BILL_${bId}`] = {
         title,
@@ -684,7 +754,7 @@ export class BackfillPlanner {
           dueDate: dueDateProvenance,
           settlementDate: null,
           officialAmount: null,
-          estimatedAmount: 'DERIVED',
+          estimatedAmount: null,
           purchasesTotal: 'DERIVED',
           paidAmount: 'DERIVED',
         },
@@ -724,27 +794,38 @@ export class BackfillPlanner {
         fechamento = maxDate;
       }
 
-      // Due date is the configured due day of the subsequent month
-      const [yearStr, monthStr] = month.split('-');
-      let dueYear = Number(yearStr);
-      let dueMonthNum = Number(monthStr) + 1;
-      if (dueMonthNum > 12) {
-        dueMonthNum = 1;
-        dueYear += 1;
-      }
-      const dueDay = effectiveConfig.defaultDueDay || 16;
-      const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
-      const safeDueDay = Math.min(dueDay, maxDayInDueMonth);
-      const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
-      const dueDayPadded = safeDueDay.toString().padStart(2, '0');
-      const vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
+      let vencimento: string | null = null;
+      let dueDateProvenance: 'CONFIGURED' | null = null;
+      let title: string;
 
-      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(fechamento) || !isValidIsoDate(vencimento)) {
+      if (typeof effectiveConfig.defaultDueDay === 'number') {
+        const [yearStr, monthStr] = month.split('-');
+        let dueYear = Number(yearStr);
+        let dueMonthNum = Number(monthStr) + 1;
+        if (dueMonthNum > 12) {
+          dueMonthNum = 1;
+          dueYear += 1;
+        }
+        const dueDay = effectiveConfig.defaultDueDay;
+        const maxDayInDueMonth = getLastDayOfMonth(dueYear, dueMonthNum);
+        const safeDueDay = Math.min(dueDay, maxDayInDueMonth);
+        const dueMonthPadded = dueMonthNum.toString().padStart(2, '0');
+        const dueDayPadded = safeDueDay.toString().padStart(2, '0');
+        vencimento = `${dueYear}-${dueMonthPadded}-${dueDayPadded}`;
+        dueDateProvenance = 'CONFIGURED';
+        title = `${nubankCartaoPage.name} - Ciclo ${month} Aberto (Venc ${dueDayPadded}/${dueMonthPadded})`;
+      } else {
+        vencimento = null;
+        dueDateProvenance = null;
+        title = `${nubankCartaoPage.name} - Ciclo ${month} Aberto`;
+      }
+
+      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(fechamento) || (vencimento !== null && !isValidIsoDate(vencimento))) {
         throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para ciclo de período ${month}`);
       }
 
       cardBillCycles[`PERIOD_${month}`] = {
-        title: `${nubankCartaoPage.name} - Ciclo ${month} Aberto (Venc ${dueDayPadded}/${dueMonthPadded})`,
+        title,
         stableBillId: `nubank:cartao:${month}:cycle`,
         sourceBillId: '',
         cartao: nubankCartaoPage.name,
@@ -771,17 +852,17 @@ export class BackfillPlanner {
           periodStart: 'DERIVED',
           periodEnd: 'DERIVED',
           closingDate: 'DERIVED',
-          dueDate: 'CONFIGURED',
+          dueDate: dueDateProvenance,
           settlementDate: null,
           officialAmount: null,
-          estimatedAmount: 'DERIVED',
+          estimatedAmount: null,
           purchasesTotal: 'DERIVED',
           paidAmount: 'DERIVED',
         },
       };
     }
 
-    // 9. Transaction Processing & Auditing (155 Transactions)
+    // 9. Transaction Processing & Auditing
     const operations: BackfillOperation[] = [];
     const transactionAudits: TransactionResolutionAudit[] = [];
     const incomingTransferAudits: IncomingTransferAuditItem[] = [];
@@ -789,7 +870,10 @@ export class BackfillPlanner {
     let unresolvedAccountsCount = 0;
     let unresolvedCategoryErrorsCount = 0;
     let pendingCategoryReviewCount = 0;
-    let pendingOutflowTransfersSum = 0;
+    let confirmedDirectCheckingExpenses = 0;
+    let pendingThirdPartyOutflows = 0;
+    let sameOwnershipOutgoingTransfers = 0;
+    let cardBillSettlementCashOutflows = 0;
     let allCheckingOutflowsSum = 0;
 
     for (const tx of sqliteTransactions) {
@@ -915,6 +999,9 @@ export class BackfillPlanner {
         });
       // Branch 3: Card bill payment leg
       } else if (amount < 0 && isPayment) {
+        if (!isCredit) {
+          cardBillSettlementCashOutflows += Math.abs(amount);
+        }
         economicNature = 'Pagamento de fatura';
         budgetEffect = 'Neutro';
         reviewStatus = 'Confirmado Auto';
@@ -935,6 +1022,9 @@ export class BackfillPlanner {
         }
       // Branch 4: Internal transfer same ownership outflow
       } else if (amount < 0 && isSameOwnership) {
+        if (!isCredit) {
+          sameOwnershipOutgoingTransfers += Math.abs(amount);
+        }
         economicNature = 'Transferência interna';
         budgetEffect = 'Neutro';
         reviewStatus = 'Confirmado Auto';
@@ -953,7 +1043,7 @@ export class BackfillPlanner {
           cStat.count++;
           cStat.sum += amount;
         }
-      // Branch 5: Outgoing third-party transfer pending intentional review (the 13 transfers, R$ 158,59)
+      // Branch 5: Outgoing third-party transfer pending intentional review
       } else if (
         amount < 0 &&
         !isCredit &&
@@ -969,9 +1059,12 @@ export class BackfillPlanner {
           'Transferência enviada para terceiro pendente de classificação de categoria e efeito orçamentário';
         categoryPageId = '';
         pendingCategoryReviewCount++;
-        pendingOutflowTransfersSum += Math.abs(amount);
+        pendingThirdPartyOutflows += Math.abs(amount);
       // Branch 6: Standard Expenses (Credit card purchases or Checking expenses)
       } else {
+        if (!isCredit && amount < 0) {
+          confirmedDirectCheckingExpenses += Math.abs(amount);
+        }
         if (catMapping) {
           categoryPageId = categoryIdByName.get(catMapping.canonical.toLowerCase().trim()) || '';
           if (!categoryAuditMap.has(lookupKey)) {
@@ -1295,7 +1388,8 @@ export class BackfillPlanner {
         // Generic dynamic matching across all candidate cycles based on settlement window [inicio, vencimento]
         const pDate = event.date.substring(0, 10);
         const candidateCycles = Object.values(cardBillCycles).filter((cy) => {
-          return pDate >= cy.inicio && pDate <= cy.vencimento;
+          const upperDate = cy.vencimento || cy.fechamento;
+          return pDate >= cy.inicio && pDate <= upperDate;
         });
 
         // If multiple candidate cycles match, prioritize open/period cycles because upstream bills already carry explicitBillId
@@ -1420,8 +1514,8 @@ export class BackfillPlanner {
         nCompras: cycle.purchases.length,
         somaCompras: roundedPurchases,
         valorOficial: null,
-        valorAproximado: roundedPurchases,
-        componentesAdicionais: 0,
+        valorAproximado: null,
+        componentesAdicionais: null,
         diferenca: purchasePaymentDelta,
         purchasePaymentDelta,
         officialBillDiscrepancy: null,
@@ -1441,14 +1535,14 @@ export class BackfillPlanner {
         'Início do Período': { start: cycle.inicio, end: null },
         'Fim do Período': { start: cycle.fim, end: null },
         'Data de Fechamento': { start: cycle.fechamento, end: null },
-        'Data de Vencimento': { start: cycle.vencimento, end: null },
+        'Data de Vencimento': cycle.vencimento ? { start: cycle.vencimento, end: null } : null,
         'Tipo de Ciclo': cycle.tipoCiclo,
         'Origem / Qualidade dos Dados': cycle.qualidade,
         'Status da Fatura': null,
         'Valor da Fatura Fechada (Oficial)': null,
         'Valor Estimado da Fatura Aberta': null,
         'Total de Compras no Ciclo': roundedPurchases,
-        'Componentes Adicionais da Fatura': 0,
+        'Componentes Adicionais da Fatura': null,
         'Divergência Não Explicada': null,
         'Valor Pago': roundedPaid,
         'Data de Liquidação': null,
@@ -1497,37 +1591,8 @@ export class BackfillPlanner {
       });
     }
 
-    // 12. Proposed Derived Updates (EXCLUDED FROM EXECUTABLE OPERATIONS)
-    const proposedDerivedUpdates: ProposedDerivedUpdateAudit[] = [
-      {
-        targetBase: 'NOTION_DS_ACCOUNTS',
-        pageId: nubankCartaoPage.id,
-        title: 'Nubank Cartão',
-        field: 'Limite Operacional Usado',
-        currentValue: null,
-        proposedValue: 138.65,
-        difference: '+R$ 138.65',
-        formulaSource: 'max(0, Limite Personalizado [400.00] - Limite Disponível [261.35])',
-        timestampFreshness: '2026-09-10 (Notion live)',
-        rationale:
-          'Cálculo derivado de margem de crédito operacional conforme contrato. FORA DE ESCOPO: pertence ao sync/runtime atual.',
-        status: 'OUT_OF_SCOPE_NOT_EXECUTED',
-      },
-      {
-        targetBase: 'NOTION_DS_MONTHLY_BUDGET',
-        pageId: '3d8a3ece-fa49-8186-a830-dd1b371241ac',
-        title: 'Setembro/2026',
-        field: 'Receitas Realizadas / Despesas Realizadas / Compras Realizadas Cartão',
-        currentValue: null,
-        proposedValue: 'Valores Históricos de Maio a Agosto/2026',
-        difference: 'N/A (Descompasso de competência)',
-        formulaSource: 'Agregação sum(INCOME) e sum(EXPENSE) por mês de competência',
-        timestampFreshness: 'Setembro/2026',
-        rationale:
-          'O registro existente no Notion pertence a Setembro/2026, enquanto a base histórica termina em 02/08/2026. FORA DE ESCOPO.',
-        status: 'OUT_OF_SCOPE_NOT_EXECUTED',
-      },
-    ];
+    // 12. Proposed Derived Updates (EXCLUDED FROM EXECUTABLE OPERATIONS - STRICTLY EMPTY)
+    const proposedDerivedUpdates: ProposedDerivedUpdateAudit[] = [];
 
     // 13. Category Reconciliation Summary
     const categoryReconciliations: CategoryReconciliationItem[] = [];
@@ -1560,10 +1625,7 @@ export class BackfillPlanner {
       sourceSnapshotHash,
       targetNotionSnapshotHash,
       upstreamBillEnrichmentHash: options.upstreamBillEnrichmentHash || null,
-      plannerConfigHash: crypto
-        .createHash('sha256')
-        .update(JSON.stringify(effectiveConfig))
-        .digest('hex'),
+      plannerConfigHash: calculateSemanticConfigHash(effectiveConfig),
       operations: operations.map((op) => ({
         operationType: op.operationType,
         classification: op.classification,
@@ -1638,6 +1700,7 @@ export class BackfillPlanner {
     const paymentPairingAmbiguitiesZero = pairingAmbiguities.length === 0;
     const paymentAllocationsResolved = unresolvedPaymentAllocationsCount === 0;
 
+    // Conservative import-safety check: validates cycle date structures and safe status inference when official evidence is absent.
     const billStructuralValidity =
       cardBillAudits.length > 0 &&
       cardBillAudits.every(
@@ -1645,7 +1708,7 @@ export class BackfillPlanner {
           isValidIsoDate(b.inicio) &&
           isValidIsoDate(b.fim) &&
           isValidIsoDate(b.fechamento) &&
-          isValidIsoDate(b.vencimento),
+          (b.vencimento === null || isValidIsoDate(b.vencimento)),
       );
     const billOfficialEvidenceAvailable = cardBillAudits.some((b) => b.valorOficial !== null);
     const billStatusInferenceSafe = cardBillAudits.every((b) =>
@@ -1656,35 +1719,27 @@ export class BackfillPlanner {
     // Fail-closed snapshot validation: absence of evidence evaluates strictly to false
     const ciphertextIntegrityValid = Boolean(options.snapshotValidation?.ciphertextIntegrityValid);
     const manifestIntegrityValid = Boolean(options.snapshotValidation?.manifestIntegrityValid);
+    const manifestStructureAndHashReferencesValid = manifestIntegrityValid;
     const plaintextRestoreVerified = Boolean(options.snapshotValidation?.plaintextRestoreVerified);
 
+    const sourceSnapshotCiphertextValid = Boolean(options.snapshotValidation?.sourceSnapshotCiphertextValid);
+    const sourceSnapshotManifestValid = Boolean(options.snapshotValidation?.sourceSnapshotManifestValid);
+    const sourceSnapshotRestoreVerified = Boolean(options.snapshotValidation?.sourceSnapshotRestoreVerified);
+
+    const targetSnapshotValid = Boolean(targetNotionSnapshotHash && targetNotionSnapshotHash.length === 64);
+    const sourceBackupValid = Boolean(
+      sourceSnapshotHash &&
+      sourceSnapshotHash.length === 64 &&
+      sourceSnapshotCiphertextValid &&
+      sourceSnapshotManifestValid &&
+      sourceSnapshotRestoreVerified,
+    );
+
     // Dynamic Financial Discrepancy & Cash Flow Reconciliation
-    // 1. Direct checking expenses (strictly excluding internal transfers and third-party outgoing transfers)
-    const directCheckingExpenses = sqliteTransactions
-      .filter((t) => {
-        if (t.account_type !== 'BANK' || Number(t.amount) >= 0) return false;
-        const isBillPayment =
-          t.description.toLowerCase().includes('pagamento') ||
-          (t.category_pierre && t.category_pierre.toLowerCase().includes('pagamento'));
-        const descLower = t.description.toLowerCase();
-        const pierreLower = (t.category_pierre || '').toLowerCase().trim();
-        const mappedLower = (t.category_mapped || '').toLowerCase().trim();
-        const raw = JSON.parse(t.raw_json || '{}');
-        const rawCatLower = ((raw.category as string) || '').toLowerCase().trim();
-        const isInternal =
-          pierreLower.includes('mesma titularidade') ||
-          rawCatLower.includes('mesma titularidade') ||
-          (effectiveConfig.sameOwnershipCategoryKeywords || []).some(
-            (k) => pierreLower.includes(k) || rawCatLower.includes(k),
-          );
-        const lookupKey = `${mappedLower} || ${pierreLower}`;
-        const isThirdPartyTransfer =
-          lookupKey === '(transferência) || transferências' ||
-          (mappedLower === '(transferência)' && descLower.startsWith('transferência enviada'));
-        return !isBillPayment && !isInternal && !isThirdPartyTransfer;
-      })
-      .reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
-    const roundedDirectChecking = Math.round(directCheckingExpenses * 100) / 100;
+    const roundedDirectChecking = Math.round(confirmedDirectCheckingExpenses * 100) / 100;
+    const roundedPendingOutflows = Math.round(pendingThirdPartyOutflows * 100) / 100;
+    const roundedInternalTransfers = Math.round(sameOwnershipOutgoingTransfers * 100) / 100;
+    const roundedBillSettlements = Math.round(cardBillSettlementCashOutflows * 100) / 100;
 
     const totalCardPurchases = sqliteTransactions
       .filter((t) => {
@@ -1697,16 +1752,16 @@ export class BackfillPlanner {
       .reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
     const roundedCardPurchases = Math.round(totalCardPurchases * 100) / 100;
 
-    // Confirmed Economic Expenses: R$ 1.904,12 + R$ 649,79 = R$ 2.553,91
+    // Confirmed Economic Expenses: Direct checking expenses + Credit card purchases
     const confirmedEconomicExpenses =
       options._mockExpectedEconomicExpenses !== undefined
         ? options._mockExpectedEconomicExpenses
         : Math.round((roundedDirectChecking + roundedCardPurchases) * 100) / 100;
 
-    // Pending Economic Outflows: R$ 158,59 (13 outgoing third-party transfers)
-    const pendingEconomicOutflows = Math.round(pendingOutflowTransfersSum * 100) / 100;
+    // Pending Economic Outflows: Outgoing third-party transfers pending review
+    const pendingEconomicOutflows = roundedPendingOutflows;
 
-    // Physical Cash Outflows: R$ 2.458,17 (1904.12 + 115.00 + 280.46 + 158.59)
+    // Physical Cash Outflows: Dynamic sum of all checking cash outflows
     const physicalCashOutflows = Math.round(allCheckingOutflowsSum * 100) / 100;
 
     const totalExpenseOperations = operations
@@ -1717,7 +1772,10 @@ export class BackfillPlanner {
     const classifiedEconomicReconciliationZero =
       Math.abs(confirmedEconomicExpenses - roundedExpenseOperations) < 0.001;
     const cashFlowReconciliationZero =
-      Math.abs(physicalCashOutflows - (roundedDirectChecking + 115.00 + 280.46 + pendingEconomicOutflows)) < 0.001;
+      Math.abs(
+        physicalCashOutflows -
+          (roundedDirectChecking + roundedPendingOutflows + roundedInternalTransfers + roundedBillSettlements),
+      ) < 0.001;
     const financialDiscrepancyZero =
       classifiedEconomicReconciliationZero && cashFlowReconciliationZero;
 
@@ -1737,7 +1795,7 @@ export class BackfillPlanner {
 
     const pendingEconomicClassificationCount =
       incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length +
-      pendingCategoryReviewCount; // 36 inflows + 13 outflows = 49
+      pendingCategoryReviewCount;
 
     const checks = {
       schemaConformant13Of13,
@@ -1758,11 +1816,15 @@ export class BackfillPlanner {
       classifiedEconomicReconciliationZero,
       financialDiscrepancyZero,
       identityCollisionsZero,
-      targetSnapshotValid: Boolean(targetNotionSnapshotHash && targetNotionSnapshotHash.length === 64),
-      sourceBackupValid: Boolean(sourceSnapshotHash && sourceSnapshotHash.length === 64),
+      targetSnapshotValid,
+      sourceBackupValid,
       ciphertextIntegrityValid,
       manifestIntegrityValid,
+      manifestStructureAndHashReferencesValid,
       plaintextRestoreVerified,
+      sourceSnapshotCiphertextValid,
+      sourceSnapshotManifestValid,
+      sourceSnapshotRestoreVerified,
       worktreeClean: isWorktreeClean,
       headInSyncWithRemote: isHeadInSync,
       planHashReproducible,
@@ -1823,6 +1885,15 @@ export class BackfillPlanner {
     if (!checks.plaintextRestoreVerified) {
       blockers.push('SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot para texto plano não verificada.');
     }
+    if (!checks.sourceSnapshotCiphertextValid) {
+      blockers.push('SOURCE_SNAPSHOT_CIPHERTEXT_INVALID: Falha na integridade do arquivo cifrado do snapshot SQLite de origem.');
+    }
+    if (!checks.sourceSnapshotManifestValid) {
+      blockers.push('SOURCE_SNAPSHOT_MANIFEST_INVALID: Falha na integridade do manifesto do snapshot SQLite de origem.');
+    }
+    if (!checks.sourceSnapshotRestoreVerified) {
+      blockers.push('SOURCE_SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot SQLite de origem não verificada via AES-256-GCM.');
+    }
     if (!checks.cashFlowReconciliationZero) {
       blockers.push('CASH_FLOW_DISCREPANCY: Discrepância na reconciliação de fluxo de caixa físico.');
     }
@@ -1875,6 +1946,9 @@ export class BackfillPlanner {
       explicitSnapshots: {
         sourceDbPath: this.dbPath,
         sourceDbSha256: sourceSnapshotHash,
+        sourceSnapshotManifestPath: options.snapshotValidation?.sourceSnapshotManifestPath,
+        sourceSnapshotCiphertextSha256: options.snapshotValidation?.sourceSnapshotEncryptedSha256,
+        sourceSnapshotPlaintextSha256: options.snapshotValidation?.sourceSnapshotPlaintextSha256,
         targetNotionManifestPath: targetManifestPath as string,
         targetNotionSnapshotSha256: targetNotionSnapshotHash as string,
       },
@@ -1900,6 +1974,10 @@ export class BackfillPlanner {
         confirmedEconomicExpenses,
         pendingEconomicOutflows,
         physicalCashOutflows,
+        confirmedDirectCheckingExpenses: roundedDirectChecking,
+        pendingThirdPartyOutflows: roundedPendingOutflows,
+        sameOwnershipOutgoingTransfers: roundedInternalTransfers,
+        cardBillSettlementCashOutflows: roundedBillSettlements,
         checks,
       },
       securityGates: {

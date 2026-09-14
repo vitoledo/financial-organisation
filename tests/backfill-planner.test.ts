@@ -1,13 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import Database from 'better-sqlite3';
 import {
   BackfillPlanner,
   validateOperationAgainstContract,
   isValidIsoDate,
   getLastDayOfMonth,
   generateCounterpartyPseudonym,
+  calculateSemanticConfigHash,
+  buildSemanticPlannerConfig,
 } from '../src/notion/migration-runner/backfill-planner';
 
 describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
@@ -56,6 +60,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
+    SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
     BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
     MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
     COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
@@ -173,9 +178,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(artifact.operations).toHaveLength(159);
       expect(artifact.operations.every((op) => op.operationType === 'CREATE')).toBe(true);
 
-      // Verify the 2 derived updates are recorded as OUT_OF_SCOPE_NOT_EXECUTED outside operations
-      expect(proposedDerivedUpdates).toHaveLength(2);
-      expect(proposedDerivedUpdates.every((u) => u.status === 'OUT_OF_SCOPE_NOT_EXECUTED')).toBe(true);
+      // Verify proposedDerivedUpdates is strictly empty in Phase 2A.5 clean state
+      expect(proposedDerivedUpdates).toHaveLength(0);
     });
 
     it('strongly types all relation references as EXISTING_PAGE_ID or PLANNED_STABLE_ID', () => {
@@ -254,7 +258,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const checks = artifact.readiness.checks;
-      expect(Object.keys(checks)).toHaveLength(26);
+      expect(Object.keys(checks)).toHaveLength(30);
       expect(checks).toHaveProperty('schemaConformant13Of13');
       expect(checks).toHaveProperty('missingPropertiesZero');
       expect(checks).toHaveProperty('structuralMismatchesZero');
@@ -277,7 +281,11 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(checks).toHaveProperty('sourceBackupValid');
       expect(checks).toHaveProperty('ciphertextIntegrityValid');
       expect(checks).toHaveProperty('manifestIntegrityValid');
+      expect(checks).toHaveProperty('manifestStructureAndHashReferencesValid');
       expect(checks).toHaveProperty('plaintextRestoreVerified');
+      expect(checks).toHaveProperty('sourceSnapshotCiphertextValid');
+      expect(checks).toHaveProperty('sourceSnapshotManifestValid');
+      expect(checks).toHaveProperty('sourceSnapshotRestoreVerified');
       expect(checks).toHaveProperty('worktreeClean');
       expect(checks).toHaveProperty('headInSyncWithRemote');
       expect(checks).toHaveProperty('planHashReproducible');
@@ -833,6 +841,202 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(scriptContent).not.toContain('14 bank legs');
       expect(scriptContent).not.toContain('c82e6d46-15f2-47fc-991d-abaa12f063b8');
       expect(scriptContent).not.toContain('02e273f7-840e-4b3a-b487-348f922dce70');
+    });
+
+    it('15. dynamically reconciles cash flow with arbitrary modified transaction amounts without breaking', () => {
+      // Generalization test: create temporary copy of SQLite DB with modified transaction amounts
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-gen-test-'));
+      const tempDbPath = path.join(tempDir, 'financial-gen.db');
+      try {
+        fs.copyFileSync(path.resolve(process.cwd(), 'data', 'financial.db'), tempDbPath);
+        const db = new Database(tempDbPath);
+
+        // Modify amounts of several transactions: internal transfers, settlements, direct checking expenses
+        db.prepare("UPDATE transactions SET amount = -999.99 WHERE id = 'e82b7cf5-bc8d-4fe3-9799-734d8525bf78'").run();
+        db.prepare("UPDATE transactions SET amount = -1234.56 WHERE id = '65d14dfb-9ef6-43cb-bdf2-f8eb065c71db'").run();
+        db.prepare("UPDATE transactions SET amount = -77.77 WHERE id = '3a552251-84ff-4202-b2f7-54b9d0b6c623'").run();
+        db.close();
+
+        const planner = new BackfillPlanner({ dbPath: tempDbPath, envVars: testEnv });
+        const { artifact } = planner.generateArtifact({
+          dbPath: tempDbPath,
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+        });
+
+        // The formula physicalCashOutflows == confirmedDirectCheckingExpenses + pendingThirdPartyOutflows + sameOwnershipOutgoingTransfers + cardBillSettlementCashOutflows MUST hold dynamically
+        expect(artifact.readiness.checks.cashFlowReconciliationZero).toBe(true);
+        expect(artifact.readiness.checks.classifiedEconomicReconciliationZero).toBe(true);
+        expect(artifact.readiness.checks.financialDiscrepancyZero).toBe(true);
+        expect(artifact.readiness.physicalCashOutflows).toBeGreaterThan(0);
+      } finally {
+        try {
+          if (fs.existsSync(tempDbPath)) fs.unlinkSync(tempDbPath);
+          if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup
+        }
+      }
+    });
+
+    it('16. generates identical semantic plannerConfigHash across Windows and Linux path representations', () => {
+      const baseMapping = {
+        'uuid-checking-1': 'CHECKING' as const,
+        'uuid-credit-1': 'CREDIT' as const,
+      };
+
+      const winConfig = {
+        sourceAccountMapping: baseMapping,
+        accountMappingConfigPath: 'C:\\Users\\vitol\\AppData\\Local\\financial\\account-mapping.json',
+        counterpartyHmacKey: 'windows-machine-secret-key',
+        hmacKeyVersion: 'v1',
+        defaultDueDay: 16,
+        sameOwnershipCategoryKeywords: ['mesma titularidade', 'transferência'],
+      };
+
+      const linuxConfig = {
+        sourceAccountMapping: baseMapping,
+        accountMappingConfigPath: '/home/deploy/configs/account-mapping.json',
+        counterpartyHmacKey: 'different-linux-secret-key',
+        hmacKeyVersion: 'v1',
+        defaultDueDay: 16,
+        sameOwnershipCategoryKeywords: ['mesma titularidade', 'transferência'],
+      };
+
+      const hashWin = calculateSemanticConfigHash(winConfig);
+      const hashLinux = calculateSemanticConfigHash(linuxConfig);
+
+      expect(hashWin).toBe(hashLinux);
+      expect(hashWin).toMatch(/^[a-f0-9]{64}$/);
+    });
+
+    it('17. canonicalizes key sorting so account mapping key order does not alter semantic config hash', () => {
+      const mapping1 = {
+        'b-uuid': 'CREDIT' as const,
+        'a-uuid': 'CHECKING' as const,
+      };
+      const mapping2 = {
+        'a-uuid': 'CHECKING' as const,
+        'b-uuid': 'CREDIT' as const,
+      };
+
+      const hash1 = calculateSemanticConfigHash({ sourceAccountMapping: mapping1 });
+      const hash2 = calculateSemanticConfigHash({ sourceAccountMapping: mapping2 });
+
+      expect(hash1).toBe(hash2);
+    });
+
+    it('18. leaves vencimento and fieldProvenance.dueDate as null when defaultDueDay is omitted in config and upstream', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const configWithoutDueDay = {
+        sourceAccountMapping: {
+          'c82e6d46-15f2-47fc-991d-abaa12f063b8': 'CHECKING' as const,
+          '02e273f7-840e-4b3a-b487-348f922dce70': 'CREDIT' as const,
+        },
+        defaultDueDay: undefined,
+      };
+
+      const { cardBillAudits, artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        plannerConfig: configWithoutDueDay,
+      });
+
+      // Period estimated cycles without upstream due date must have null vencimento and null dueDate provenance
+      const estimatedCycle = cardBillAudits.find((b) => b.origem === 'PERIOD_ESTIMATED');
+      expect(estimatedCycle).toBeDefined();
+      expect(estimatedCycle!.vencimento).toBeNull();
+      expect(estimatedCycle!.fieldProvenance.dueDate).toBeNull();
+
+      // Bill title must NOT invent (Venc DD/MM)
+      const billOp = artifact.operations.find(
+        (o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS' && o.stableId === estimatedCycle!.stableBillId,
+      );
+      expect(billOp?.sanitizedPayload['Fatura / Ciclo']).not.toContain('(Venc');
+    });
+
+    it('19. sets vencimento and CONFIGURED provenance when defaultDueDay is explicitly provided', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const configWithDueDay = {
+        sourceAccountMapping: {
+          'c82e6d46-15f2-47fc-991d-abaa12f063b8': 'CHECKING' as const,
+          '02e273f7-840e-4b3a-b487-348f922dce70': 'CREDIT' as const,
+        },
+        defaultDueDay: 20,
+      };
+
+      const { cardBillAudits, artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        plannerConfig: configWithDueDay,
+      });
+
+      const estimatedCycle = cardBillAudits.find((b) => b.origem === 'PERIOD_ESTIMATED');
+      expect(estimatedCycle).toBeDefined();
+      expect(estimatedCycle!.vencimento).toBe('2026-08-20');
+      expect(estimatedCycle!.fieldProvenance.dueDate).toBe('CONFIGURED');
+
+      const billOp = artifact.operations.find(
+        (o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS' && o.stableId === estimatedCycle!.stableBillId,
+      );
+      expect(billOp?.sanitizedPayload['Fatura / Ciclo']).toContain('(Venc 20/08)');
+    });
+
+    it('20. strictly sets official amount, discrepancy, and open bill estimate fields to null without official statement', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits, artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      for (const bill of cardBillAudits) {
+        expect(bill.valorOficial).toBeNull();
+        expect(bill.officialBillDiscrepancy).toBeNull();
+        expect(bill.unexplainedDiscrepancy).toBeNull();
+        expect(bill.componentesAdicionais).toBeNull();
+        expect(bill.valorAproximado).toBeNull();
+        expect(bill.fieldProvenance.estimatedAmount).toBeNull();
+      }
+
+      const billOps = artifact.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
+      for (const op of billOps) {
+        expect(op.sanitizedPayload['Valor da Fatura Fechada (Oficial)']).toBeNull();
+        expect(op.sanitizedPayload['Divergência Não Explicada']).toBeNull();
+        expect(op.sanitizedPayload['Componentes Adicionais da Fatura']).toBeNull();
+        expect(op.sanitizedPayload['Valor Estimado da Fatura Aberta']).toBeNull();
+      }
+    });
+
+    it('21. static code scanning certifies zero personal UUIDs, obsolete snapshot fallbacks, financial constants, page IDs, or names across core files', () => {
+      const filesToScan = [
+        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-planner.ts'),
+        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-dry-run.ts'),
+        path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'),
+      ];
+
+      const forbiddenPatterns: Array<{ name: string; regex: RegExp }> = [
+        { name: 'personal checking account UUID', regex: /c82e6d46-15f2-47fc-991d-abaa12f063b8/i },
+        { name: 'personal credit account UUID', regex: /02e273f7-840e-4b3a-b487-348f922dce70/i },
+        { name: 'hardcoded personal page ID', regex: /3d8a3ece-fa49-8186-a830-dd1b371241ac/i },
+        { name: 'hardcoded 280.46 in formulas/code', regex: /280\.46/ },
+        { name: 'hardcoded 115.00 in formulas/code', regex: /115\.00/ },
+        { name: 'hardcoded 2712.50 in formulas/code', regex: /2712\.50/ },
+        { name: 'hardcoded 1904.12 in formulas/code', regex: /1904\.12/ },
+        { name: 'hardcoded 158.59 in formulas/code', regex: /158\.59/ },
+        { name: 'hardcoded 1899.12 in formulas/code', regex: /1899\.12/ },
+        { name: 'hardcoded 163.59 in formulas/code', regex: /163\.59/ },
+        { name: 'hardcoded 2062.71 in formulas/code', regex: /2062\.71/ },
+        { name: 'hardcoded 649.79 in formulas/code', regex: /649\.79/ },
+        { name: 'hardcoded fallback snapshot filename', regex: /notion-data-snapshot-20260913T190702-0a3af05c\.json\.enc/ },
+      ];
+
+      for (const filePath of filesToScan) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        for (const pattern of forbiddenPatterns) {
+          const match = content.match(pattern.regex);
+          expect(match, `Found ${pattern.name} in ${path.basename(filePath)}`).toBeNull();
+        }
+      }
     });
   });
 });

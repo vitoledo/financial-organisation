@@ -6,7 +6,7 @@ dotenv.config();
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════════════════════════');
-  console.log('  FASE 2A.4: CORREÇÃO FINAL DE READINESS, PRIVACIDADE E PENDÊNCIAS ECONÔMICAS');
+  console.log('  FASE 2A.5: SEAL FINAL E PORTABILIDADE DO BACKFILL PLAN');
   console.log('             (MODO ESTRITAMENTE READ-ONLY — ZERO ESCRITAS NO NOTION)');
   console.log('═══════════════════════════════════════════════════════════════════════════════\n');
 
@@ -255,7 +255,11 @@ async function main() {
   console.log(`  • Versão do Plano: ${p.version} (mapping: ${p.mappingVersion})`);
   console.log(`  • Commit SHA de Referência: ${p.commitSha}`);
   console.log(`  • Source DB Path: ${p.explicitSnapshots.sourceDbPath}`);
-  console.log(`  • Source DB SHA-256: ${p.explicitSnapshots.sourceDbSha256}`);
+  console.log(`  • Source DB SHA-256 (Plaintext): ${p.explicitSnapshots.sourceDbSha256}`);
+  if (p.explicitSnapshots.sourceSnapshotManifestPath) {
+    console.log(`  • Source Snapshot Manifest: ${p.explicitSnapshots.sourceSnapshotManifestPath}`);
+    console.log(`  • Source Snapshot Ciphertext SHA-256: ${p.explicitSnapshots.sourceSnapshotCiphertextSha256}`);
+  }
   console.log(`  • Target Notion Manifest: ${p.explicitSnapshots.targetNotionManifestPath}`);
   console.log(`  • Target Notion Snapshot SHA-256: ${p.explicitSnapshots.targetNotionSnapshotSha256}`);
   console.log(`  • Deterministic BackfillPlanHash: ${p.backfillPlanHash}`);

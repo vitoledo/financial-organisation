@@ -7,6 +7,7 @@ import { Client } from '@notionhq/client';
 import { BackfillPlanner, resolvePlannerConfig } from './backfill-planner';
 import { NotionSchemaValidator } from '../schema-validator';
 import { NotionLiveDataSnapshotManager } from './data-snapshot';
+import { FinancialBackupManager } from './backup';
 import {
   BackfillPlanArtifact,
   TransactionResolutionAudit,
@@ -39,6 +40,7 @@ export interface BackfillDryRunAnalyzerOptions {
   apiKey?: string;
   envVars?: Record<string, string | undefined>;
   targetSnapshotManifestPath?: string;
+  sourceSnapshotManifestPath?: string;
   targetNotionSnapshotHash?: string;
   commitSha?: string;
   schemaEvidence?: BackfillSchemaConformanceEvidence;
@@ -152,6 +154,7 @@ export class BackfillDryRunAnalyzer {
   public verifySnapshotReadiness(): {
     ciphertextIntegrityValid: boolean;
     manifestIntegrityValid: boolean;
+    manifestStructureAndHashReferencesValid: boolean;
     plaintextRestoreVerified: boolean;
   } {
     let ciphertextIntegrityValid = false;
@@ -161,10 +164,16 @@ export class BackfillDryRunAnalyzer {
     try {
       const manifestPath =
         this.options.targetSnapshotManifestPath ??
-        path.resolve(process.cwd(), 'backups', 'notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json');
+        this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
+        process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
 
-      if (!fs.existsSync(manifestPath)) {
-        return { ciphertextIntegrityValid: false, manifestIntegrityValid: false, plaintextRestoreVerified: false };
+      if (!manifestPath || !fs.existsSync(manifestPath)) {
+        return {
+          ciphertextIntegrityValid: false,
+          manifestIntegrityValid: false,
+          manifestStructureAndHashReferencesValid: false,
+          plaintextRestoreVerified: false,
+        };
       }
 
       const manifestContent = fs.readFileSync(manifestPath, 'utf8');
@@ -183,7 +192,12 @@ export class BackfillDryRunAnalyzer {
 
       const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
       if (!fs.existsSync(encryptedFilePath)) {
-        return { ciphertextIntegrityValid: false, manifestIntegrityValid, plaintextRestoreVerified: false };
+        return {
+          ciphertextIntegrityValid: false,
+          manifestIntegrityValid,
+          manifestStructureAndHashReferencesValid: manifestIntegrityValid,
+          plaintextRestoreVerified: false,
+        };
       }
 
       const encryptedBuffer = fs.readFileSync(encryptedFilePath);
@@ -251,13 +265,161 @@ export class BackfillDryRunAnalyzer {
         }
       }
     } catch {
-      return { ciphertextIntegrityValid: false, manifestIntegrityValid: false, plaintextRestoreVerified: false };
+      return {
+        ciphertextIntegrityValid: false,
+        manifestIntegrityValid: false,
+        manifestStructureAndHashReferencesValid: false,
+        plaintextRestoreVerified: false,
+      };
     }
 
     return {
       ciphertextIntegrityValid,
       manifestIntegrityValid,
+      manifestStructureAndHashReferencesValid: manifestIntegrityValid,
       plaintextRestoreVerified,
+    };
+  }
+
+  public verifySourceSnapshotReadiness(): {
+    sourceSnapshotCiphertextValid: boolean;
+    sourceSnapshotManifestValid: boolean;
+    sourceSnapshotRestoreVerified: boolean;
+    manifestPath: string;
+    sourceSnapshotPlaintextSha256?: string;
+    sourceSnapshotEncryptedSha256?: string;
+  } {
+    let sourceSnapshotCiphertextValid = false;
+    let sourceSnapshotManifestValid = false;
+    let sourceSnapshotRestoreVerified = false;
+    let sourceSnapshotPlaintextSha256: string | undefined = undefined;
+    let sourceSnapshotEncryptedSha256: string | undefined = undefined;
+
+    const manifestPath =
+      this.options.sourceSnapshotManifestPath ??
+      this.envVars.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
+      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim();
+
+    if (!manifestPath || !fs.existsSync(manifestPath)) {
+      return {
+        sourceSnapshotCiphertextValid: false,
+        sourceSnapshotManifestValid: false,
+        sourceSnapshotRestoreVerified: false,
+        manifestPath: manifestPath || '',
+      };
+    }
+
+    try {
+      const manifestContent = fs.readFileSync(manifestPath, 'utf8');
+      const manifest = JSON.parse(manifestContent);
+
+      if (
+        manifest.format !== 'FIN_ENC_V1' ||
+        !manifest.encryptedFileSha256 ||
+        !manifest.originalDbSha256 ||
+        !manifest.backupFileName
+      ) {
+        sourceSnapshotManifestValid = false;
+      } else {
+        sourceSnapshotManifestValid = true;
+        sourceSnapshotPlaintextSha256 = manifest.originalDbSha256;
+        sourceSnapshotEncryptedSha256 = manifest.encryptedFileSha256;
+      }
+
+      const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
+      if (!fs.existsSync(encryptedFilePath)) {
+        return {
+          sourceSnapshotCiphertextValid: false,
+          sourceSnapshotManifestValid,
+          sourceSnapshotRestoreVerified: false,
+          manifestPath,
+          sourceSnapshotPlaintextSha256,
+          sourceSnapshotEncryptedSha256,
+        };
+      }
+
+      const encryptedBuffer = fs.readFileSync(encryptedFilePath);
+      const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
+      if (actualEncSha256 === manifest.encryptedFileSha256) {
+        sourceSnapshotCiphertextValid = true;
+      }
+
+      const rawKey =
+        this.envVars.MIGRATION_BACKUP_KEY ||
+        process.env.MIGRATION_BACKUP_KEY ||
+        this.envVars.AUDIT_ENCRYPTION_KEY ||
+        process.env.AUDIT_ENCRYPTION_KEY;
+
+      if (sourceSnapshotCiphertextValid && sourceSnapshotManifestValid && rawKey) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-sqlite-dryrun-'));
+        const tempPlaintextFile = path.join(tempDir, 'restored-snapshot.db');
+        let tempDb: Database.Database | null = null;
+        try {
+          const backupMgr = new FinancialBackupManager({ dbPath: this.dbPath, key: rawKey });
+          let keyBuffer: Buffer;
+          if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+            keyBuffer = Buffer.from(rawKey, 'hex');
+          } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
+            keyBuffer = Buffer.from(rawKey, 'base64');
+          } else {
+            throw new Error('Invalid key format');
+          }
+
+          const decryptedBuffer = backupMgr.decryptBackupBuffer(encryptedBuffer, keyBuffer);
+          fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
+
+          const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
+          if (actualPlaintextSha === manifest.originalDbSha256) {
+            tempDb = new Database(tempPlaintextFile, { readonly: true });
+            const pragmaRes = tempDb.pragma('integrity_check') as any[];
+            const integrityOk =
+              pragmaRes &&
+              pragmaRes.length > 0 &&
+              (pragmaRes[0].integrity_check === 'ok' || Object.values(pragmaRes[0])[0] === 'ok');
+
+            const txCountRes = tempDb.prepare('SELECT count(*) as count FROM transactions').get() as any;
+            if (integrityOk && txCountRes && txCountRes.count > 0) {
+              sourceSnapshotRestoreVerified = true;
+            }
+          }
+        } catch {
+          sourceSnapshotRestoreVerified = false;
+        } finally {
+          if (tempDb) {
+            try {
+              tempDb.close();
+            } catch {
+              // ignore
+            }
+          }
+          try {
+            if (fs.existsSync(tempPlaintextFile)) {
+              fs.unlinkSync(tempPlaintextFile);
+            }
+            if (fs.existsSync(tempDir)) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } catch {
+      return {
+        sourceSnapshotCiphertextValid: false,
+        sourceSnapshotManifestValid: false,
+        sourceSnapshotRestoreVerified: false,
+        manifestPath,
+      };
+    }
+
+    return {
+      sourceSnapshotCiphertextValid,
+      sourceSnapshotManifestValid,
+      sourceSnapshotRestoreVerified,
+      manifestPath,
+      sourceSnapshotPlaintextSha256,
+      sourceSnapshotEncryptedSha256,
     };
   }
 
@@ -341,7 +503,53 @@ export class BackfillDryRunAnalyzer {
     }
 
     // 3.5. Verify Snapshot Readiness (Fail-Closed, Real Decryption to Isolated Temp)
-    const snapshotValidation = this.verifySnapshotReadiness();
+    const targetManifestPath =
+      this.options.targetSnapshotManifestPath ??
+      this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
+      process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
+
+    if (!targetManifestPath) {
+      throw new Error(
+        'FAIL_CLOSED_TARGET_SNAPSHOT: Caminho do manifesto do snapshot alvo não informado nem configurado em NOTION_TARGET_SNAPSHOT_MANIFEST.',
+      );
+    }
+    if (!fs.existsSync(targetManifestPath)) {
+      throw new Error(
+        `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${targetManifestPath}'.`,
+      );
+    }
+
+    const sourceManifestPath =
+      this.options.sourceSnapshotManifestPath ??
+      this.envVars.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
+      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim();
+
+    if (!sourceManifestPath) {
+      throw new Error(
+        'FAIL_CLOSED_SOURCE_SNAPSHOT: Caminho do manifesto do snapshot SQLite de origem não informado nem configurado em SOURCE_SQLITE_SNAPSHOT_MANIFEST.',
+      );
+    }
+    if (!fs.existsSync(sourceManifestPath)) {
+      throw new Error(
+        `FAIL_CLOSED_SOURCE_SNAPSHOT: Manifesto do snapshot SQLite de origem não encontrado em '${sourceManifestPath}'.`,
+      );
+    }
+
+    const targetSnapshotValidation = this.verifySnapshotReadiness();
+    const sourceSnapshotValidation = this.verifySourceSnapshotReadiness();
+
+    const snapshotValidation = {
+      ciphertextIntegrityValid: targetSnapshotValidation.ciphertextIntegrityValid,
+      manifestIntegrityValid: targetSnapshotValidation.manifestIntegrityValid,
+      manifestStructureAndHashReferencesValid: targetSnapshotValidation.manifestStructureAndHashReferencesValid,
+      plaintextRestoreVerified: targetSnapshotValidation.plaintextRestoreVerified,
+      sourceSnapshotCiphertextValid: sourceSnapshotValidation.sourceSnapshotCiphertextValid,
+      sourceSnapshotManifestValid: sourceSnapshotValidation.sourceSnapshotManifestValid,
+      sourceSnapshotRestoreVerified: sourceSnapshotValidation.sourceSnapshotRestoreVerified,
+      sourceSnapshotPlaintextSha256: sourceSnapshotValidation.sourceSnapshotPlaintextSha256,
+      sourceSnapshotEncryptedSha256: sourceSnapshotValidation.sourceSnapshotEncryptedSha256,
+      sourceSnapshotManifestPath: sourceManifestPath,
+    };
 
     // 3.6. Resolve Planner Config (External config required, zero silent defaults)
     let plannerConfig = this.options.plannerConfig;
@@ -372,7 +580,7 @@ export class BackfillDryRunAnalyzer {
       dbPath: this.dbPath,
       envVars: this.envVars,
       commitSha: this.options.commitSha,
-      targetSnapshotManifestPath: this.options.targetSnapshotManifestPath,
+      targetSnapshotManifestPath: targetManifestPath,
       targetNotionSnapshotHash: this.options.targetNotionSnapshotHash,
       plannerConfig,
       snapshotValidation,
@@ -497,9 +705,9 @@ export class BackfillDryRunAnalyzer {
     const totalPurchasesAmount = cardPurchases.reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
     const totalPaymentsAmount = cardPayments.reduce((acc, t) => acc + Math.abs(Number(t.amount)), 0);
 
-    // 5.3. Economic Consumption: Direct Checking Expenses (2062.71) + Card Purchases (649.79) = R$ 2.712,50
+    // 5.3. Economic Consumption: Direct Checking Expenses + Card Purchases
     const totalEconomicExpenses = directCheckingExpenses + totalPurchasesAmount;
-    const confirmedEconomicIncome = 0; // The 36 third-party inflows are pending classification
+    const confirmedEconomicIncome = 0; // Third-party inflows are pending classification
 
     // 6. Identity Strategy Check
     const countWithSourceId = sqliteTransactions.length;
@@ -529,8 +737,8 @@ export class BackfillDryRunAnalyzer {
       rowsUnchanged: 0,
       relationsToPopulate: {
         Conta: sqliteTransactions.length,
-        Categoria: sqliteTransactions.length - incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length, // 119
-        'Fatura Vinculada': cardPurchases.length, // strictly 20 purchases!
+        Categoria: sqliteTransactions.length - incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length,
+        'Fatura Vinculada': cardPurchases.length,
       },
       duplicatesDetected: 0,
       ambiguousItems: [],
@@ -545,8 +753,8 @@ export class BackfillDryRunAnalyzer {
       rowsUnchanged: 0,
       relationsToPopulate: {
         'Cartão Vinculado': cardBillAudits.length,
-        'Lançamentos do Ciclo': cardPurchases.length, // strictly 20 purchases!
-        'Transações de Pagamento': paymentEventAllocations.filter((a) => a.method !== 'UNRESOLVED_PAYMENT_ALLOCATION').length, // 15
+        'Lançamentos do Ciclo': cardPurchases.length,
+        'Transações de Pagamento': paymentEventAllocations.filter((a) => a.method !== 'UNRESOLVED_PAYMENT_ALLOCATION').length,
       },
       duplicatesDetected: 0,
       ambiguousItems: [],
