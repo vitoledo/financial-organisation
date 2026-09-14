@@ -1,8 +1,12 @@
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
-import { BackfillPlanner } from './backfill-planner';
+import { BackfillPlanner, resolvePlannerConfig } from './backfill-planner';
 import { NotionSchemaValidator } from '../schema-validator';
+import { NotionLiveDataSnapshotManager } from './data-snapshot';
 import {
   BackfillPlanArtifact,
   TransactionResolutionAudit,
@@ -13,6 +17,7 @@ import {
   IncomingTransferAuditItem,
   PaymentEventAllocation,
   BackfillSchemaConformanceEvidence,
+  BackfillPlannerConfig,
 } from './types';
 
 export interface BackfillBaseAnalysis {
@@ -37,6 +42,8 @@ export interface BackfillDryRunAnalyzerOptions {
   targetNotionSnapshotHash?: string;
   commitSha?: string;
   schemaEvidence?: BackfillSchemaConformanceEvidence;
+  plannerConfig?: BackfillPlannerConfig;
+  accountMappingPath?: string;
 }
 
 export interface BackfillDryRunReport {
@@ -65,6 +72,7 @@ export interface BackfillDryRunReport {
       directOutflows: number;
       outgoingInternalTransfers: number;
       cardBillSettlementOutflows: number;
+      pendingOutflows?: number;
       totalOutflows: number;
       netCashFlow: number;
     };
@@ -78,6 +86,9 @@ export interface BackfillDryRunReport {
       directCheckingExpenses: number;
       cardPurchases: number;
       totalEconomicExpenses: number;
+      confirmedEconomicExpenses?: number;
+      pendingEconomicOutflows?: number;
+      physicalCashOutflows?: number;
       economicIncome: number;
       pendingThirdPartyInflows: number;
       neutralSettlements: number;
@@ -136,6 +147,118 @@ export class BackfillDryRunAnalyzer {
         auth: apiKey,
         notionVersion: '2026-03-11',
       });
+  }
+
+  public verifySnapshotReadiness(): {
+    ciphertextIntegrityValid: boolean;
+    manifestIntegrityValid: boolean;
+    plaintextRestoreVerified: boolean;
+  } {
+    let ciphertextIntegrityValid = false;
+    let manifestIntegrityValid = false;
+    let plaintextRestoreVerified = false;
+
+    try {
+      const manifestPath =
+        this.options.targetSnapshotManifestPath ??
+        path.resolve(process.cwd(), 'backups', 'notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json');
+
+      if (!fs.existsSync(manifestPath)) {
+        return { ciphertextIntegrityValid: false, manifestIntegrityValid: false, plaintextRestoreVerified: false };
+      }
+
+      const manifestContent = fs.readFileSync(manifestPath, 'utf8');
+      const manifest = JSON.parse(manifestContent);
+
+      if (
+        !manifest.encryptedFileSha256 ||
+        !manifest.originalJsonSha256 ||
+        !manifest.backupFileName ||
+        manifest.totalBases !== 13
+      ) {
+        manifestIntegrityValid = false;
+      } else {
+        manifestIntegrityValid = true;
+      }
+
+      const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
+      if (!fs.existsSync(encryptedFilePath)) {
+        return { ciphertextIntegrityValid: false, manifestIntegrityValid, plaintextRestoreVerified: false };
+      }
+
+      const encryptedBuffer = fs.readFileSync(encryptedFilePath);
+      const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
+      if (actualEncSha256 === manifest.encryptedFileSha256) {
+        ciphertextIntegrityValid = true;
+      }
+
+      const rawKey =
+        this.envVars.AUDIT_ENCRYPTION_KEY ||
+        this.envVars.MIGRATION_BACKUP_KEY ||
+        process.env.AUDIT_ENCRYPTION_KEY ||
+        process.env.MIGRATION_BACKUP_KEY;
+
+      if (ciphertextIntegrityValid && manifestIntegrityValid && rawKey) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-snapshot-dryrun-'));
+        const tempPlaintextFile = path.join(tempDir, 'restored-snapshot.json');
+        try {
+          const snapshotManager = new NotionLiveDataSnapshotManager({
+            backupKey: rawKey,
+            apiKey: this.options.apiKey || this.envVars.NOTION_API_KEY || 'dry-run-key',
+          });
+          let keyBuffer: Buffer;
+          if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+            keyBuffer = Buffer.from(rawKey, 'hex');
+          } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
+            keyBuffer = Buffer.from(rawKey, 'base64');
+          } else {
+            keyBuffer = crypto.createHash('sha256').update(rawKey).digest();
+          }
+          const magicHeader = Buffer.from('FIN_ENC_V1', 'utf8');
+          const iv = encryptedBuffer.subarray(magicHeader.length, magicHeader.length + 12);
+          const authTag = encryptedBuffer.subarray(magicHeader.length + 12, magicHeader.length + 12 + 16);
+          const ciphertext = encryptedBuffer.subarray(magicHeader.length + 12 + 16);
+
+          const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+          decipher.setAuthTag(authTag);
+          const decryptedBuffer = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+          fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
+
+          const actualJsonSha256 = crypto.createHash('sha256').update(fs.readFileSync(tempPlaintextFile)).digest('hex');
+          const parsedRestored = JSON.parse(decryptedBuffer.toString('utf8'));
+
+          if (
+            actualJsonSha256 === manifest.originalJsonSha256 &&
+            parsedRestored.totalBases === 13 &&
+            parsedRestored.snapshotType === 'NOTION_LIVE_DATA_SNAPSHOT'
+          ) {
+            plaintextRestoreVerified = true;
+          }
+        } catch {
+          plaintextRestoreVerified = false;
+        } finally {
+          try {
+            if (fs.existsSync(tempPlaintextFile)) {
+              fs.unlinkSync(tempPlaintextFile);
+            }
+            if (fs.existsSync(tempDir)) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+          } catch {
+            // cleanup error ignored
+          }
+        }
+      }
+    } catch {
+      return { ciphertextIntegrityValid: false, manifestIntegrityValid: false, plaintextRestoreVerified: false };
+    }
+
+    return {
+      ciphertextIntegrityValid,
+      manifestIntegrityValid,
+      plaintextRestoreVerified,
+    };
   }
 
   public async runAnalysis(): Promise<BackfillDryRunReport> {
@@ -217,6 +340,23 @@ export class BackfillDryRunAnalyzer {
       }
     }
 
+    // 3.5. Verify Snapshot Readiness (Fail-Closed, Real Decryption to Isolated Temp)
+    const snapshotValidation = this.verifySnapshotReadiness();
+
+    // 3.6. Resolve Planner Config (External config required, zero silent defaults)
+    let plannerConfig = this.options.plannerConfig;
+    if (!plannerConfig) {
+      try {
+        const resolved = resolvePlannerConfig(
+          undefined,
+          this.envVars,
+        );
+        plannerConfig = resolved.effectiveConfig;
+      } catch {
+        // Will fail-closed inside planner if needed
+      }
+    }
+
     // 4. Generate deterministic BackfillPlanArtifact and audits
     const planner = new BackfillPlanner({ dbPath: this.dbPath, envVars: this.envVars });
     const {
@@ -234,6 +374,8 @@ export class BackfillDryRunAnalyzer {
       commitSha: this.options.commitSha,
       targetSnapshotManifestPath: this.options.targetSnapshotManifestPath,
       targetNotionSnapshotHash: this.options.targetNotionSnapshotHash,
+      plannerConfig,
+      snapshotValidation,
       notionAccounts,
       notionCategories,
       schemaEvidence,
@@ -256,6 +398,7 @@ export class BackfillDryRunAnalyzer {
     let directCheckingExpenses = 0;
     let outgoingInternalTransfers = 0;
     let cardBillSettlementOutflows = 0;
+    let pendingOutflows = 0;
     const bankPaymentTxs = checkingTxs.filter(
       (tx) =>
         Number(tx.amount) < 0 &&
@@ -271,9 +414,10 @@ export class BackfillDryRunAnalyzer {
 
       const amt = Number(tx.amount);
       const descLower = tx.description?.toLowerCase() || '';
-      const pierreLower = tx.category_pierre?.toLowerCase() || '';
+      const pierreLower = (tx.category_pierre || '').toLowerCase().trim();
+      const mappedLower = (tx.category_mapped || '').toLowerCase().trim();
       const raw = JSON.parse(tx.raw_json || '{}');
-      const rawCatLower = ((raw.category as string) || '').toLowerCase();
+      const rawCatLower = ((raw.category as string) || '').toLowerCase().trim();
       const isSame =
         pierreLower.includes('mesma titularidade') ||
         rawCatLower.includes('mesma titularidade');
@@ -286,11 +430,17 @@ export class BackfillDryRunAnalyzer {
         const isBillPayment =
           descLower.includes('pagamento') ||
           pierreLower.includes('pagamento');
+        const lookupKey = `${mappedLower} || ${pierreLower}`;
+        const isThirdPartyTransfer =
+          lookupKey === '(transferência) || transferências' ||
+          (mappedLower === '(transferência)' && descLower.startsWith('transferência enviada'));
 
         if (isBillPayment) {
           cardBillSettlementOutflows += Math.abs(amt);
         } else if (isSame) {
           outgoingInternalTransfers += Math.abs(amt);
+        } else if (isThirdPartyTransfer) {
+          pendingOutflows += Math.abs(amt);
         } else {
           directCheckingExpenses += Math.abs(amt);
         }
@@ -309,7 +459,7 @@ export class BackfillDryRunAnalyzer {
       byBudgetEffect[effect].sum += Math.abs(amt);
     }
 
-    const totalCheckingOutflows = directCheckingExpenses + outgoingInternalTransfers + cardBillSettlementOutflows;
+    const totalCheckingOutflows = directCheckingExpenses + outgoingInternalTransfers + cardBillSettlementOutflows + pendingOutflows;
     const netCheckingCashFlow = checkingInflows - totalCheckingOutflows;
 
     // 5.2. Card Liability
@@ -454,6 +604,7 @@ export class BackfillDryRunAnalyzer {
           directOutflows: Math.round(directCheckingExpenses * 100) / 100,
           outgoingInternalTransfers: Math.round(outgoingInternalTransfers * 100) / 100,
           cardBillSettlementOutflows: Math.round(cardBillSettlementOutflows * 100) / 100,
+          pendingOutflows: Math.round(pendingOutflows * 100) / 100,
           totalOutflows: Math.round(totalCheckingOutflows * 100) / 100,
           netCashFlow: Math.round(netCheckingCashFlow * 100) / 100,
         },
@@ -467,6 +618,9 @@ export class BackfillDryRunAnalyzer {
           directCheckingExpenses: Math.round(directCheckingExpenses * 100) / 100,
           cardPurchases: Math.round(totalPurchasesAmount * 100) / 100,
           totalEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
+          confirmedEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
+          pendingEconomicOutflows: Math.round(pendingOutflows * 100) / 100,
+          physicalCashOutflows: Math.round(totalCheckingOutflows * 100) / 100,
           economicIncome: confirmedEconomicIncome,
           pendingThirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
           neutralSettlements: Math.round(cardBillSettlementOutflows * 100) / 100,
@@ -475,8 +629,8 @@ export class BackfillDryRunAnalyzer {
         paymentAuditSummary: {
           totalPaymentOccurrences: bankPaymentTxs.length + cardPayments.length,
           bankCashLegs: bankPaymentTxs.length,
-          cardLiabilityLegs: 15,
-          unpairedPayments: 11,
+          cardLiabilityLegs: paymentLegAudits.filter((l) => l.role === 'CARD_LIABILITY_LEG').length,
+          unpairedPayments: paymentLegAudits.filter((l) => l.role === 'UNPAIRED_PAYMENT').length,
           totalBankCashPaid: Math.round(cardBillSettlementOutflows * 100) / 100,
         },
         inflowsAuditSummary: {

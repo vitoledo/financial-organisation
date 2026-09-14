@@ -47,6 +47,9 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
+    BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
+    MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
+    COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   };
 
   it('resolves 155/155 transactions deterministically via SOURCE_ACCOUNT_ID with 0 UNRESOLVED', async () => {
@@ -185,7 +188,9 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
 
     expect(report.planArtifact.readiness.readyForExecutorImplementation).toBe(false);
     expect(report.planArtifact.readiness.readyForApply).toBe(false);
-    expect(report.planArtifact.readiness.pendingEconomicClassificationCount).toBe(36);
+    expect(report.planArtifact.readiness.pendingEconomicClassificationCount).toBe(49);
+    expect(report.planArtifact.readiness.pendingCategoryReviewCount).toBe(13);
+    expect(report.planArtifact.readiness.checks.unresolvedCategoryErrorsZero).toBe(true);
     expect(report.planArtifact.readiness.blockers.length).toBeGreaterThan(0);
   });
 
@@ -199,7 +204,8 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     const r = report.reconciliation;
 
     // Physical checking cash flow
-    expect(r.checkingCashFlow.directOutflows).toBe(2062.71);
+    expect(r.checkingCashFlow.directOutflows).toBe(1899.12);
+    expect(r.checkingCashFlow.pendingOutflows).toBe(163.59);
     expect(r.checkingCashFlow.outgoingInternalTransfers).toBe(115.0);
     expect(r.checkingCashFlow.cardBillSettlementOutflows).toBe(280.46);
     expect(r.checkingCashFlow.totalOutflows).toBe(2458.17);
@@ -208,10 +214,13 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     expect(r.cardLiability.totalPurchases).toBe(649.79);
     expect(r.cardLiability.purchasesCount).toBe(20);
 
-    // Decoupled economic consumption: Direct checking (2062.71) + Card purchases (649.79) = R$ 2.712,50
-    expect(r.economicConsumption.directCheckingExpenses).toBe(2062.71);
+    // Decoupled economic consumption: Direct checking (1899.12) + Card purchases (649.79) = R$ 2.548,91
+    expect(r.economicConsumption.directCheckingExpenses).toBe(1899.12);
     expect(r.economicConsumption.cardPurchases).toBe(649.79);
-    expect(r.economicConsumption.totalEconomicExpenses).toBe(2712.5);
+    expect(r.economicConsumption.totalEconomicExpenses).toBe(2548.91);
+    expect(r.economicConsumption.confirmedEconomicExpenses).toBe(2548.91);
+    expect(r.economicConsumption.pendingEconomicOutflows).toBe(163.59);
+    expect(r.economicConsumption.physicalCashOutflows).toBe(2458.17);
     expect(r.economicConsumption.pendingThirdPartyInflows).toBe(2294.39);
     expect(r.discrepancy).toBe(0);
 

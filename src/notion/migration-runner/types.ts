@@ -160,11 +160,16 @@ export interface CardBillFieldProvenance {
   identityQuality: 'SOURCE' | 'CONFIGURED';
   cycleType: 'SOURCE' | 'CONFIGURED';
   valueQuality: 'DERIVED' | 'CONFIGURED';
-  status: 'DERIVED' | 'CONFIGURED';
-  dates: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
+  status: 'DERIVED' | 'SOURCE' | 'CONFIGURED' | null;
+  periodStart: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
+  periodEnd: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
+  closingDate: 'SOURCE' | 'DERIVED' | 'CONFIGURED';
+  dueDate: 'SOURCE' | 'CONFIGURED' | 'DERIVED';
+  settlementDate: 'DERIVED' | 'CONFIGURED' | null;
+  officialAmount: 'SOURCE' | 'DERIVED' | null;
+  estimatedAmount: 'DERIVED';
   purchasesTotal: 'DERIVED';
   paidAmount: 'DERIVED' | 'CONFIGURED';
-  settlementDate: 'DERIVED' | 'CONFIGURED';
 }
 
 export type BackfillOperationType = 'CREATE' | 'UPDATE';
@@ -198,7 +203,7 @@ export interface CardBillAuditItem {
   fechamento: string;
   vencimento: string;
   dataLiquidacao: string | null;
-  status: string;
+  status: string | null;
   origem: string;
   qualidade: string;
   tipoCiclo: string;
@@ -210,7 +215,7 @@ export interface CardBillAuditItem {
   diferenca: number;
   purchasePaymentDelta: number;
   officialBillDiscrepancy: number | null;
-  unexplainedDiscrepancy: number;
+  unexplainedDiscrepancy: number | null;
   paidAmount: number;
   fieldProvenance: CardBillFieldProvenance;
 }
@@ -277,17 +282,27 @@ export interface BackfillPlanArtifact {
     readyForApply: boolean;
     blockers: string[];
     pendingEconomicClassificationCount: number;
+    pendingCategoryReviewCount: number;
+    confirmedEconomicExpenses: number;
+    pendingEconomicOutflows: number;
+    physicalCashOutflows: number;
     checks: {
       schemaConformant13Of13: boolean;
       missingPropertiesZero: boolean;
       structuralMismatchesZero: boolean;
       duplicatesZero: boolean;
       unresolvedAccountsZero: boolean;
+      unresolvedCategoryErrorsZero: boolean;
       unresolvedCategoriesZero: boolean;
       unresolvedPaymentAllocationsZero: boolean;
       paymentPairingAmbiguitiesZero: boolean;
       paymentAllocationsResolved: boolean;
+      billStructuralValidity: boolean;
+      billOfficialEvidenceAvailable: boolean;
+      billStatusInferenceSafe: boolean;
       billReconciliationEvidenceSufficient: boolean;
+      cashFlowReconciliationZero: boolean;
+      classifiedEconomicReconciliationZero: boolean;
       financialDiscrepancyZero: boolean;
       identityCollisionsZero: boolean;
       targetSnapshotValid: boolean;
@@ -312,6 +327,10 @@ export interface BackfillPlannerConfig {
   sourceAccountMapping: Record<string, 'CHECKING' | 'CREDIT'>;
   sameOwnershipCategoryKeywords?: string[];
   defaultDueDay?: number;
+  accountMappingConfigPath?: string;
+  accountMappingConfigHash?: string;
+  counterpartyHmacKey?: string;
+  hmacKeyVersion?: string;
 }
 
 export interface InputFingerprint {

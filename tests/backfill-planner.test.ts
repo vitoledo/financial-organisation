@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
 import {
   BackfillPlanner,
   validateOperationAgainstContract,
   isValidIsoDate,
   getLastDayOfMonth,
+  generateCounterpartyPseudonym,
 } from '../src/notion/migration-runner/backfill-planner';
 
 describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
@@ -52,6 +56,9 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     NOTION_DS_CARD_BILLS: 'fake-bills-ds',
     NOTION_DS_MONTHLY_BUDGET: 'fake-budget-ds',
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
+    BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
+    MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
+    COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   };
 
   describe('validateOperationAgainstContract', () => {
@@ -239,7 +246,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(totalCycleTransactions).toBe(20);
     });
 
-    it('includes all 20 dynamic readiness checks in BackfillPlanArtifact', () => {
+    it('includes all 26 dynamic readiness checks in BackfillPlanArtifact', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -247,17 +254,23 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const checks = artifact.readiness.checks;
-      expect(Object.keys(checks)).toHaveLength(20);
+      expect(Object.keys(checks)).toHaveLength(26);
       expect(checks).toHaveProperty('schemaConformant13Of13');
       expect(checks).toHaveProperty('missingPropertiesZero');
       expect(checks).toHaveProperty('structuralMismatchesZero');
       expect(checks).toHaveProperty('duplicatesZero');
       expect(checks).toHaveProperty('unresolvedAccountsZero');
+      expect(checks).toHaveProperty('unresolvedCategoryErrorsZero');
       expect(checks).toHaveProperty('unresolvedCategoriesZero');
       expect(checks).toHaveProperty('unresolvedPaymentAllocationsZero');
       expect(checks).toHaveProperty('paymentPairingAmbiguitiesZero');
       expect(checks).toHaveProperty('paymentAllocationsResolved');
+      expect(checks).toHaveProperty('billStructuralValidity');
+      expect(checks).toHaveProperty('billOfficialEvidenceAvailable');
+      expect(checks).toHaveProperty('billStatusInferenceSafe');
       expect(checks).toHaveProperty('billReconciliationEvidenceSufficient');
+      expect(checks).toHaveProperty('cashFlowReconciliationZero');
+      expect(checks).toHaveProperty('classifiedEconomicReconciliationZero');
       expect(checks).toHaveProperty('financialDiscrepancyZero');
       expect(checks).toHaveProperty('identityCollisionsZero');
       expect(checks).toHaveProperty('targetSnapshotValid');
@@ -375,11 +388,11 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
         notionCategories: sampleNotionCategories,
-        _mockExpectedEconomicExpenses: 2712.51,
+        _mockExpectedEconomicExpenses: 2548.92,
       });
       expect(artifact.readiness.checks.financialDiscrepancyZero).toBe(false);
       expect(artifact.readiness.blockers).toContain(
-        'FINANCIAL_DISCREPANCY: Discrepância financeira residual detectada (R$ 0.01).',
+        'FINANCIAL_DISCREPANCY: Discrepância financeira residual detectada.',
       );
     });
 
@@ -396,7 +409,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       );
     });
 
-    it('excludes outgoing internal transfers (R$ 115,00) from economic expenses', () => {
+    it('excludes outgoing internal transfers (R$ 115,00) and pending outgoing transfers (R$ 163,59) from economic expenses', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -412,17 +425,19 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       const totalExpenses = artifact.operations
         .filter((o) => o.sanitizedPayload['Efeito Orçamentário'] === 'Despesa')
         .reduce((sum, o) => sum + Number(o.sanitizedPayload['Valor']), 0);
-      expect(Math.round(totalExpenses * 100) / 100).toBe(2712.5);
+      expect(Math.round(totalExpenses * 100) / 100).toBe(2548.91);
     });
 
-    it('treats 36 third-party inflows as economically pending review with null nature and effect', () => {
+    it('treats 36 third-party inflows and 13 third-party outflows as economically pending review with null nature and effect', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact, incomingTransferAudits } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
         notionCategories: sampleNotionCategories,
       });
 
-      expect(artifact.readiness.pendingEconomicClassificationCount).toBe(36);
+      expect(artifact.readiness.pendingEconomicClassificationCount).toBe(49);
+      expect(artifact.readiness.pendingCategoryReviewCount).toBe(13);
+      expect(artifact.readiness.checks.unresolvedCategoryErrorsZero).toBe(true);
 
       const pendingAudits = incomingTransferAudits.filter(
         (t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER',
@@ -442,7 +457,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(pendingOps.every((o) => o.sanitizedPayload['Status de Revisão'] === 'Pendente Revisão')).toBe(true);
     });
 
-    it('audits card cycles status and unexplained discrepancy accurately', () => {
+    it('audits card cycles status and unexplained discrepancy as null when official evidence is absent', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { cardBillAudits } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -451,25 +466,25 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
 
       expect(cardBillAudits).toHaveLength(4);
 
-      // Cycle 2 (June) - conservative 'Paga Parcialmente' due to null official bill value
+      // Cycle 2 (June) - conservative null status due to null official bill value
       const cycle2 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:a5ea6710-2f6e-4663-a237-2c062b8fa8d7');
       expect(cycle2).toBeDefined();
       expect(cycle2!.somaCompras).toBe(171.79);
       expect(cycle2!.paidAmount).toBe(171.79);
       expect(cycle2!.purchasePaymentDelta).toBe(0);
       expect(cycle2!.officialBillDiscrepancy).toBeNull();
-      expect(cycle2!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle2!.status).toBe('Paga Parcialmente');
+      expect(cycle2!.unexplainedDiscrepancy).toBeNull();
+      expect(cycle2!.status).toBeNull();
 
-      // Cycle 3 (July) - conservative 'Paga Parcialmente' due to null official bill value
+      // Cycle 3 (July) - conservative null status due to null official bill value
       const cycle3 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:f4513058-c028-4b90-b663-16f27d0e2d8e');
       expect(cycle3).toBeDefined();
       expect(cycle3!.somaCompras).toBe(55.89);
       expect(cycle3!.paidAmount).toBe(55.89);
       expect(cycle3!.purchasePaymentDelta).toBe(0);
       expect(cycle3!.officialBillDiscrepancy).toBeNull();
-      expect(cycle3!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle3!.status).toBe('Paga Parcialmente');
+      expect(cycle3!.unexplainedDiscrepancy).toBeNull();
+      expect(cycle3!.status).toBeNull();
 
       // Cycle 1 (May) - partially paid, delta 24.85
       const cycle1 = cardBillAudits.find((b) => b.stableBillId === 'nubank:bill:7f6be926-ae1b-4685-a830-8ec6e773fbf0');
@@ -478,8 +493,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(cycle1!.paidAmount).toBe(31.93);
       expect(cycle1!.purchasePaymentDelta).toBe(24.85);
       expect(cycle1!.officialBillDiscrepancy).toBeNull();
-      expect(cycle1!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle1!.status).toBe('Paga Parcialmente');
+      expect(cycle1!.unexplainedDiscrepancy).toBeNull();
+      expect(cycle1!.status).toBeNull();
 
       // Cycle 4 (July open/fallback) - partially paid, delta 316.24
       const cycle4 = cardBillAudits.find((b) => b.stableBillId === 'nubank:cartao:2026-07:cycle');
@@ -488,8 +503,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(cycle4!.paidAmount).toBe(98.79);
       expect(cycle4!.purchasePaymentDelta).toBe(316.24);
       expect(cycle4!.officialBillDiscrepancy).toBeNull();
-      expect(cycle4!.unexplainedDiscrepancy).toBe(0);
-      expect(cycle4!.status).toBe('Paga Parcialmente');
+      expect(cycle4!.unexplainedDiscrepancy).toBeNull();
+      expect(cycle4!.status).toBeNull();
     });
 
     it('strictly validates calendar dates and rejects invalid ISO dates', () => {
@@ -537,11 +552,11 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         notionCategories: sampleNotionCategories,
       });
 
-      // All card bills without valorOficial must be conservative
+      // All card bills without valorOficial must have status = null
       for (const bill of cardBillAudits) {
         if (bill.valorOficial === null) {
           expect(bill.status).not.toBe('Paga Integralmente');
-          expect(['Paga Parcialmente', 'Aberta em Curso', 'Fechada a Vencer']).toContain(bill.status);
+          expect(bill.status).toBeNull();
         }
       }
     });
@@ -601,6 +616,223 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
 
       // In Phase 2A, readyForApply must be strictly false
       expect(artifact.readiness.readyForApply).toBe(false);
+    });
+  });
+
+  describe('Fase 2A.4 - Mandatory Negative Proofs & Safety Invariants', () => {
+    it('1. throws FAIL_CLOSED_ACCOUNT_MAPPING_CONFIG when sourceAccountMapping / BACKFILL_ACCOUNT_MAPPING_PATH is missing', () => {
+      const envWithoutMapping = { ...testEnv, BACKFILL_ACCOUNT_MAPPING_PATH: '' };
+      const planner = new BackfillPlanner({ envVars: envWithoutMapping });
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+        });
+      }).toThrow(/FAIL_CLOSED_ACCOUNT_MAPPING_CONFIG/);
+    });
+
+    it('2. maps unknown account UUID to UNRESOLVED_ACCOUNT and evaluates unresolvedAccountsZero as false', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact, transactionAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        plannerConfig: {
+          sourceAccountMapping: {
+            'arbitrary-unknown-uuid': 'CHECKING',
+          },
+        },
+      });
+      expect(artifact.readiness.checks.unresolvedAccountsZero).toBe(false);
+      expect(artifact.readiness.blockers.some((b) => b.includes('UNRESOLVED_ACCOUNTS'))).toBe(true);
+      const unresolved = transactionAudits.filter((t) => t.resolutionMethod === 'UNRESOLVED');
+      expect(unresolved.length).toBeGreaterThan(0);
+    });
+
+    it('3. evaluates all 3 snapshot checks as false when snapshotValidation is omitted', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        snapshotValidation: undefined,
+      });
+      expect(artifact.readiness.checks.ciphertextIntegrityValid).toBe(false);
+      expect(artifact.readiness.checks.manifestIntegrityValid).toBe(false);
+      expect(artifact.readiness.checks.plaintextRestoreVerified).toBe(false);
+    });
+
+    it('4. sets readyForExecutorImplementation to false when plaintext restore is unverified', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        snapshotValidation: {
+          ciphertextIntegrityValid: true,
+          manifestIntegrityValid: true,
+          plaintextRestoreVerified: false,
+        },
+      });
+      expect(artifact.readiness.checks.plaintextRestoreVerified).toBe(false);
+      expect(artifact.readiness.readyForExecutorImplementation).toBe(false);
+      expect(artifact.readiness.blockers).toContain(
+        'SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot para texto plano não verificada.',
+      );
+    });
+
+    it('5. ensures pending outgoing third-party transfers do NOT become Despesa', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      const pendingOutflowOps = artifact.operations.filter(
+        (o) =>
+          o.targetDataSource.envKey === 'NOTION_DS_TRANSACTIONS' &&
+          o.sanitizedPayload['Movimento'] === 'Saída' &&
+          o.sanitizedPayload['Status de Revisão'] === 'Pendente Revisão',
+      );
+      expect(pendingOutflowOps).toHaveLength(13);
+      for (const op of pendingOutflowOps) {
+        expect(op.sanitizedPayload['Efeito Orçamentário']).toBeNull();
+        expect(op.sanitizedPayload['Natureza']).toBeNull();
+        expect(op.relations['Categoria'] || []).toHaveLength(0);
+      }
+    });
+
+    it('6. ensures pending outgoing third-party transfers never have Status de Revisão = Confirmado Auto', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      const pendingOutflowOps = artifact.operations.filter(
+        (o) =>
+          o.targetDataSource.envKey === 'NOTION_DS_TRANSACTIONS' &&
+          o.sanitizedPayload['Movimento'] === 'Saída' &&
+          !o.sanitizedPayload['Natureza'],
+      );
+      expect(pendingOutflowOps).toHaveLength(13);
+      for (const op of pendingOutflowOps) {
+        expect(op.sanitizedPayload['Status de Revisão']).toBe('Pendente Revisão');
+        expect(op.sanitizedPayload['Status de Revisão']).not.toBe('Confirmado Auto');
+      }
+    });
+
+    it('7. includes pending outflows in physical cash but strictly excludes from confirmed economic expenses', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      expect(artifact.readiness.pendingEconomicOutflows).toBe(163.59);
+      expect(artifact.readiness.confirmedEconomicExpenses).toBe(2548.91);
+      expect(artifact.readiness.physicalCashOutflows).toBe(2458.17);
+      expect(artifact.readiness.checks.cashFlowReconciliationZero).toBe(true);
+      expect(artifact.readiness.checks.classifiedEconomicReconciliationZero).toBe(true);
+    });
+
+    it('8. sets Divergência Não Explicada and officialBillDiscrepancy to null when valorOficial is null', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      expect(cardBillAudits).toHaveLength(4);
+      for (const bill of cardBillAudits) {
+        expect(bill.valorOficial).toBeNull();
+        expect(bill.officialBillDiscrepancy).toBeNull();
+        expect(bill.unexplainedDiscrepancy).toBeNull();
+      }
+    });
+
+    it('9. does not infer Paga Integralmente or Paga Parcialmente without official bill value (status remains null)', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      for (const bill of cardBillAudits) {
+        expect(bill.status).toBeNull();
+        expect(bill.status).not.toBe('Paga Integralmente');
+        expect(bill.status).not.toBe('Paga Parcialmente');
+      }
+    });
+
+    it('10. distinguishes field provenance: dueDate is CONFIGURED/SOURCE while closingDate is DERIVED', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { cardBillAudits } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      expect(cardBillAudits).toHaveLength(4);
+      for (const bill of cardBillAudits) {
+        expect(bill.fieldProvenance.dueDate).not.toBe(bill.fieldProvenance.closingDate);
+        expect(['SOURCE', 'CONFIGURED']).toContain(bill.fieldProvenance.dueDate);
+        expect(bill.fieldProvenance.closingDate).toBe('DERIVED');
+        expect(bill.fieldProvenance.status).toBeNull();
+        expect(bill.fieldProvenance.officialAmount).toBeNull();
+      }
+      const fallbackCycle = cardBillAudits.find((b) => b.origem === 'PERIOD_ESTIMATED');
+      expect(fallbackCycle).toBeDefined();
+      expect(fallbackCycle!.fieldProvenance.dueDate).toBe('CONFIGURED');
+    });
+
+    it('11. prohibits unkeyed hashing for counterparty pseudonymization (returns [OFUSCADO] or keyed HMAC)', () => {
+      // Without key -> masked as [OFUSCADO], never unkeyed SHA-256
+      const masked = generateCounterpartyPseudonym('João Silva', undefined);
+      expect(masked).toBe('[OFUSCADO]');
+      expect(masked).not.toContain('sha256');
+
+      const maskedEmpty = generateCounterpartyPseudonym('João Silva', '');
+      expect(maskedEmpty).toBe('[OFUSCADO]');
+
+      // With key -> proper HMAC with prefix and 32 hex chars (128 bits minimum)
+      const keyed = generateCounterpartyPseudonym('João Silva', 'secret-key-test', 'v1');
+      expect(keyed).toMatch(/^HMAC_v1_[a-f0-9]{32}$/);
+
+      // Verify that keyed HMAC differs from unkeyed SHA-256
+      const unkeyedSha256 = crypto.createHash('sha256').update('João Silva').digest('hex').substring(0, 32);
+      expect(keyed).not.toBe(`HMAC_v1_${unkeyedSha256}`);
+    });
+
+    it('12. ensures plan artifact and operations do not contain source account UUIDs', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      const artifactJson = JSON.stringify(artifact);
+      for (const op of artifact.operations) {
+        expect(op.sanitizedPayload).not.toHaveProperty('source_account_id');
+        expect(op.sanitizedPayload).not.toHaveProperty('account_id');
+      }
+      expect(artifactJson).not.toContain('c82e6d46-15f2-47fc-991d-abaa12f063b8');
+      expect(artifactJson).not.toContain('02e273f7-840e-4b3a-b487-348f922dce70');
+    });
+
+    it('13. ensures operation payloads do not contain personal names in HMAC Contraparte', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const { artifact } = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+      const txOps = artifact.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_TRANSACTIONS');
+      for (const op of txOps) {
+        const hmacVal = op.sanitizedPayload['HMAC Contraparte'];
+        expect(typeof hmacVal).toBe('string');
+        if (hmacVal && hmacVal !== '[OFUSCADO]') {
+          expect(hmacVal).toMatch(/^HMAC_/);
+          expect(hmacVal).not.toMatch(/[a-zA-Z]{4,}\s[a-zA-Z]{4,}/); // No first + last names
+        }
+      }
+    });
+
+    it('14. ensures scripts/backfill-dry-run.ts contains zero hardcoded counts or values', () => {
+      const scriptContent = fs.readFileSync(path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'), 'utf8');
+      expect(scriptContent).not.toContain('155/155');
+      expect(scriptContent).not.toContain('36 txs pendentes):');
+      expect(scriptContent).not.toContain('14 bank legs');
+      expect(scriptContent).not.toContain('c82e6d46-15f2-47fc-991d-abaa12f063b8');
+      expect(scriptContent).not.toContain('02e273f7-840e-4b3a-b487-348f922dce70');
     });
   });
 });

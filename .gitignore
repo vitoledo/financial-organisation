@@ -22,6 +22,8 @@ backups/
 # backstop: it contains balances, transactions and the whole net-worth picture.
 financial-summary.json
 **/financial-summary.json
+account-mapping.json
+**/account-mapping.json
 
 # Environment variables (sensitive)
 .env
