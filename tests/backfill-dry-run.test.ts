@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import path from 'path';
+import Database from 'better-sqlite3';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
 import { BackfillPlanner } from '../src/notion/migration-runner/backfill-planner';
 
@@ -261,5 +263,35 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     });
 
     await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT/);
+  });
+
+  it('guarantees zero drift: mutating data/financial.db does not alter dry-run report because it strictly reads the snapshot', async () => {
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+    });
+    const baselineReport = await analyzer.runAnalysis();
+
+    // Temporarily insert a row into data/financial.db
+    const liveDbPath = path.resolve(process.cwd(), 'data', 'financial.db');
+    const liveDb = new Database(liveDbPath);
+    const existingAcc = (liveDb.prepare('SELECT id FROM accounts LIMIT 1').get() as any)?.id;
+    const tempTxId = 'drift-test-temp-tx-' + Date.now();
+    try {
+      liveDb
+        .prepare(
+          "INSERT INTO transactions (id, account_id, date, amount, original_amount, direction, description, account_type) VALUES (?, ?, '2026-09-01', -100.0, -100.0, 'OUTFLOW', 'Drift test tx', 'BANK')",
+        )
+        .run(tempTxId, existingAcc);
+
+      // Run dry-run again
+      const driftedReport = await analyzer.runAnalysis();
+      expect(driftedReport.totalSourceTransactions).toBe(155);
+      expect(driftedReport.planArtifact.backfillPlanHash).toBe(baselineReport.planArtifact.backfillPlanHash);
+      expect(driftedReport.totalSourceTransactions).toBe(baselineReport.totalSourceTransactions);
+    } finally {
+      liveDb.prepare('DELETE FROM transactions WHERE id = ?').run(tempTxId);
+      liveDb.close();
+    }
   });
 });

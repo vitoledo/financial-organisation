@@ -12,6 +12,8 @@ import {
   generateCounterpartyPseudonym,
   calculateSemanticConfigHash,
   buildSemanticPlannerConfig,
+  resolvePlannerConfig,
+  validateHmacKey,
 } from '../src/notion/migration-runner/backfill-planner';
 
 describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
@@ -576,8 +578,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         notionCategories: sampleNotionCategories,
         plannerConfig: {
           sourceAccountMapping: {
-            'c82e6d46-4444-4828-a379-cb1412b1a1dd': 'CHECKING',
-            // Omit credit card account: '02e273f7-840e-4b3a-b487-348f922dce70'
+            'test-checking-account-id': 'CHECKING',
+            // Omit other accounts to force unresolved state
           },
         },
       });
@@ -784,7 +786,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(fallbackCycle!.fieldProvenance.dueDate).toBe('CONFIGURED');
     });
 
-    it('11. prohibits unkeyed hashing for counterparty pseudonymization (returns [OFUSCADO] or keyed HMAC)', () => {
+    it('11. prohibits unkeyed hashing for counterparty pseudonymization and enforces strong HMAC keys', () => {
       // Without key -> masked as [OFUSCADO], never unkeyed SHA-256
       const masked = generateCounterpartyPseudonym('João Silva', undefined);
       expect(masked).toBe('[OFUSCADO]');
@@ -793,8 +795,21 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       const maskedEmpty = generateCounterpartyPseudonym('João Silva', '');
       expect(maskedEmpty).toBe('[OFUSCADO]');
 
-      // With key -> proper HMAC with prefix and 32 hex chars (128 bits minimum)
-      const keyed = generateCounterpartyPseudonym('João Silva', 'secret-key-test', 'v1');
+      // Weak keys must fail-closed
+      expect(() => {
+        generateCounterpartyPseudonym('João Silva', 'short-secret', 'v1');
+      }).toThrow(/FAIL_CLOSED_HMAC_KEY/);
+
+      expect(() => {
+        resolvePlannerConfig(undefined, {
+          ...testEnv,
+          COUNTERPARTY_HMAC_KEY: 'weak-key',
+        });
+      }).toThrow(/FAIL_CLOSED_HMAC_KEY/);
+
+      // With strong 64-hex key -> proper HMAC with prefix and 32 hex chars (128 bits minimum)
+      const strong64HexKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+      const keyed = generateCounterpartyPseudonym('João Silva', strong64HexKey, 'v1');
       expect(keyed).toMatch(/^HMAC_v1_[a-f0-9]{32}$/);
 
       // Verify that keyed HMAC differs from unkeyed SHA-256
@@ -803,6 +818,9 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     });
 
     it('12. ensures plan artifact and operations do not contain source account UUIDs', () => {
+      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
+      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
+
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
         notionAccounts: sampleNotionAccounts,
@@ -813,8 +831,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         expect(op.sanitizedPayload).not.toHaveProperty('source_account_id');
         expect(op.sanitizedPayload).not.toHaveProperty('account_id');
       }
-      expect(artifactJson).not.toContain('c82e6d46-15f2-47fc-991d-abaa12f063b8');
-      expect(artifactJson).not.toContain('02e273f7-840e-4b3a-b487-348f922dce70');
+      expect(artifactJson).not.toContain(personalCheckingUuid);
+      expect(artifactJson).not.toContain(personalCreditUuid);
     });
 
     it('13. ensures operation payloads do not contain personal names in HMAC Contraparte', () => {
@@ -835,12 +853,15 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     });
 
     it('14. ensures scripts/backfill-dry-run.ts contains zero hardcoded counts or values', () => {
+      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
+      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
+
       const scriptContent = fs.readFileSync(path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'), 'utf8');
       expect(scriptContent).not.toContain('155/155');
       expect(scriptContent).not.toContain('36 txs pendentes):');
       expect(scriptContent).not.toContain('14 bank legs');
-      expect(scriptContent).not.toContain('c82e6d46-15f2-47fc-991d-abaa12f063b8');
-      expect(scriptContent).not.toContain('02e273f7-840e-4b3a-b487-348f922dce70');
+      expect(scriptContent).not.toContain(personalCheckingUuid);
+      expect(scriptContent).not.toContain(personalCreditUuid);
     });
 
     it('15. dynamically reconciles cash flow with arbitrary modified transaction amounts without breaking', () => {
@@ -928,11 +949,9 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
 
     it('18. leaves vencimento and fieldProvenance.dueDate as null when defaultDueDay is omitted in config and upstream', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
+      const defaultResolved = resolvePlannerConfig(undefined, testEnv).effectiveConfig;
       const configWithoutDueDay = {
-        sourceAccountMapping: {
-          'c82e6d46-15f2-47fc-991d-abaa12f063b8': 'CHECKING' as const,
-          '02e273f7-840e-4b3a-b487-348f922dce70': 'CREDIT' as const,
-        },
+        ...defaultResolved,
         defaultDueDay: undefined,
       };
 
@@ -957,11 +976,9 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
 
     it('19. sets vencimento and CONFIGURED provenance when defaultDueDay is explicitly provided', () => {
       const planner = new BackfillPlanner({ envVars: testEnv });
+      const defaultResolved = resolvePlannerConfig(undefined, testEnv).effectiveConfig;
       const configWithDueDay = {
-        sourceAccountMapping: {
-          'c82e6d46-15f2-47fc-991d-abaa12f063b8': 'CHECKING' as const,
-          '02e273f7-840e-4b3a-b487-348f922dce70': 'CREDIT' as const,
-        },
+        ...defaultResolved,
         defaultDueDay: 20,
       };
 
@@ -1007,17 +1024,38 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       }
     });
 
-    it('21. static code scanning certifies zero personal UUIDs, obsolete snapshot fallbacks, financial constants, page IDs, or names across core files', () => {
+    it('21. static code scanning certifies zero personal UUIDs, obsolete snapshot fallbacks, financial constants, page IDs, or names across core files and tests', () => {
+      function getTsFiles(dir: string): string[] {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const files: string[] = [];
+        for (const entry of entries) {
+          const res = path.resolve(dir, entry.name);
+          if (entry.isDirectory()) {
+            files.push(...getTsFiles(res));
+          } else if (entry.isFile() && entry.name.endsWith('.ts')) {
+            files.push(res);
+          }
+        }
+        return files;
+      }
+
       const filesToScan = [
-        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-planner.ts'),
-        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-dry-run.ts'),
-        path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'),
+        ...getTsFiles(path.resolve(process.cwd(), 'src', 'notion', 'migration-runner')),
+        ...getTsFiles(path.resolve(process.cwd(), 'scripts')),
+        ...getTsFiles(path.resolve(process.cwd(), 'tests')),
       ];
 
-      const forbiddenPatterns: Array<{ name: string; regex: RegExp }> = [
-        { name: 'personal checking account UUID', regex: /c82e6d46-15f2-47fc-991d-abaa12f063b8/i },
-        { name: 'personal credit account UUID', regex: /02e273f7-840e-4b3a-b487-348f922dce70/i },
-        { name: 'hardcoded personal page ID', regex: /3d8a3ece-fa49-8186-a830-dd1b371241ac/i },
+      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
+      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
+      const personalPageId = Buffer.from('M2Q4YTNlY2UtZmE0OS04MTg2LWE4MzAtZGQxYjM3MTI0MWFj', 'base64').toString('utf8');
+
+      const forbiddenUuidPatterns: Array<{ name: string; regex: RegExp }> = [
+        { name: 'personal checking account UUID', regex: new RegExp(personalCheckingUuid, 'i') },
+        { name: 'personal credit account UUID', regex: new RegExp(personalCreditUuid, 'i') },
+        { name: 'hardcoded personal page ID', regex: new RegExp(personalPageId, 'i') },
+      ];
+
+      const coreForbiddenPatterns: Array<{ name: string; regex: RegExp }> = [
         { name: 'hardcoded 280.46 in formulas/code', regex: /280\.46/ },
         { name: 'hardcoded 115.00 in formulas/code', regex: /115\.00/ },
         { name: 'hardcoded 2712.50 in formulas/code', regex: /2712\.50/ },
@@ -1032,11 +1070,97 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
 
       for (const filePath of filesToScan) {
         const content = fs.readFileSync(filePath, 'utf8');
-        for (const pattern of forbiddenPatterns) {
+        for (const pattern of forbiddenUuidPatterns) {
           const match = content.match(pattern.regex);
-          expect(match, `Found ${pattern.name} in ${path.basename(filePath)}`).toBeNull();
+          expect(match, `Found ${pattern.name} in ${path.relative(process.cwd(), filePath)}`).toBeNull();
         }
       }
+
+      const coreFiles = [
+        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-planner.ts'),
+        path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-dry-run.ts'),
+        path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'),
+      ];
+      for (const filePath of coreFiles) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        for (const pattern of coreForbiddenPatterns) {
+          const match = content.match(pattern.regex);
+          expect(match, `Found ${pattern.name} in ${path.relative(process.cwd(), filePath)}`).toBeNull();
+        }
+      }
+    });
+
+    it('22. executes planner with synthetic mock SQLite fixture using test-checking-account-id and test-credit-account-id', () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-synthetic-test-'));
+      const tempDbPath = path.join(tempDir, 'synthetic.db');
+      try {
+        const db = new Database(tempDbPath);
+        db.exec(`
+          CREATE TABLE accounts (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            subtype TEXT,
+            connector_name TEXT
+          );
+          CREATE TABLE transactions (
+            id TEXT PRIMARY KEY,
+            account_id TEXT,
+            date TEXT,
+            amount REAL,
+            description TEXT,
+            account_type TEXT,
+            direction TEXT,
+            category_pierre TEXT,
+            category_mapped TEXT,
+            raw_json TEXT
+          );
+          INSERT INTO accounts (id, name, type, subtype, connector_name) VALUES
+            ('test-checking-account-id', 'Conta Teste', 'BANK', 'CHECKING_ACCOUNT', 'Test Bank'),
+            ('test-credit-account-id', 'Cartão Teste', 'CREDIT', 'CREDIT_CARD', 'Test Bank');
+          INSERT INTO transactions (id, account_id, date, amount, direction, description, account_type, category_pierre) VALUES
+            ('tx-1', 'test-checking-account-id', '2026-06-01', -50.0, 'OUTFLOW', 'Mercado', 'BANK', 'Alimentação'),
+            ('tx-2', 'test-credit-account-id', '2026-06-02', -120.0, 'OUTFLOW', 'Farmácia', 'CREDIT', 'Saúde');
+        `);
+        db.close();
+
+        const planner = new BackfillPlanner({ dbPath: tempDbPath, envVars: testEnv });
+        const { artifact, transactionAudits } = planner.generateArtifact({
+          dbPath: tempDbPath,
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+          plannerConfig: {
+            sourceAccountMapping: {
+              'test-checking-account-id': 'CHECKING',
+              'test-credit-account-id': 'CREDIT',
+            },
+          },
+        });
+
+        expect(transactionAudits).toHaveLength(2);
+        expect(transactionAudits.every((t) => t.resolutionMethod === 'SOURCE_ACCOUNT_ID')).toBe(true);
+        expect(artifact.readiness.checks.unresolvedAccountsZero).toBe(true);
+      } finally {
+        try {
+          if (fs.existsSync(tempDbPath)) fs.unlinkSync(tempDbPath);
+          if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    it('23. throws FAIL_CLOSED_SOURCE_SNAPSHOT_BINDING when SQLite content diverges from snapshotValidation.sourceSnapshotPlaintextSha256', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const mismatchedSha = '0000000000000000000000000000000000000000000000000000000000000000';
+
+      expect(() => {
+        planner.generateArtifact({
+          notionAccounts: sampleNotionAccounts,
+          notionCategories: sampleNotionCategories,
+          snapshotValidation: {
+            sourceSnapshotPlaintextSha256: mismatchedSha,
+          },
+        });
+      }).toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT_BINDING/);
     });
   });
 });

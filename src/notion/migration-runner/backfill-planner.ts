@@ -54,18 +54,47 @@ export function calculateSemanticConfigHash(config: BackfillPlannerConfig): stri
   return crypto.createHash('sha256').update(JSON.stringify(semantic)).digest('hex');
 }
 
+export function validateHmacKey(key?: string): { valid: boolean; reason?: string } {
+  if (!key || key.trim().length === 0) {
+    return { valid: true };
+  }
+  const trimmed = key.trim();
+  // 64-hex string (32 bytes raw)
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    return { valid: true };
+  }
+  // Base64 string that decodes to >= 32 bytes
+  if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(trimmed) || /^[A-Za-z0-9+/]{44}$/.test(trimmed)) {
+    try {
+      const decoded = Buffer.from(trimmed, 'base64');
+      if (decoded.length >= 32) return { valid: true };
+    } catch {
+      // ignore
+    }
+  }
+  return {
+    valid: false,
+    reason:
+      'Chave COUNTERPARTY_HMAC_KEY inválida ou fraca. Exigido material criptográfico forte de no mínimo 32 bytes (64 caracteres hexadecimais ou Base64 de 44 caracteres). Strings curtas ou arbitrárias são estritamente proibidas.',
+  };
+}
+
 export function generateCounterpartyPseudonym(
   counterpartyName: string,
   hmacKey?: string,
   keyVersion: string = 'v1',
 ): string {
   if (!counterpartyName || typeof counterpartyName !== 'string') return '[OFUSCADO]';
-  if (hmacKey && hmacKey.trim().length > 0) {
-    const hmacHex = crypto.createHmac('sha256', hmacKey).update(counterpartyName).digest('hex');
-    const truncated = hmacHex.substring(0, 32);
-    return `HMAC_${keyVersion}_${truncated}`;
+  if (!hmacKey || hmacKey.trim().length === 0) return '[OFUSCADO]';
+
+  const check = validateHmacKey(hmacKey);
+  if (!check.valid) {
+    throw new Error(`FAIL_CLOSED_HMAC_KEY: ${check.reason}`);
   }
-  return '[OFUSCADO]';
+
+  const hmacHex = crypto.createHmac('sha256', hmacKey.trim()).update(counterpartyName).digest('hex');
+  const truncated = hmacHex.substring(0, 32);
+  return `HMAC_${keyVersion}_${truncated}`;
 }
 
 export function resolvePlannerConfig(
@@ -132,6 +161,18 @@ export function resolvePlannerConfig(
       ? userConfig.defaultDueDay
       : fileDueDay;
 
+  const rawHmacKey =
+    userConfig?.counterpartyHmacKey ||
+    envVars?.COUNTERPARTY_HMAC_KEY ||
+    process.env.COUNTERPARTY_HMAC_KEY;
+
+  if (rawHmacKey && rawHmacKey.trim().length > 0) {
+    const check = validateHmacKey(rawHmacKey);
+    if (!check.valid) {
+      throw new Error(`FAIL_CLOSED_HMAC_KEY: ${check.reason}`);
+    }
+  }
+
   const effectiveConfig: BackfillPlannerConfig = {
     ...DEFAULT_BACKFILL_PLANNER_CONFIG,
     ...(userConfig || {}),
@@ -139,10 +180,7 @@ export function resolvePlannerConfig(
     defaultDueDay: effectiveDueDay,
     accountMappingConfigPath: mappingPath,
     accountMappingConfigHash: mappingHash,
-    counterpartyHmacKey:
-      userConfig?.counterpartyHmacKey ||
-      envVars?.COUNTERPARTY_HMAC_KEY ||
-      process.env.COUNTERPARTY_HMAC_KEY,
+    counterpartyHmacKey: rawHmacKey,
     hmacKeyVersion:
       userConfig?.hmacKeyVersion ||
       envVars?.COUNTERPARTY_HMAC_KEY_VERSION ||
@@ -429,20 +467,27 @@ export class BackfillPlanner {
     }
 
     // 2. Source Snapshot Binding (SQLite DB)
-    if (!fs.existsSync(this.dbPath)) {
-      throw new Error(`FAIL_CLOSED_SOURCE_DB: Arquivo de banco de dados SQLite não encontrado em '${this.dbPath}'.`);
+    const effectiveDbPath = options.dbPath || this.dbPath;
+    if (!fs.existsSync(effectiveDbPath)) {
+      throw new Error(`FAIL_CLOSED_SOURCE_DB: Arquivo de banco de dados SQLite não encontrado em '${effectiveDbPath}'.`);
     }
-    const dbBuf = fs.readFileSync(this.dbPath);
-    const calculatedSourceHash = crypto.createHash('sha256').update(dbBuf).digest('hex');
-    const sourceSnapshotHash =
-      options.snapshotValidation?.sourceSnapshotPlaintextSha256 ||
-      calculatedSourceHash;
+    const dbBuf = fs.readFileSync(effectiveDbPath);
+    const calculatedHashOfDbActuallyConsumed = crypto.createHash('sha256').update(dbBuf).digest('hex');
 
-    if (options.sourceSnapshotHash && options.sourceSnapshotHash !== sourceSnapshotHash) {
+    if (options.snapshotValidation?.sourceSnapshotPlaintextSha256) {
+      if (calculatedHashOfDbActuallyConsumed !== options.snapshotValidation.sourceSnapshotPlaintextSha256) {
+        throw new Error(
+          `FAIL_CLOSED_SOURCE_SNAPSHOT_BINDING: Hash do banco SQLite efetivamente consumido (${calculatedHashOfDbActuallyConsumed}) diverge do hash do snapshot homologado (${options.snapshotValidation.sourceSnapshotPlaintextSha256}).`,
+        );
+      }
+    }
+
+    if (options.sourceSnapshotHash && options.sourceSnapshotHash !== calculatedHashOfDbActuallyConsumed) {
       throw new Error(
-        `FAIL_CLOSED_SOURCE_DB: Hash do banco SQLite (${sourceSnapshotHash}) diverge do hash esperado (${options.sourceSnapshotHash}).`,
+        `FAIL_CLOSED_SOURCE_DB: Hash do banco SQLite (${calculatedHashOfDbActuallyConsumed}) diverge do hash esperado (${options.sourceSnapshotHash}).`,
       );
     }
+    const sourceSnapshotHash = calculatedHashOfDbActuallyConsumed;
 
     // 3. Target Notion Snapshot Binding (Explicit Manifest Binding - FAIL-CLOSED)
     const targetManifestPath = options.targetSnapshotManifestPath ?? this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
@@ -522,7 +567,7 @@ export class BackfillPlanner {
     }
 
     // 6. SQLite Source Data Extraction & Account Resolution Table
-    const db = new Database(this.dbPath, { readonly: true });
+    const db = new Database(effectiveDbPath, { readonly: true });
     const sqliteAccounts = db.prepare('SELECT * FROM accounts').all() as any[];
     const sqliteTransactions = db.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
     db.close();
@@ -1944,7 +1989,7 @@ export class BackfillPlanner {
       upstreamBillEnrichmentHash: options.upstreamBillEnrichmentHash,
       backfillPlanHash,
       explicitSnapshots: {
-        sourceDbPath: this.dbPath,
+        sourceDbPath: effectiveDbPath,
         sourceDbSha256: sourceSnapshotHash,
         sourceSnapshotManifestPath: options.snapshotValidation?.sourceSnapshotManifestPath,
         sourceSnapshotCiphertextSha256: options.snapshotValidation?.sourceSnapshotEncryptedSha256,

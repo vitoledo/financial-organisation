@@ -1,12 +1,13 @@
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
+import { generateCounterpartyPseudonym } from '../src/notion/migration-runner/backfill-planner';
 
 dotenv.config();
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════════════════════════');
-  console.log('  FASE 2A.5: SEAL FINAL E PORTABILIDADE DO BACKFILL PLAN');
+  console.log('  FASE 2A.6: BINDING CRIPTOGRÁFICO FINAL DO SOURCE SNAPSHOT');
   console.log('             (MODO ESTRITAMENTE READ-ONLY — ZERO ESCRITAS NO NOTION)');
   console.log('═══════════════════════════════════════════════════════════════════════════════\n');
 
@@ -149,13 +150,7 @@ async function main() {
     const num = (idx + 1).toString().padStart(2, ' ');
     const dt = inf.date.substring(0, 10);
     const val = inf.amount.toFixed(2).padStart(8, ' ');
-    let cpStr: string;
-    if (hmacKey && hmacKey.trim().length > 0) {
-      const hmacHex = crypto.createHmac('sha256', hmacKey).update(inf.counterpartyName).digest('hex');
-      cpStr = `HMAC_${hmacVersion}_${hmacHex.substring(0, 32)}`;
-    } else {
-      cpStr = '[OFUSCADO]';
-    }
+    const cpStr = generateCounterpartyPseudonym(inf.counterpartyName, hmacKey, hmacVersion);
     const cp = cpStr.padEnd(20, ' ');
     const cls = inf.counterpartyType.padEnd(23, ' ');
     const nat = (inf.economicNature || 'null').padEnd(14, ' ');

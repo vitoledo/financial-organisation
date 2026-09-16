@@ -129,8 +129,15 @@ export interface BackfillDryRunReport {
   paymentEventAllocations: PaymentEventAllocation[];
 }
 
+export interface ValidatedSourceSession {
+  restoredDbPath: string;
+  plaintextSha256: string;
+  ciphertextSha256: string;
+  manifestPath: string;
+  cleanup: () => void;
+}
+
 export class BackfillDryRunAnalyzer {
-  private db: Database.Database;
   private client: Client;
   private envVars: Record<string, string | undefined>;
   private dbPath: string;
@@ -140,7 +147,6 @@ export class BackfillDryRunAnalyzer {
     this.options = options;
     this.envVars = options.envVars ?? (process.env as Record<string, string | undefined>);
     this.dbPath = options.dbPath ?? path.resolve(process.cwd(), 'data', 'financial.db');
-    this.db = new Database(this.dbPath, { readonly: true });
 
     const apiKey = options.apiKey ?? this.envVars.NOTION_API_KEY?.trim();
     this.client =
@@ -281,6 +287,149 @@ export class BackfillDryRunAnalyzer {
     };
   }
 
+  public prepareValidatedSourceDatabase(): ValidatedSourceSession {
+    const manifestPath =
+      this.options.sourceSnapshotManifestPath ??
+      this.envVars.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
+      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim();
+
+    if (!manifestPath) {
+      throw new Error(
+        'FAIL_CLOSED_SOURCE_SNAPSHOT: Caminho do manifesto do snapshot SQLite de origem não informado nem configurado em SOURCE_SQLITE_SNAPSHOT_MANIFEST.',
+      );
+    }
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error(
+        `FAIL_CLOSED_SOURCE_SNAPSHOT: Manifesto do snapshot SQLite de origem não encontrado em '${manifestPath}'.`,
+      );
+    }
+
+    let manifest: any;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (err: any) {
+      throw new Error(`FAIL_CLOSED_SOURCE_SNAPSHOT: Erro ao ler manifesto do snapshot SQLite: ${err.message}`);
+    }
+
+    if (
+      manifest.format !== 'FIN_ENC_V1' ||
+      !manifest.encryptedFileSha256 ||
+      !manifest.originalDbSha256 ||
+      !manifest.backupFileName
+    ) {
+      throw new Error(
+        'FAIL_CLOSED_SOURCE_SNAPSHOT: Manifesto do snapshot SQLite inválido ou incompleto (format, hashes ou backupFileName ausentes).',
+      );
+    }
+
+    const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
+    if (!fs.existsSync(encryptedFilePath)) {
+      throw new Error(
+        `FAIL_CLOSED_SOURCE_SNAPSHOT: Arquivo criptografado de snapshot SQLite '${encryptedFilePath}' referenciado no manifesto não existe.`,
+      );
+    }
+
+    const encryptedBuffer = fs.readFileSync(encryptedFilePath);
+    const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
+    if (actualEncSha256 !== manifest.encryptedFileSha256) {
+      throw new Error(
+        `FAIL_CLOSED_SOURCE_SNAPSHOT: Hash do arquivo criptografado SQLite (${actualEncSha256}) diverge do manifesto (${manifest.encryptedFileSha256}).`,
+      );
+    }
+
+    const rawKey =
+      this.envVars.MIGRATION_BACKUP_KEY ||
+      process.env.MIGRATION_BACKUP_KEY ||
+      this.envVars.AUDIT_ENCRYPTION_KEY ||
+      process.env.AUDIT_ENCRYPTION_KEY;
+
+    if (!rawKey || rawKey.trim().length === 0) {
+      throw new Error(
+        'FAIL_CLOSED_SOURCE_SNAPSHOT: Chave de decodificação MIGRATION_BACKUP_KEY não informada para decifrar snapshot de origem.',
+      );
+    }
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-source-snapshot-'));
+    const tempPlaintextFile = path.join(tempDir, 'restored-source.db');
+
+    let keyBuffer: Buffer;
+    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+      keyBuffer = Buffer.from(rawKey, 'hex');
+    } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
+      keyBuffer = Buffer.from(rawKey, 'base64');
+    } else {
+      throw new Error(
+        'FAIL_CLOSED_SOURCE_SNAPSHOT: Formato de chave MIGRATION_BACKUP_KEY inválido (exigido hex de 64 caracteres ou base64 de 44 caracteres).',
+      );
+    }
+
+    try {
+      const backupMgr = new FinancialBackupManager({ dbPath: tempPlaintextFile, key: rawKey });
+      const decryptedBuffer = backupMgr.decryptBackupBuffer(encryptedBuffer, keyBuffer);
+      fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
+
+      const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
+      if (actualPlaintextSha !== manifest.originalDbSha256) {
+        throw new Error(
+          `FAIL_CLOSED_SOURCE_SNAPSHOT: Hash do banco SQLite restaurado (${actualPlaintextSha}) diverge do manifesto (${manifest.originalDbSha256}).`,
+        );
+      }
+
+      const verificationDb = new Database(tempPlaintextFile, { readonly: true });
+      try {
+        const pragmaRes = verificationDb.pragma('integrity_check') as any[];
+        const integrityOk =
+          pragmaRes &&
+          pragmaRes.length > 0 &&
+          (pragmaRes[0].integrity_check === 'ok' || Object.values(pragmaRes[0])[0] === 'ok');
+
+        if (!integrityOk) {
+          throw new Error('FAIL_CLOSED_SOURCE_SNAPSHOT: PRAGMA integrity_check falhou no snapshot restaurado.');
+        }
+
+        const txCountRes = verificationDb.prepare('SELECT count(*) as count FROM transactions').get() as any;
+        if (!txCountRes || txCountRes.count <= 0) {
+          throw new Error('FAIL_CLOSED_SOURCE_SNAPSHOT: Tabela transactions vazia ou inexistente no snapshot.');
+        }
+      } finally {
+        verificationDb.close();
+      }
+
+      const cleanup = () => {
+        try {
+          if (fs.existsSync(tempPlaintextFile)) {
+            fs.unlinkSync(tempPlaintextFile);
+          }
+          if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      };
+
+      return {
+        restoredDbPath: tempPlaintextFile,
+        plaintextSha256: manifest.originalDbSha256,
+        ciphertextSha256: manifest.encryptedFileSha256,
+        manifestPath,
+        cleanup,
+      };
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempPlaintextFile)) {
+          fs.unlinkSync(tempPlaintextFile);
+        }
+        if (fs.existsSync(tempDir)) {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+
   public verifySourceSnapshotReadiness(): {
     sourceSnapshotCiphertextValid: boolean;
     sourceSnapshotManifestValid: boolean;
@@ -289,121 +438,23 @@ export class BackfillDryRunAnalyzer {
     sourceSnapshotPlaintextSha256?: string;
     sourceSnapshotEncryptedSha256?: string;
   } {
-    let sourceSnapshotCiphertextValid = false;
-    let sourceSnapshotManifestValid = false;
-    let sourceSnapshotRestoreVerified = false;
-    let sourceSnapshotPlaintextSha256: string | undefined = undefined;
-    let sourceSnapshotEncryptedSha256: string | undefined = undefined;
-
     const manifestPath =
       this.options.sourceSnapshotManifestPath ??
       this.envVars.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
-      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim();
-
-    if (!manifestPath || !fs.existsSync(manifestPath)) {
-      return {
-        sourceSnapshotCiphertextValid: false,
-        sourceSnapshotManifestValid: false,
-        sourceSnapshotRestoreVerified: false,
-        manifestPath: manifestPath || '',
-      };
-    }
+      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
+      '';
 
     try {
-      const manifestContent = fs.readFileSync(manifestPath, 'utf8');
-      const manifest = JSON.parse(manifestContent);
-
-      if (
-        manifest.format !== 'FIN_ENC_V1' ||
-        !manifest.encryptedFileSha256 ||
-        !manifest.originalDbSha256 ||
-        !manifest.backupFileName
-      ) {
-        sourceSnapshotManifestValid = false;
-      } else {
-        sourceSnapshotManifestValid = true;
-        sourceSnapshotPlaintextSha256 = manifest.originalDbSha256;
-        sourceSnapshotEncryptedSha256 = manifest.encryptedFileSha256;
-      }
-
-      const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
-      if (!fs.existsSync(encryptedFilePath)) {
-        return {
-          sourceSnapshotCiphertextValid: false,
-          sourceSnapshotManifestValid,
-          sourceSnapshotRestoreVerified: false,
-          manifestPath,
-          sourceSnapshotPlaintextSha256,
-          sourceSnapshotEncryptedSha256,
-        };
-      }
-
-      const encryptedBuffer = fs.readFileSync(encryptedFilePath);
-      const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
-      if (actualEncSha256 === manifest.encryptedFileSha256) {
-        sourceSnapshotCiphertextValid = true;
-      }
-
-      const rawKey =
-        this.envVars.MIGRATION_BACKUP_KEY ||
-        process.env.MIGRATION_BACKUP_KEY ||
-        this.envVars.AUDIT_ENCRYPTION_KEY ||
-        process.env.AUDIT_ENCRYPTION_KEY;
-
-      if (sourceSnapshotCiphertextValid && sourceSnapshotManifestValid && rawKey) {
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-sqlite-dryrun-'));
-        const tempPlaintextFile = path.join(tempDir, 'restored-snapshot.db');
-        let tempDb: Database.Database | null = null;
-        try {
-          const backupMgr = new FinancialBackupManager({ dbPath: this.dbPath, key: rawKey });
-          let keyBuffer: Buffer;
-          if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-            keyBuffer = Buffer.from(rawKey, 'hex');
-          } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
-            keyBuffer = Buffer.from(rawKey, 'base64');
-          } else {
-            throw new Error('Invalid key format');
-          }
-
-          const decryptedBuffer = backupMgr.decryptBackupBuffer(encryptedBuffer, keyBuffer);
-          fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
-
-          const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
-          if (actualPlaintextSha === manifest.originalDbSha256) {
-            tempDb = new Database(tempPlaintextFile, { readonly: true });
-            const pragmaRes = tempDb.pragma('integrity_check') as any[];
-            const integrityOk =
-              pragmaRes &&
-              pragmaRes.length > 0 &&
-              (pragmaRes[0].integrity_check === 'ok' || Object.values(pragmaRes[0])[0] === 'ok');
-
-            const txCountRes = tempDb.prepare('SELECT count(*) as count FROM transactions').get() as any;
-            if (integrityOk && txCountRes && txCountRes.count > 0) {
-              sourceSnapshotRestoreVerified = true;
-            }
-          }
-        } catch {
-          sourceSnapshotRestoreVerified = false;
-        } finally {
-          if (tempDb) {
-            try {
-              tempDb.close();
-            } catch {
-              // ignore
-            }
-          }
-          try {
-            if (fs.existsSync(tempPlaintextFile)) {
-              fs.unlinkSync(tempPlaintextFile);
-            }
-            if (fs.existsSync(tempDir)) {
-              fs.rmSync(tempDir, { recursive: true, force: true });
-            }
-          } catch {
-            // ignore
-          }
-        }
-      }
+      const session = this.prepareValidatedSourceDatabase();
+      session.cleanup();
+      return {
+        sourceSnapshotCiphertextValid: true,
+        sourceSnapshotManifestValid: true,
+        sourceSnapshotRestoreVerified: true,
+        manifestPath: session.manifestPath,
+        sourceSnapshotPlaintextSha256: session.plaintextSha256,
+        sourceSnapshotEncryptedSha256: session.ciphertextSha256,
+      };
     } catch {
       return {
         sourceSnapshotCiphertextValid: false,
@@ -412,15 +463,6 @@ export class BackfillDryRunAnalyzer {
         manifestPath,
       };
     }
-
-    return {
-      sourceSnapshotCiphertextValid,
-      sourceSnapshotManifestValid,
-      sourceSnapshotRestoreVerified,
-      manifestPath,
-      sourceSnapshotPlaintextSha256,
-      sourceSnapshotEncryptedSha256,
-    };
   }
 
   public async runAnalysis(): Promise<BackfillDryRunReport> {
@@ -471,116 +513,104 @@ export class BackfillDryRunAnalyzer {
       throw new Error(`FAIL_CLOSED_NOTION_QUERY: Falha ao consultar Categorias no Notion Live: ${err?.message || err}`);
     }
 
-    // 2. Read SQLite accounts and transactions
-    const sqliteAccounts = this.db.prepare('SELECT * FROM accounts').all() as any[];
-    const sqliteTransactions = this.db.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
+    // 2. Prepare validated source SQLite database from frozen snapshot (FAIL-CLOSED, ANTI-TOCTOU)
+    const sourceSession = this.prepareValidatedSourceDatabase();
+    let activeDb: Database.Database | null = null;
 
-    // 3. Obtain Schema Conformance Evidence if available
-    let schemaEvidence = this.options.schemaEvidence;
-    if (!schemaEvidence && (this.options.apiKey || this.envVars.NOTION_API_KEY)) {
-      try {
-        const validator = new NotionSchemaValidator(this.options.apiKey || this.envVars.NOTION_API_KEY);
-        const introspection = await validator.runIntrospection(this.envVars, { treatAllAsExisting: true });
-        const missingPropertiesCount = Object.values(introspection.results).reduce(
-          (acc, r) => acc + r.properties.filter((p) => p.status === 'MISSING').length,
-          0,
-        );
-        const structuralMismatchesCount = Object.values(introspection.results).reduce(
-          (acc, r) =>
-            acc +
-            r.properties.filter((p) => p.status === 'TYPE_MISMATCH' || p.status === 'RENAME_TYPE_MISMATCH').length,
-          0,
-        );
-        schemaEvidence = {
-          totalDataSources: introspection.totalCanonical,
-          verifiedDataSources: introspection.verifiedCount,
-          missingPropertiesCount,
-          structuralMismatchesCount,
-        };
-      } catch {
-        // In unit tests or offline runs without network, schemaEvidence remains undefined
+    try {
+      activeDb = new Database(sourceSession.restoredDbPath, { readonly: true });
+      const sqliteAccounts = activeDb.prepare('SELECT * FROM accounts').all() as any[];
+      const sqliteTransactions = activeDb.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
+
+      // 3. Obtain Schema Conformance Evidence if available
+      let schemaEvidence = this.options.schemaEvidence;
+      if (!schemaEvidence && (this.options.apiKey || this.envVars.NOTION_API_KEY)) {
+        try {
+          const validator = new NotionSchemaValidator(this.options.apiKey || this.envVars.NOTION_API_KEY);
+          const introspection = await validator.runIntrospection(this.envVars, { treatAllAsExisting: true });
+          const missingPropertiesCount = Object.values(introspection.results).reduce(
+            (acc, r) => acc + r.properties.filter((p) => p.status === 'MISSING').length,
+            0,
+          );
+          const structuralMismatchesCount = Object.values(introspection.results).reduce(
+            (acc, r) =>
+              acc +
+              r.properties.filter((p) => p.status === 'TYPE_MISMATCH' || p.status === 'RENAME_TYPE_MISMATCH').length,
+            0,
+          );
+          schemaEvidence = {
+            totalDataSources: introspection.totalCanonical,
+            verifiedDataSources: introspection.verifiedCount,
+            missingPropertiesCount,
+            structuralMismatchesCount,
+          };
+        } catch {
+          // In unit tests or offline runs without network, schemaEvidence remains undefined
+        }
       }
-    }
 
-    // 3.5. Verify Snapshot Readiness (Fail-Closed, Real Decryption to Isolated Temp)
-    const targetManifestPath =
-      this.options.targetSnapshotManifestPath ??
-      this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
-      process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
+      // 3.5. Verify Target Snapshot Readiness (Fail-Closed, Real Decryption to Isolated Temp)
+      const targetManifestPath =
+        this.options.targetSnapshotManifestPath ??
+        this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
+        process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
 
-    if (!targetManifestPath) {
-      throw new Error(
-        'FAIL_CLOSED_TARGET_SNAPSHOT: Caminho do manifesto do snapshot alvo não informado nem configurado em NOTION_TARGET_SNAPSHOT_MANIFEST.',
-      );
-    }
-    if (!fs.existsSync(targetManifestPath)) {
-      throw new Error(
-        `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${targetManifestPath}'.`,
-      );
-    }
-
-    const sourceManifestPath =
-      this.options.sourceSnapshotManifestPath ??
-      this.envVars.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim() ??
-      process.env.SOURCE_SQLITE_SNAPSHOT_MANIFEST?.trim();
-
-    if (!sourceManifestPath) {
-      throw new Error(
-        'FAIL_CLOSED_SOURCE_SNAPSHOT: Caminho do manifesto do snapshot SQLite de origem não informado nem configurado em SOURCE_SQLITE_SNAPSHOT_MANIFEST.',
-      );
-    }
-    if (!fs.existsSync(sourceManifestPath)) {
-      throw new Error(
-        `FAIL_CLOSED_SOURCE_SNAPSHOT: Manifesto do snapshot SQLite de origem não encontrado em '${sourceManifestPath}'.`,
-      );
-    }
-
-    const targetSnapshotValidation = this.verifySnapshotReadiness();
-    const sourceSnapshotValidation = this.verifySourceSnapshotReadiness();
-
-    const snapshotValidation = {
-      ciphertextIntegrityValid: targetSnapshotValidation.ciphertextIntegrityValid,
-      manifestIntegrityValid: targetSnapshotValidation.manifestIntegrityValid,
-      manifestStructureAndHashReferencesValid: targetSnapshotValidation.manifestStructureAndHashReferencesValid,
-      plaintextRestoreVerified: targetSnapshotValidation.plaintextRestoreVerified,
-      sourceSnapshotCiphertextValid: sourceSnapshotValidation.sourceSnapshotCiphertextValid,
-      sourceSnapshotManifestValid: sourceSnapshotValidation.sourceSnapshotManifestValid,
-      sourceSnapshotRestoreVerified: sourceSnapshotValidation.sourceSnapshotRestoreVerified,
-      sourceSnapshotPlaintextSha256: sourceSnapshotValidation.sourceSnapshotPlaintextSha256,
-      sourceSnapshotEncryptedSha256: sourceSnapshotValidation.sourceSnapshotEncryptedSha256,
-      sourceSnapshotManifestPath: sourceManifestPath,
-    };
-
-    // 3.6. Resolve Planner Config (External config required, zero silent defaults)
-    let plannerConfig = this.options.plannerConfig;
-    if (!plannerConfig) {
-      try {
-        const resolved = resolvePlannerConfig(
-          undefined,
-          this.envVars,
+      if (!targetManifestPath) {
+        throw new Error(
+          'FAIL_CLOSED_TARGET_SNAPSHOT: Caminho do manifesto do snapshot alvo não informado nem configurado em NOTION_TARGET_SNAPSHOT_MANIFEST.',
         );
-        plannerConfig = resolved.effectiveConfig;
-      } catch {
-        // Will fail-closed inside planner if needed
       }
-    }
+      if (!fs.existsSync(targetManifestPath)) {
+        throw new Error(
+          `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${targetManifestPath}'.`,
+        );
+      }
 
-    // 4. Generate deterministic BackfillPlanArtifact and audits
-    const planner = new BackfillPlanner({ dbPath: this.dbPath, envVars: this.envVars });
-    const {
-      artifact: planArtifact,
-      transactionAudits,
-      cardBillAudits,
-      categoryReconciliations,
-      proposedDerivedUpdates,
-      paymentLegAudits,
-      incomingTransferAudits,
-      paymentEventAllocations,
-    } = planner.generateArtifact({
-      dbPath: this.dbPath,
-      envVars: this.envVars,
-      commitSha: this.options.commitSha,
-      targetSnapshotManifestPath: targetManifestPath,
+      const targetSnapshotValidation = this.verifySnapshotReadiness();
+
+      const snapshotValidation = {
+        ciphertextIntegrityValid: targetSnapshotValidation.ciphertextIntegrityValid,
+        manifestIntegrityValid: targetSnapshotValidation.manifestIntegrityValid,
+        manifestStructureAndHashReferencesValid: targetSnapshotValidation.manifestStructureAndHashReferencesValid,
+        plaintextRestoreVerified: targetSnapshotValidation.plaintextRestoreVerified,
+        sourceSnapshotCiphertextValid: true,
+        sourceSnapshotManifestValid: true,
+        sourceSnapshotRestoreVerified: true,
+        sourceSnapshotPlaintextSha256: sourceSession.plaintextSha256,
+        sourceSnapshotEncryptedSha256: sourceSession.ciphertextSha256,
+        sourceSnapshotManifestPath: sourceSession.manifestPath,
+      };
+
+      // 3.6. Resolve Planner Config (External config required, zero silent defaults)
+      let plannerConfig = this.options.plannerConfig;
+      if (!plannerConfig) {
+        try {
+          const resolved = resolvePlannerConfig(
+            undefined,
+            this.envVars,
+          );
+          plannerConfig = resolved.effectiveConfig;
+        } catch {
+          // Will fail-closed inside planner if needed
+        }
+      }
+
+      // 4. Generate deterministic BackfillPlanArtifact and audits
+      const planner = new BackfillPlanner({ dbPath: sourceSession.restoredDbPath, envVars: this.envVars });
+      const {
+        artifact: planArtifact,
+        transactionAudits,
+        cardBillAudits,
+        categoryReconciliations,
+        proposedDerivedUpdates,
+        paymentLegAudits,
+        incomingTransferAudits,
+        paymentEventAllocations,
+      } = planner.generateArtifact({
+        dbPath: sourceSession.restoredDbPath,
+        envVars: this.envVars,
+        commitSha: this.options.commitSha,
+        targetSnapshotManifestPath: targetManifestPath,
       targetNotionSnapshotHash: this.options.targetNotionSnapshotHash,
       plannerConfig,
       snapshotValidation,
@@ -786,85 +816,95 @@ export class BackfillDryRunAnalyzer {
     const totalRowsToUpdate = planArtifact.summary.executableUpdateCount;
     const totalRelationsToPopulate = planArtifact.summary.totalRelations;
 
-    return {
-      timestampIso,
-      sourceDatabase: path.resolve(process.cwd(), 'data', 'financial.db'),
-      totalSourceTransactions: sqliteTransactions.length,
-      totalSourceAccounts: sqliteAccounts.length,
-      basesAnalysis,
-      summary: {
-        totalRowsToCreate,
-        totalRowsToUpdate,
-        totalRelationsToPopulate,
-        totalDuplicates: 0,
-        totalAmbiguities: 0,
-      },
-      reconciliation: {
-        minDate,
-        maxDate,
-        countByMonth,
-        byNature,
-        byBudgetEffect,
-        checkingCashFlow: {
-          inflowsTotal: Math.round(checkingInflows * 100) / 100,
-          thirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
-          sameOwnershipInflows: Math.round(sameOwnershipInflows * 100) / 100,
-          directOutflows: Math.round(directCheckingExpenses * 100) / 100,
-          outgoingInternalTransfers: Math.round(outgoingInternalTransfers * 100) / 100,
-          cardBillSettlementOutflows: Math.round(cardBillSettlementOutflows * 100) / 100,
-          pendingOutflows: Math.round(pendingOutflows * 100) / 100,
-          totalOutflows: Math.round(totalCheckingOutflows * 100) / 100,
-          netCashFlow: Math.round(netCheckingCashFlow * 100) / 100,
+      return {
+        timestampIso,
+        sourceDatabase: sourceSession.restoredDbPath,
+        totalSourceTransactions: sqliteTransactions.length,
+        totalSourceAccounts: sqliteAccounts.length,
+        basesAnalysis,
+        summary: {
+          totalRowsToCreate,
+          totalRowsToUpdate,
+          totalRelationsToPopulate,
+          totalDuplicates: 0,
+          totalAmbiguities: 0,
         },
-        cardLiability: {
-          totalPurchases: Math.round(totalPurchasesAmount * 100) / 100,
-          purchasesCount: cardPurchases.length,
-          paymentsCreditsRecorded: Math.round(totalPaymentsAmount * 100) / 100,
-          paymentsCreditsCount: cardPayments.length,
+        reconciliation: {
+          minDate,
+          maxDate,
+          countByMonth,
+          byNature,
+          byBudgetEffect,
+          checkingCashFlow: {
+            inflowsTotal: Math.round(checkingInflows * 100) / 100,
+            thirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
+            sameOwnershipInflows: Math.round(sameOwnershipInflows * 100) / 100,
+            directOutflows: Math.round(directCheckingExpenses * 100) / 100,
+            outgoingInternalTransfers: Math.round(outgoingInternalTransfers * 100) / 100,
+            cardBillSettlementOutflows: Math.round(cardBillSettlementOutflows * 100) / 100,
+            pendingOutflows: Math.round(pendingOutflows * 100) / 100,
+            totalOutflows: Math.round(totalCheckingOutflows * 100) / 100,
+            netCashFlow: Math.round(netCheckingCashFlow * 100) / 100,
+          },
+          cardLiability: {
+            totalPurchases: Math.round(totalPurchasesAmount * 100) / 100,
+            purchasesCount: cardPurchases.length,
+            paymentsCreditsRecorded: Math.round(totalPaymentsAmount * 100) / 100,
+            paymentsCreditsCount: cardPayments.length,
+          },
+          economicConsumption: {
+            directCheckingExpenses: Math.round(directCheckingExpenses * 100) / 100,
+            cardPurchases: Math.round(totalPurchasesAmount * 100) / 100,
+            totalEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
+            confirmedEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
+            pendingEconomicOutflows: Math.round(pendingOutflows * 100) / 100,
+            physicalCashOutflows: Math.round(totalCheckingOutflows * 100) / 100,
+            economicIncome: confirmedEconomicIncome,
+            pendingThirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
+            neutralSettlements: Math.round(cardBillSettlementOutflows * 100) / 100,
+            neutralTransfers: Math.round((sameOwnershipInflows + outgoingInternalTransfers) * 100) / 100,
+          },
+          paymentAuditSummary: {
+            totalPaymentOccurrences: bankPaymentTxs.length + cardPayments.length,
+            bankCashLegs: bankPaymentTxs.length,
+            cardLiabilityLegs: paymentLegAudits.filter((l) => l.role === 'CARD_LIABILITY_LEG').length,
+            unpairedPayments: paymentLegAudits.filter((l) => l.role === 'UNPAIRED_PAYMENT').length,
+            totalBankCashPaid: Math.round(cardBillSettlementOutflows * 100) / 100,
+          },
+          inflowsAuditSummary: {
+            totalInflows: checkingInflows > 0 ? checkingTxs.filter((t) => Number(t.amount) > 0).length : 0,
+            sameOwnershipInflowsCount: incomingTransferAudits.filter((t) => t.counterpartyType === 'SAME_OWNERSHIP_TRANSFER').length,
+            thirdPartyInflowsCount: incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length,
+            unprovedThirdPartyRevenueTotal: Math.round(thirdPartyInflows * 100) / 100,
+          },
+          discrepancy: 0,
+          creditCardPurchasesTotal: Math.round(totalPurchasesAmount * 100) / 100,
+          cardBillsCount: cardBillAudits.length,
         },
-        economicConsumption: {
-          directCheckingExpenses: Math.round(directCheckingExpenses * 100) / 100,
-          cardPurchases: Math.round(totalPurchasesAmount * 100) / 100,
-          totalEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
-          confirmedEconomicExpenses: Math.round(totalEconomicExpenses * 100) / 100,
-          pendingEconomicOutflows: Math.round(pendingOutflows * 100) / 100,
-          physicalCashOutflows: Math.round(totalCheckingOutflows * 100) / 100,
-          economicIncome: confirmedEconomicIncome,
-          pendingThirdPartyInflows: Math.round(thirdPartyInflows * 100) / 100,
-          neutralSettlements: Math.round(cardBillSettlementOutflows * 100) / 100,
-          neutralTransfers: Math.round((sameOwnershipInflows + outgoingInternalTransfers) * 100) / 100,
+        identityStrategy: {
+          countWithSourceId,
+          countWithFallback,
+          collisionsFound,
+          potentialCollisions: 0,
         },
-        paymentAuditSummary: {
-          totalPaymentOccurrences: bankPaymentTxs.length + cardPayments.length,
-          bankCashLegs: bankPaymentTxs.length,
-          cardLiabilityLegs: paymentLegAudits.filter((l) => l.role === 'CARD_LIABILITY_LEG').length,
-          unpairedPayments: paymentLegAudits.filter((l) => l.role === 'UNPAIRED_PAYMENT').length,
-          totalBankCashPaid: Math.round(cardBillSettlementOutflows * 100) / 100,
-        },
-        inflowsAuditSummary: {
-          totalInflows: checkingInflows > 0 ? checkingTxs.filter((t) => Number(t.amount) > 0).length : 0,
-          sameOwnershipInflowsCount: incomingTransferAudits.filter((t) => t.counterpartyType === 'SAME_OWNERSHIP_TRANSFER').length,
-          thirdPartyInflowsCount: incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length,
-          unprovedThirdPartyRevenueTotal: Math.round(thirdPartyInflows * 100) / 100,
-        },
-        discrepancy: 0,
-        creditCardPurchasesTotal: Math.round(totalPurchasesAmount * 100) / 100,
-        cardBillsCount: cardBillAudits.length,
-      },
-      identityStrategy: {
-        countWithSourceId,
-        countWithFallback,
-        collisionsFound,
-        potentialCollisions: 0,
-      },
-      planArtifact,
-      transactionAudits,
-      cardBillAudits,
-      categoryReconciliations,
-      proposedDerivedUpdates,
-      paymentLegAudits,
-      incomingTransferAudits,
-      paymentEventAllocations,
-    };
+        planArtifact,
+        transactionAudits,
+        cardBillAudits,
+        categoryReconciliations,
+        proposedDerivedUpdates,
+        paymentLegAudits,
+        incomingTransferAudits,
+        paymentEventAllocations,
+      };
+    } finally {
+      if (activeDb) {
+        try {
+          activeDb.close();
+        } catch {
+          // ignore
+        }
+      }
+      sourceSession.cleanup();
+    }
   }
 }
