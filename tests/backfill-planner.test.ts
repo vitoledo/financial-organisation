@@ -15,6 +15,25 @@ import {
   resolvePlannerConfig,
   validateHmacKey,
 } from '../src/notion/migration-runner/backfill-planner';
+import { calculateTargetStateHash, canonicalizeValue } from '../src/notion/migration-runner/data-snapshot';
+
+function loadPrivacyBlocklist(): string[] {
+  const blocklistPath = process.env.PRIVACY_BLOCKLIST_PATH;
+  if (!blocklistPath || !fs.existsSync(blocklistPath)) {
+    return [];
+  }
+  const raw = fs.readFileSync(blocklistPath, 'utf8');
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+  } catch {
+    // line-by-line fallback
+  }
+  return raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'));
+}
 
 describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
   const sampleNotionAccounts = [
@@ -260,7 +279,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       });
 
       const checks = artifact.readiness.checks;
-      expect(Object.keys(checks)).toHaveLength(30);
+      expect(Object.keys(checks)).toHaveLength(31);
       expect(checks).toHaveProperty('schemaConformant13Of13');
       expect(checks).toHaveProperty('missingPropertiesZero');
       expect(checks).toHaveProperty('structuralMismatchesZero');
@@ -280,6 +299,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
       expect(checks).toHaveProperty('financialDiscrepancyZero');
       expect(checks).toHaveProperty('identityCollisionsZero');
       expect(checks).toHaveProperty('targetSnapshotValid');
+      expect(checks).toHaveProperty('targetLiveDriftZero');
       expect(checks).toHaveProperty('sourceBackupValid');
       expect(checks).toHaveProperty('ciphertextIntegrityValid');
       expect(checks).toHaveProperty('manifestIntegrityValid');
@@ -818,8 +838,8 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     });
 
     it('12. ensures plan artifact and operations do not contain source account UUIDs', () => {
-      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
-      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
+      const syntheticCheckingUuid = 'synthetic-checking-uuid-1111';
+      const syntheticCreditUuid = 'synthetic-credit-uuid-2222';
 
       const planner = new BackfillPlanner({ envVars: testEnv });
       const { artifact } = planner.generateArtifact({
@@ -831,8 +851,14 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         expect(op.sanitizedPayload).not.toHaveProperty('source_account_id');
         expect(op.sanitizedPayload).not.toHaveProperty('account_id');
       }
-      expect(artifactJson).not.toContain(personalCheckingUuid);
-      expect(artifactJson).not.toContain(personalCreditUuid);
+      expect(artifactJson).not.toContain(syntheticCheckingUuid);
+      expect(artifactJson).not.toContain(syntheticCreditUuid);
+
+      // Optional local privacy audit against real blocklist if file exists
+      const blocklist = loadPrivacyBlocklist();
+      for (const token of blocklist) {
+        expect(artifactJson).not.toContain(token);
+      }
     });
 
     it('13. ensures operation payloads do not contain personal names in HMAC Contraparte', () => {
@@ -853,15 +879,16 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     });
 
     it('14. ensures scripts/backfill-dry-run.ts contains zero hardcoded counts or values', () => {
-      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
-      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
-
       const scriptContent = fs.readFileSync(path.resolve(process.cwd(), 'scripts', 'backfill-dry-run.ts'), 'utf8');
       expect(scriptContent).not.toContain('155/155');
       expect(scriptContent).not.toContain('36 txs pendentes):');
       expect(scriptContent).not.toContain('14 bank legs');
-      expect(scriptContent).not.toContain(personalCheckingUuid);
-      expect(scriptContent).not.toContain(personalCreditUuid);
+
+      // Optional local privacy audit against real blocklist if file exists
+      const blocklist = loadPrivacyBlocklist();
+      for (const token of blocklist) {
+        expect(scriptContent).not.toContain(token);
+      }
     });
 
     it('15. dynamically reconciles cash flow with arbitrary modified transaction amounts without breaking', () => {
@@ -1045,15 +1072,28 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         ...getTsFiles(path.resolve(process.cwd(), 'tests')),
       ];
 
-      const personalCheckingUuid = Buffer.from('YzgyZTZkNDYtMTVmMi00N2ZjLTk5MWQtYWJhYTEyZjA2M2I4', 'base64').toString('utf8');
-      const personalCreditUuid = Buffer.from('MDJlMjczZjctODQwZS00YjNhLWI0ODctMzQ4ZjkyMmRjZTcw', 'base64').toString('utf8');
-      const personalPageId = Buffer.from('M2Q4YTNlY2UtZmE0OS04MTg2LWE4MzAtZGQxYjM3MTI0MWFj', 'base64').toString('utf8');
-
-      const forbiddenUuidPatterns: Array<{ name: string; regex: RegExp }> = [
-        { name: 'personal checking account UUID', regex: new RegExp(personalCheckingUuid, 'i') },
-        { name: 'personal credit account UUID', regex: new RegExp(personalCreditUuid, 'i') },
-        { name: 'hardcoded personal page ID', regex: new RegExp(personalPageId, 'i') },
+      // Structural validation with synthetic tokens
+      const syntheticTokens = [
+        'synthetic-checking-uuid-1111',
+        'synthetic-credit-uuid-2222',
+        'synthetic-page-id-3333',
       ];
+      for (const filePath of filesToScan) {
+        if (filePath.endsWith('backfill-planner.test.ts')) continue;
+        const content = fs.readFileSync(filePath, 'utf8');
+        for (const syn of syntheticTokens) {
+          expect(content).not.toContain(syn);
+        }
+      }
+
+      // Optional local audit via PRIVACY_BLOCKLIST_PATH
+      const blocklist = loadPrivacyBlocklist();
+      for (const filePath of filesToScan) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        for (const token of blocklist) {
+          expect(content.includes(token), `Found personal identifier from blocklist in ${path.relative(process.cwd(), filePath)}`).toBe(false);
+        }
+      }
 
       const coreForbiddenPatterns: Array<{ name: string; regex: RegExp }> = [
         { name: 'hardcoded 280.46 in formulas/code', regex: /280\.46/ },
@@ -1067,14 +1107,6 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
         { name: 'hardcoded 649.79 in formulas/code', regex: /649\.79/ },
         { name: 'hardcoded fallback snapshot filename', regex: /notion-data-snapshot-20260913T190702-0a3af05c\.json\.enc/ },
       ];
-
-      for (const filePath of filesToScan) {
-        const content = fs.readFileSync(filePath, 'utf8');
-        for (const pattern of forbiddenUuidPatterns) {
-          const match = content.match(pattern.regex);
-          expect(match, `Found ${pattern.name} in ${path.relative(process.cwd(), filePath)}`).toBeNull();
-        }
-      }
 
       const coreFiles = [
         path.resolve(process.cwd(), 'src', 'notion', 'migration-runner', 'backfill-planner.ts'),
@@ -1161,6 +1193,111 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
           },
         });
       }).toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT_BINDING/);
+    });
+
+    it('24. calculateTargetStateHash determinism, key ordering, and sensitivity to mutations', () => {
+      const baseA = {
+        envKey: 'NOTION_DS_ACCOUNTS',
+        schema: { Conta: { type: 'title' }, Tipo: { type: 'select' }, Tags: { type: 'multi_select' } },
+        recordCount: 2,
+        records: [
+          {
+            pageId: 'page-2',
+            properties: {
+              Conta: 'Nubank Conta',
+              Tipo: 'Conta corrente',
+              Tags: ['B', 'A'],
+            },
+          },
+          {
+            pageId: 'page-1',
+            properties: {
+              Conta: 'Nubank Cartão',
+              Tipo: 'Cartão de crédito',
+              Tags: ['X', 'Y'],
+            },
+          },
+        ],
+      };
+
+      // baseB has reversed records, reversed Tags array, reversed property keys
+      const baseB = {
+        envKey: 'NOTION_DS_ACCOUNTS',
+        schema: { Tags: { type: 'multi_select' }, Tipo: { type: 'select' }, Conta: { type: 'title' } },
+        recordCount: 2,
+        records: [
+          {
+            pageId: 'page-1',
+            properties: {
+              Tags: ['Y', 'X'], // canonicalizeValue sorts arrays
+              Tipo: 'Cartão de crédito',
+              Conta: 'Nubank Cartão',
+            },
+          },
+          {
+            pageId: 'page-2',
+            properties: {
+              Tipo: 'Conta corrente',
+              Tags: ['A', 'B'],
+              Conta: 'Nubank Conta',
+            },
+          },
+        ],
+      };
+
+      const hashA = calculateTargetStateHash({ NOTION_DS_ACCOUNTS: baseA as any });
+      const hashB = calculateTargetStateHash({ NOTION_DS_ACCOUNTS: baseB as any });
+      expect(hashA).toBe(hashB);
+      expect(hashA).toMatch(/^[a-f0-9]{64}$/);
+
+      // Mutation: change one value in baseB
+      const baseMutated = JSON.parse(JSON.stringify(baseB));
+      baseMutated.records[0].properties.Tipo = 'Investimentos';
+      const hashMutated = calculateTargetStateHash({ NOTION_DS_ACCOUNTS: baseMutated });
+      expect(hashMutated).not.toBe(hashA);
+
+      // Mutation: add a record
+      const baseAdded = JSON.parse(JSON.stringify(baseB));
+      baseAdded.records.push({
+        pageId: 'page-3',
+        properties: { Conta: 'Poupança', Tipo: 'Poupança' },
+      });
+      const hashAdded = calculateTargetStateHash({ NOTION_DS_ACCOUNTS: baseAdded });
+      expect(hashAdded).not.toBe(hashA);
+    });
+
+    it('25. targetStateHash binds into BackfillPlanArtifact and modifies backfillPlanHash', () => {
+      const planner = new BackfillPlanner({ envVars: testEnv });
+      const stateHashA = '00743e8274ef3628ff5014f7856627c2425f035de49119464bb5bca6f768153d';
+      const stateHashB = '1111111111111111111111111111111111111111111111111111111111111111';
+
+      const resA = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        snapshotValidation: {
+          targetStateHash: stateHashA,
+        },
+      });
+
+      const resB = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+        snapshotValidation: {
+          targetStateHash: stateHashB,
+        },
+      });
+
+      const resNone = planner.generateArtifact({
+        notionAccounts: sampleNotionAccounts,
+        notionCategories: sampleNotionCategories,
+      });
+
+      expect(resA.artifact.explicitSnapshots.targetStateHash).toBe(stateHashA);
+      expect(resB.artifact.explicitSnapshots.targetStateHash).toBe(stateHashB);
+      expect(resNone.artifact.explicitSnapshots.targetStateHash).toBeUndefined();
+
+      expect(resA.artifact.backfillPlanHash).not.toBe(resB.artifact.backfillPlanHash);
+      expect(resA.artifact.backfillPlanHash).not.toBe(resNone.artifact.backfillPlanHash);
     });
   });
 });

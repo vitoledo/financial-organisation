@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
 import { BackfillPlanner } from '../src/notion/migration-runner/backfill-planner';
@@ -265,33 +268,114 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT/);
   });
 
-  it('guarantees zero drift: mutating data/financial.db does not alter dry-run report because it strictly reads the snapshot', async () => {
+  it('guarantees source isolation: mutating a copy of SQLite DB and passing as dbPath does not alter dry-run report because it strictly reads the snapshot', async () => {
     const analyzer = new BackfillDryRunAnalyzer({
       client: fakeClient,
       envVars: testEnv,
     });
     const baselineReport = await analyzer.runAnalysis();
 
-    // Temporarily insert a row into data/financial.db
-    const liveDbPath = path.resolve(process.cwd(), 'data', 'financial.db');
-    const liveDb = new Database(liveDbPath);
-    const existingAcc = (liveDb.prepare('SELECT id FROM accounts LIMIT 1').get() as any)?.id;
+    // Create copy in tempDir, mutate only copy B, point options.dbPath to it
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-dryrun-isolation-'));
+    const copyDbPath = path.join(tempDir, 'financial-copy.db');
+    fs.copyFileSync(path.resolve(process.cwd(), 'data', 'financial.db'), copyDbPath);
+
+    const copyDb = new Database(copyDbPath);
+    const existingAcc = (copyDb.prepare('SELECT id FROM accounts LIMIT 1').get() as any)?.id;
     const tempTxId = 'drift-test-temp-tx-' + Date.now();
     try {
-      liveDb
+      copyDb
         .prepare(
           "INSERT INTO transactions (id, account_id, date, amount, original_amount, direction, description, account_type) VALUES (?, ?, '2026-09-01', -100.0, -100.0, 'OUTFLOW', 'Drift test tx', 'BANK')",
         )
         .run(tempTxId, existingAcc);
+      copyDb.close();
 
-      // Run dry-run again
-      const driftedReport = await analyzer.runAnalysis();
+      // Pass dbPath pointing to the mutated copy B
+      const driftedAnalyzer = new BackfillDryRunAnalyzer({
+        client: fakeClient,
+        envVars: testEnv,
+        dbPath: copyDbPath,
+      });
+      const driftedReport = await driftedAnalyzer.runAnalysis();
+
       expect(driftedReport.totalSourceTransactions).toBe(155);
       expect(driftedReport.planArtifact.backfillPlanHash).toBe(baselineReport.planArtifact.backfillPlanHash);
       expect(driftedReport.totalSourceTransactions).toBe(baselineReport.totalSourceTransactions);
     } finally {
-      liveDb.prepare('DELETE FROM transactions WHERE id = ?').run(tempTxId);
-      liveDb.close();
+      try {
+        if (fs.existsSync(copyDbPath)) fs.unlinkSync(copyDbPath);
+        if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
     }
+  });
+
+  it('certifies data/financial.db is never mutated or written to during test runs', async () => {
+    const liveDbPath = path.resolve(process.cwd(), 'data', 'financial.db');
+    if (!fs.existsSync(liveDbPath)) return;
+    const initialStats = fs.statSync(liveDbPath);
+    const initialHash = crypto.createHash('sha256').update(fs.readFileSync(liveDbPath)).digest('hex');
+
+    // Run analyzer
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+    });
+    await analyzer.runAnalysis();
+
+    const currentStats = fs.statSync(liveDbPath);
+    const currentHash = crypto.createHash('sha256').update(fs.readFileSync(liveDbPath)).digest('hex');
+
+    expect(currentStats.mtimeMs).toBe(initialStats.mtimeMs);
+    expect(currentHash).toBe(initialHash);
+  });
+
+  it('detects target live drift when live Notion differs from frozen snapshot (negative proof)', async () => {
+    const analyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+    });
+    // Decrypt snapshot to get canonical baseline bases
+    const targetSession = analyzer.prepareValidatedTargetSnapshot();
+    const baselineBases = targetSession.payload.bases;
+    targetSession.cleanup();
+
+    // 1. When liveBases matches frozen snapshot exactly:
+    const matchedAnalyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+      liveBases: baselineBases,
+    });
+    const matchedReport = await matchedAnalyzer.runAnalysis();
+    expect(matchedReport.targetDriftReport).toBeDefined();
+    expect(matchedReport.targetDriftReport?.driftDetected).toBe(false);
+    expect(matchedReport.targetDriftReport?.differences).toHaveLength(0);
+    expect(matchedReport.planArtifact.readiness.checks.targetLiveDriftZero).toBe(true);
+
+    // 2. When liveBases B has drift (e.g. modified property):
+    const driftedBases = JSON.parse(JSON.stringify(baselineBases));
+    const firstBaseKey = Object.keys(driftedBases)[0];
+    driftedBases[firstBaseKey].records[0].properties['MockDriftProp'] = 'DriftValue';
+
+    const driftedAnalyzer = new BackfillDryRunAnalyzer({
+      client: fakeClient,
+      envVars: testEnv,
+      liveBases: driftedBases,
+    });
+    const driftedReport = await driftedAnalyzer.runAnalysis();
+
+    expect(driftedReport.targetDriftReport).toBeDefined();
+    expect(driftedReport.targetDriftReport?.driftDetected).toBe(true);
+    expect(driftedReport.targetDriftReport?.differences.length).toBeGreaterThan(0);
+    expect(driftedReport.planArtifact.readiness.checks.targetLiveDriftZero).toBe(false);
+    expect(driftedReport.planArtifact.readiness.blockers).toContain(
+      'TARGET_DRIFT_DETECTED: Divergência detectada entre o estado live do Notion e o snapshot congelado.',
+    );
+
+    // CRITICAL: Operations must still be produced strictly from snapshot A!
+    expect(driftedReport.planArtifact.operations).toEqual(matchedReport.planArtifact.operations);
+    expect(driftedReport.planArtifact.backfillPlanHash).toBe(matchedReport.planArtifact.backfillPlanHash);
+    expect(driftedReport.planArtifact.summary.totalOperations).toBe(159);
+    expect(driftedReport.summary.totalRowsToCreate).toBe(159);
   });
 });

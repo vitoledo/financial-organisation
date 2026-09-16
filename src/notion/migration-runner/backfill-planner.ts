@@ -213,6 +213,8 @@ export interface BackfillPlanGeneratorOptions {
   commitSha?: string;
   sourceSnapshotHash?: string;
   targetNotionSnapshotHash?: string;
+  targetStateHash?: string;
+  targetLiveDriftZero?: boolean;
   targetSnapshotManifestPath?: string;
   upstreamBillEnrichmentHash?: string;
   plannerConfig?: BackfillPlannerConfig;
@@ -221,6 +223,9 @@ export interface BackfillPlanGeneratorOptions {
     manifestIntegrityValid?: boolean;
     manifestStructureAndHashReferencesValid?: boolean;
     plaintextRestoreVerified?: boolean;
+    targetStateHash?: string;
+    frozenTargetStateHash?: string;
+    targetLiveDriftZero?: boolean;
     sourceSnapshotCiphertextValid?: boolean;
     sourceSnapshotManifestValid?: boolean;
     sourceSnapshotRestoreVerified?: boolean;
@@ -235,6 +240,7 @@ export interface BackfillPlanGeneratorOptions {
   _mockExpectedEconomicExpenses?: number;
   _forceIrreproducibleHash?: boolean;
 }
+
 
 /**
  * Validates each operation payload and relations strictly against TARGET_CONTRACT schema.
@@ -527,6 +533,11 @@ export class BackfillPlanner {
         `CORRUPTED_SNAPSHOT: Hash original do snapshot fornecido nas opções (${options.targetNotionSnapshotHash}) diverge do manifesto (${targetNotionSnapshotHash}).`,
       );
     }
+    const targetStateHash =
+      options.targetStateHash ??
+      options.snapshotValidation?.targetStateHash ??
+      options.snapshotValidation?.frozenTargetStateHash ??
+      '';
 
     // 4. Data Source IDs (FAIL-CLOSED: NO SILENT FALLBACKS)
     const accountsDsId = this.envVars.NOTION_DS_ACCOUNTS?.trim();
@@ -1669,6 +1680,7 @@ export class BackfillPlanner {
       commitSha,
       sourceSnapshotHash,
       targetNotionSnapshotHash,
+      targetStateHash,
       upstreamBillEnrichmentHash: options.upstreamBillEnrichmentHash || null,
       plannerConfigHash: calculateSemanticConfigHash(effectiveConfig),
       operations: operations.map((op) => ({
@@ -1772,6 +1784,13 @@ export class BackfillPlanner {
     const sourceSnapshotRestoreVerified = Boolean(options.snapshotValidation?.sourceSnapshotRestoreVerified);
 
     const targetSnapshotValid = Boolean(targetNotionSnapshotHash && targetNotionSnapshotHash.length === 64);
+    const targetLiveDriftZero = Boolean(
+      options.targetLiveDriftZero !== undefined
+        ? options.targetLiveDriftZero
+        : options.snapshotValidation?.targetLiveDriftZero !== undefined
+        ? options.snapshotValidation.targetLiveDriftZero
+        : false,
+    );
     const sourceBackupValid = Boolean(
       sourceSnapshotHash &&
       sourceSnapshotHash.length === 64 &&
@@ -1779,6 +1798,7 @@ export class BackfillPlanner {
       sourceSnapshotManifestValid &&
       sourceSnapshotRestoreVerified,
     );
+
 
     // Dynamic Financial Discrepancy & Cash Flow Reconciliation
     const roundedDirectChecking = Math.round(confirmedDirectCheckingExpenses * 100) / 100;
@@ -1862,6 +1882,7 @@ export class BackfillPlanner {
       financialDiscrepancyZero,
       identityCollisionsZero,
       targetSnapshotValid,
+      targetLiveDriftZero,
       sourceBackupValid,
       ciphertextIntegrityValid,
       manifestIntegrityValid,
@@ -1930,6 +1951,9 @@ export class BackfillPlanner {
     if (!checks.plaintextRestoreVerified) {
       blockers.push('SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot para texto plano não verificada.');
     }
+    if (!checks.targetLiveDriftZero) {
+      blockers.push('TARGET_DRIFT_DETECTED: Divergência detectada entre o estado live do Notion e o snapshot congelado.');
+    }
     if (!checks.sourceSnapshotCiphertextValid) {
       blockers.push('SOURCE_SNAPSHOT_CIPHERTEXT_INVALID: Falha na integridade do arquivo cifrado do snapshot SQLite de origem.');
     }
@@ -1939,6 +1963,7 @@ export class BackfillPlanner {
     if (!checks.sourceSnapshotRestoreVerified) {
       blockers.push('SOURCE_SNAPSHOT_RESTORE_UNVERIFIED: Restauração do snapshot SQLite de origem não verificada via AES-256-GCM.');
     }
+
     if (!checks.cashFlowReconciliationZero) {
       blockers.push('CASH_FLOW_DISCREPANCY: Discrepância na reconciliação de fluxo de caixa físico.');
     }
@@ -1996,6 +2021,7 @@ export class BackfillPlanner {
         sourceSnapshotPlaintextSha256: options.snapshotValidation?.sourceSnapshotPlaintextSha256,
         targetNotionManifestPath: targetManifestPath as string,
         targetNotionSnapshotSha256: targetNotionSnapshotHash as string,
+        targetStateHash: targetStateHash || undefined,
       },
       executionPlan: {
         stage1CreationsCount: executableCreateCount,

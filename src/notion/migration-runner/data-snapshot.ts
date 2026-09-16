@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
+import { parseKey32Bytes } from './backup';
 
 const MAGIC_HEADER = Buffer.from('FIN_ENC_V1');
 const IV_LENGTH = 12;
@@ -106,22 +107,9 @@ export class NotionLiveDataSnapshotManager {
 
   private deriveKey(key?: string): Buffer {
     const rawKey = key ?? this.backupKey ?? this.envVars.MIGRATION_BACKUP_KEY?.trim();
-    if (!rawKey) {
-      throw new Error('Chave de backup ausente. Configure MIGRATION_BACKUP_KEY.');
-    }
-
-    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-      const buf = Buffer.from(rawKey, 'hex');
-      if (buf.length === 32) return buf;
-    }
-
-    if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
-      const decoded = Buffer.from(rawKey, 'base64');
-      if (decoded.length === 32) return decoded;
-    }
-
-    throw new Error('Chave MIGRATION_BACKUP_KEY inválida: exigidos 32 bytes em 64-hex ou Base64.');
+    return parseKey32Bytes(rawKey, 'MIGRATION_BACKUP_KEY');
   }
+
 
   private sanitizeProperty(prop: any): any {
     if (!prop || typeof prop !== 'object') return prop;
@@ -487,4 +475,133 @@ export class NotionLiveDataSnapshotManager {
     const parsed = JSON.parse(decrypted.toString('utf8'));
     return parsed.snapshotType === 'NOTION_LIVE_DATA_SNAPSHOT' && parsed.totalBases === 13;
   }
+}
+
+/**
+ * Deterministically canonicalizes arbitrary values (objects sorted by keys, string arrays sorted).
+ * Excludes non-semantic metadata.
+ */
+export function canonicalizeValue(val: any): any {
+  if (val === null || val === undefined) return null;
+  if (Array.isArray(val)) {
+    const mapped = val.map(canonicalizeValue);
+    if (mapped.every((item) => typeof item === 'string')) {
+      return [...mapped].sort();
+    }
+    return mapped;
+  }
+  if (typeof val === 'object') {
+    const sortedObj: Record<string, any> = {};
+    for (const k of Object.keys(val).sort()) {
+      sortedObj[k] = canonicalizeValue(val[k]);
+    }
+    return sortedObj;
+  }
+  return val;
+}
+
+/**
+ * Computes canonical deterministic SHA-256 target state hash across all bases.
+ * Canonical deterministic sorting: envKey -> pageId -> property name -> relation IDs.
+ * Non-semantic capture metadata (timestamps, urls) is strictly excluded.
+ */
+export function calculateTargetStateHash(bases: Record<string, BaseSnapshotData>): string {
+  const sortedEnvKeys = Object.keys(bases).sort();
+  const canonicalBases: any[] = [];
+
+  for (const envKey of sortedEnvKeys) {
+    const base = bases[envKey];
+    const records = [...(base?.records || [])].sort((a, b) => {
+      const idA = (a.id || (a as any).pageId || '').toString();
+      const idB = (b.id || (b as any).pageId || '').toString();
+      return idA.localeCompare(idB);
+    });
+
+    const canonicalRecords = records.map((rec) => {
+      const sortedProps: Record<string, any> = {};
+      for (const propKey of Object.keys(rec.properties || {}).sort()) {
+        sortedProps[propKey] = canonicalizeValue(rec.properties[propKey]);
+      }
+      return {
+        pageId: (rec.id || (rec as any).pageId || '').toString(),
+        archived: Boolean(rec.archived),
+        properties: sortedProps,
+      };
+    });
+
+    canonicalBases.push({
+      envKey,
+      dataSourceId: base?.dataSourceId || '',
+      records: canonicalRecords,
+    });
+  }
+
+  const preimage = JSON.stringify(canonicalBases);
+  return crypto.createHash('sha256').update(preimage).digest('hex');
+}
+
+/**
+ * Extracts Notion accounts format required by BackfillPlanner directly from snapshot records.
+ */
+export function extractNotionAccountsFromSnapshot(records: NotionPageRecord[]): any[] {
+  return (records || []).map((p) => {
+    let name = '';
+    if (typeof p.properties['Conta'] === 'string') {
+      name = p.properties['Conta'].trim();
+    } else if (typeof p.properties['Nome da Conta'] === 'string') {
+      name = p.properties['Nome da Conta'].trim();
+    } else if (Array.isArray(p.properties['Conta']?.title)) {
+      name = p.properties['Conta'].title.map((t: any) => t.plain_text || '').join('').trim();
+    } else if (Array.isArray(p.properties['Nome da Conta']?.title)) {
+      name = p.properties['Nome da Conta'].title.map((t: any) => t.plain_text || '').join('').trim();
+    }
+    const type = typeof p.properties['Tipo'] === 'object' && p.properties['Tipo']?.select?.name
+      ? p.properties['Tipo'].select.name
+      : p.properties['Tipo'];
+    const creditLimit = typeof p.properties['Limite contratado'] === 'object'
+      ? p.properties['Limite contratado']?.number
+      : p.properties['Limite contratado'];
+    const customLimit = typeof p.properties['Limite personalizado'] === 'object'
+      ? p.properties['Limite personalizado']?.number
+      : p.properties['Limite personalizado'];
+    const availableLimit = typeof p.properties['Limite disponível'] === 'object'
+      ? p.properties['Limite disponível']?.number
+      : p.properties['Limite disponível'];
+
+    return {
+      id: p.id,
+      name,
+      type,
+      creditLimit,
+      customLimit,
+      availableLimit,
+    };
+  });
+}
+
+/**
+ * Extracts Notion categories format required by BackfillPlanner directly from snapshot records.
+ */
+export function extractNotionCategoriesFromSnapshot(records: NotionPageRecord[]): any[] {
+  return (records || []).map((p) => {
+    let name = '';
+    if (typeof p.properties['Categoria'] === 'string') {
+      name = p.properties['Categoria'].trim();
+    } else if (typeof p.properties['Nome da Categoria'] === 'string') {
+      name = p.properties['Nome da Categoria'].trim();
+    } else if (Array.isArray(p.properties['Categoria']?.title)) {
+      name = p.properties['Categoria'].title.map((t: any) => t.plain_text || '').join('').trim();
+    } else if (Array.isArray(p.properties['Nome da Categoria']?.title)) {
+      name = p.properties['Nome da Categoria'].title.map((t: any) => t.plain_text || '').join('').trim();
+    }
+    const group = typeof p.properties['Grupo'] === 'object' && p.properties['Grupo']?.select?.name
+      ? p.properties['Grupo'].select.name
+      : p.properties['Grupo'];
+
+    return {
+      id: p.id,
+      name,
+      group,
+    };
+  });
 }

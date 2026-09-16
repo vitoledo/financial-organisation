@@ -7,7 +7,7 @@ dotenv.config();
 
 async function main() {
   console.log('═══════════════════════════════════════════════════════════════════════════════');
-  console.log('  FASE 2A.6: BINDING CRIPTOGRÁFICO FINAL DO SOURCE SNAPSHOT');
+  console.log('  FASE 2A.7: BINDING FINAL DO TARGET SNAPSHOT E ISOLAMENTO ABSOLUTO');
   console.log('             (MODO ESTRITAMENTE READ-ONLY — ZERO ESCRITAS NO NOTION)');
   console.log('═══════════════════════════════════════════════════════════════════════════════\n');
 
@@ -257,6 +257,11 @@ async function main() {
   }
   console.log(`  • Target Notion Manifest: ${p.explicitSnapshots.targetNotionManifestPath}`);
   console.log(`  • Target Notion Snapshot SHA-256: ${p.explicitSnapshots.targetNotionSnapshotSha256}`);
+  console.log(`  • Target State Hash (Frozen Snapshot): ${p.explicitSnapshots.targetStateHash}`);
+  if (report.targetDriftReport) {
+    console.log(`  • Target State Hash (Live Notion): ${report.targetDriftReport.liveTargetStateHash}`);
+    console.log(`  • Target Live Drift Status: ${p.readiness.checks.targetLiveDriftZero ? 'ZERO DRIFT DETECTADO (100% IDÊNTICO)' : `${report.targetDriftReport.differences.length} DIFERENÇA(S) DETECTADA(S)`}`);
+  }
   console.log(`  • Deterministic BackfillPlanHash: ${p.backfillPlanHash}`);
   console.log(`  • Total de Operações Planejadas: ${p.summary.totalOperations}`);
   console.log(`      - CREATE Executáveis (Transações + Faturas): ${p.summary.executableCreateCount}`);

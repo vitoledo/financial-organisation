@@ -17,6 +17,42 @@ export interface BackupOptions {
   allowEmptyDbForBackup?: boolean;
 }
 
+/**
+ * Derive a 32-byte AES-256 key from cryptographic material (strictly 64-hex or Base64 decoding to 32 bytes).
+ * Free-text passphrases, SHA-256 fallbacks, and non-32-byte keys are strictly rejected with FAIL_CLOSED_TARGET_SNAPSHOT_KEY.
+ */
+export function parseKey32Bytes(rawKey?: string, keyName: string = 'MIGRATION_BACKUP_KEY'): Buffer {
+  if (!rawKey || rawKey.trim().length === 0) {
+    throw new Error(
+      `Chave de backup ausente. Configure a variável de ambiente ${keyName}.`,
+    );
+  }
+
+  const trimmed = rawKey.trim();
+
+  // 1. 64-character hex string (32 bytes raw cryptographic key)
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const buf = Buffer.from(trimmed, 'hex');
+    if (buf.length === 32) return buf;
+  }
+
+  // 2. Base64 string that decodes to exactly 32 bytes
+  if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(trimmed) || /^[A-Za-z0-9+/]{44}$/.test(trimmed)) {
+    const decoded = Buffer.from(trimmed, 'base64');
+    if (decoded.length === 32) {
+      return decoded;
+    }
+  }
+
+  throw new Error(
+    `FAIL_CLOSED_TARGET_SNAPSHOT_KEY: Chave ${keyName} inválida. Exigido material criptográfico de exatamente 32 bytes codificado em 64 caracteres hexadecimais ou Base64 (strings livres/passphrases e fallbacks SHA-256 são estritamente proibidos).`,
+  );
+}
+
+export function deriveBackupKey(key?: string, keyName: string = 'MIGRATION_BACKUP_KEY'): Buffer {
+  return parseKey32Bytes(key, keyName);
+}
+
 export class FinancialBackupManager {
   private dbPath: string;
   private backupDir: string;
@@ -33,34 +69,13 @@ export class FinancialBackupManager {
 
   /**
    * Derive a 32-byte AES-256 key from cryptographic material (strictly 64-hex or Base64 decoding to 32 bytes).
-   * Free-text passphrases, SHA-256 fallbacks, and non-32-byte keys are strictly rejected.
    */
   private deriveKey(key?: string): Buffer {
     const rawKey = key ?? this.backupKey ?? process.env.MIGRATION_BACKUP_KEY?.trim();
-    if (!rawKey) {
-      throw new Error(
-        'Chave de backup ausente. Configure a variável de ambiente MIGRATION_BACKUP_KEY.',
-      );
-    }
-
-    // 1. 64-character hex string (32 bytes raw cryptographic key)
-    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-      const buf = Buffer.from(rawKey, 'hex');
-      if (buf.length === 32) return buf;
-    }
-
-    // 2. Base64 string that decodes to exactly 32 bytes
-    if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
-      const decoded = Buffer.from(rawKey, 'base64');
-      if (decoded.length === 32) {
-        return decoded;
-      }
-    }
-
-    throw new Error(
-      'Chave MIGRATION_BACKUP_KEY inválida. Exigido material criptográfico de exatamente 32 bytes codificado em 64 caracteres hexadecimais ou Base64 (strings livres/passphrases não são permitidas).',
-    );
+    return parseKey32Bytes(rawKey, 'MIGRATION_BACKUP_KEY');
   }
+
+
 
   /**
    * Creates an encrypted, immutable, timestamped snapshot of the local financial database.

@@ -266,6 +266,7 @@ export interface BackfillPlanArtifact {
     sourceSnapshotPlaintextSha256?: string;
     targetNotionManifestPath: string;
     targetNotionSnapshotSha256: string;
+    targetStateHash?: string;
   };
   executionPlan: {
     stage1CreationsCount: number;
@@ -313,6 +314,7 @@ export interface BackfillPlanArtifact {
       financialDiscrepancyZero: boolean;
       identityCollisionsZero: boolean;
       targetSnapshotValid: boolean;
+      targetLiveDriftZero: boolean;
       sourceBackupValid: boolean;
       ciphertextIntegrityValid: boolean;
       manifestIntegrityValid: boolean;
@@ -326,6 +328,7 @@ export interface BackfillPlanArtifact {
       planHashReproducible: boolean;
     };
   };
+
   securityGates: {
     enabledVar: 'FINANCIAL_BACKFILL_ENABLED';
     expectedEnabledValue: 'I_UNDERSTAND_BACKFILL_MUTATIONS';
@@ -566,4 +569,18 @@ export interface DdlApplyExecutionSummary {
   startedAt: string;
   completedAt: string;
   stepResults: DdlStepExecutionResult[];
+}
+
+export interface TargetDriftDifference {
+  envKey: string;
+  pageId: string;
+  differenceType: 'PAGE_ADDED' | 'PAGE_REMOVED' | 'PROPERTY_MODIFIED' | 'ARCHIVED_STATUS_MODIFIED';
+  propertyName?: string;
+}
+
+export interface TargetDriftReport {
+  frozenTargetStateHash: string;
+  liveTargetStateHash: string;
+  driftDetected: boolean;
+  differences: TargetDriftDifference[];
 }

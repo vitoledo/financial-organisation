@@ -6,8 +6,17 @@ import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import { BackfillPlanner, resolvePlannerConfig } from './backfill-planner';
 import { NotionSchemaValidator } from '../schema-validator';
-import { NotionLiveDataSnapshotManager } from './data-snapshot';
-import { FinancialBackupManager } from './backup';
+import {
+  NotionLiveDataSnapshotManager,
+  BaseSnapshotData,
+  LiveDataSnapshotPayload,
+  calculateTargetStateHash,
+  extractNotionAccountsFromSnapshot,
+  extractNotionCategoriesFromSnapshot,
+  canonicalizeValue,
+} from './data-snapshot';
+import { FinancialBackupManager, parseKey32Bytes } from './backup';
+import { TARGET_CONTRACT } from '../../domain/schema-contract';
 import {
   BackfillPlanArtifact,
   TransactionResolutionAudit,
@@ -19,6 +28,8 @@ import {
   PaymentEventAllocation,
   BackfillSchemaConformanceEvidence,
   BackfillPlannerConfig,
+  TargetDriftDifference,
+  TargetDriftReport,
 } from './types';
 
 export interface BackfillBaseAnalysis {
@@ -46,7 +57,10 @@ export interface BackfillDryRunAnalyzerOptions {
   schemaEvidence?: BackfillSchemaConformanceEvidence;
   plannerConfig?: BackfillPlannerConfig;
   accountMappingPath?: string;
+  liveBases?: Record<string, BaseSnapshotData>;
+  skipLiveDriftCheck?: boolean;
 }
+
 
 export interface BackfillDryRunReport {
   timestampIso: string;
@@ -127,6 +141,7 @@ export interface BackfillDryRunReport {
   paymentLegAudits: PaymentLegAuditItem[];
   incomingTransferAudits: IncomingTransferAuditItem[];
   paymentEventAllocations: PaymentEventAllocation[];
+  targetDriftReport?: TargetDriftReport;
 }
 
 export interface ValidatedSourceSession {
@@ -136,6 +151,18 @@ export interface ValidatedSourceSession {
   manifestPath: string;
   cleanup: () => void;
 }
+
+export interface ValidatedTargetSession {
+  payload: LiveDataSnapshotPayload;
+  plaintextSha256: string;
+  ciphertextSha256: string;
+  manifestPath: string;
+  frozenTargetStateHash: string;
+  notionAccounts: any[];
+  notionCategories: any[];
+  cleanup: () => void;
+}
+
 
 export class BackfillDryRunAnalyzer {
   private client: Client;
@@ -157,119 +184,217 @@ export class BackfillDryRunAnalyzer {
       });
   }
 
+  public prepareValidatedTargetSnapshot(): ValidatedTargetSession {
+    const manifestPath =
+      this.options.targetSnapshotManifestPath ??
+      this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
+      process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
+
+    if (!manifestPath) {
+      throw new Error(
+        'FAIL_CLOSED_TARGET_SNAPSHOT: Caminho do manifesto do snapshot alvo não informado nem configurado em NOTION_TARGET_SNAPSHOT_MANIFEST.',
+      );
+    }
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error(
+        `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${manifestPath}'.`,
+      );
+    }
+
+    let manifest: any;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (err: any) {
+      throw new Error(`FAIL_CLOSED_TARGET_SNAPSHOT: Erro ao ler manifesto do snapshot alvo: ${err.message}`);
+    }
+
+    if (
+      manifest.format !== 'FIN_ENC_V1' ||
+      !manifest.encryptedFileSha256 ||
+      !manifest.originalJsonSha256 ||
+      !manifest.backupFileName ||
+      manifest.totalBases !== 13
+    ) {
+      throw new Error(
+        'FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo inválido ou incompleto (format, hashes ou backupFileName ausentes).',
+      );
+    }
+
+    const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
+    if (!fs.existsSync(encryptedFilePath)) {
+      throw new Error(
+        `FAIL_CLOSED_TARGET_SNAPSHOT: Arquivo criptografado de snapshot alvo '${encryptedFilePath}' referenciado no manifesto não existe.`,
+      );
+    }
+
+    const encryptedBuffer = fs.readFileSync(encryptedFilePath);
+    const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
+    if (actualEncSha256 !== manifest.encryptedFileSha256) {
+      throw new Error(
+        `CORRUPTED_SNAPSHOT: Hash do arquivo criptografado (${actualEncSha256}) diverge do manifesto (${manifest.encryptedFileSha256}).`,
+      );
+    }
+
+    const rawKey =
+      this.envVars.MIGRATION_BACKUP_KEY ||
+      process.env.MIGRATION_BACKUP_KEY ||
+      this.envVars.AUDIT_ENCRYPTION_KEY ||
+      process.env.AUDIT_ENCRYPTION_KEY;
+
+    if (!rawKey || rawKey.trim().length === 0) {
+      throw new Error(
+        'FAIL_CLOSED_TARGET_SNAPSHOT: Chave de decodificação MIGRATION_BACKUP_KEY não informada para decifrar snapshot alvo.',
+      );
+    }
+
+    const keyBuffer = parseKey32Bytes(rawKey, 'MIGRATION_BACKUP_KEY');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-target-snapshot-'));
+    const tempPlaintextFile = path.join(tempDir, 'restored-target.json');
+
+    try {
+      const magicHeader = Buffer.from('FIN_ENC_V1', 'utf8');
+      if (encryptedBuffer.length < magicHeader.length + 12 + 16) {
+        throw new Error('CORRUPTED_SNAPSHOT: Arquivo de snapshot corrompido ou formato inválido: cabeçalho insuficiente.');
+      }
+      const magic = encryptedBuffer.subarray(0, magicHeader.length);
+      if (!magic.equals(magicHeader)) {
+        throw new Error('CORRUPTED_SNAPSHOT: Formato de snapshot inválido: cabeçalho mágico não reconhecido.');
+      }
+
+      const iv = encryptedBuffer.subarray(magicHeader.length, magicHeader.length + 12);
+      const authTag = encryptedBuffer.subarray(magicHeader.length + 12, magicHeader.length + 12 + 16);
+      const ciphertext = encryptedBuffer.subarray(magicHeader.length + 12 + 16);
+
+      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+      decipher.setAuthTag(authTag);
+      const decryptedBuffer = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+      fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
+
+      const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
+      if (actualPlaintextSha !== manifest.originalJsonSha256) {
+        throw new Error(
+          `CORRUPTED_SNAPSHOT: Hash do JSON restaurado (${actualPlaintextSha}) diverge do manifesto (${manifest.originalJsonSha256}).`,
+        );
+      }
+
+      const payload = JSON.parse(decryptedBuffer.toString('utf8')) as LiveDataSnapshotPayload;
+      if (payload.snapshotType !== 'NOTION_LIVE_DATA_SNAPSHOT' || payload.totalBases !== 13) {
+        throw new Error('FAIL_CLOSED_TARGET_SNAPSHOT: Estrutura inválida no snapshot alvo restaurado.');
+      }
+
+      const frozenTargetStateHash = calculateTargetStateHash(payload.bases);
+      const notionAccounts = extractNotionAccountsFromSnapshot(payload.bases['NOTION_DS_ACCOUNTS']?.records || []);
+      const notionCategories = extractNotionCategoriesFromSnapshot(payload.bases['NOTION_DS_CATEGORIES']?.records || []);
+
+      const cleanup = () => {
+        try {
+          if (fs.existsSync(tempPlaintextFile)) {
+            fs.unlinkSync(tempPlaintextFile);
+          }
+          if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      };
+
+      return {
+        payload,
+        plaintextSha256: manifest.originalJsonSha256,
+        ciphertextSha256: manifest.encryptedFileSha256,
+        manifestPath,
+        frozenTargetStateHash,
+        notionAccounts,
+        notionCategories,
+        cleanup,
+      };
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempPlaintextFile)) {
+          fs.unlinkSync(tempPlaintextFile);
+        }
+        if (fs.existsSync(tempDir)) {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+
+  public calculateTargetDifferences(
+    frozenBases: Record<string, BaseSnapshotData>,
+    liveBases: Record<string, BaseSnapshotData>,
+  ): TargetDriftDifference[] {
+    const diffs: TargetDriftDifference[] = [];
+    const allEnvKeys = new Set([...Object.keys(frozenBases), ...Object.keys(liveBases)]);
+
+    for (const envKey of Array.from(allEnvKeys).sort()) {
+      const frozenBase = frozenBases[envKey] || { records: [] };
+      const liveBase = liveBases[envKey] || { records: [] };
+
+      const frozenMap = new Map((frozenBase.records || []).map((r) => [r.id, r]));
+      const liveMap = new Map((liveBase.records || []).map((r) => [r.id, r]));
+
+      for (const liveRec of liveBase.records || []) {
+        if (!frozenMap.has(liveRec.id)) {
+          diffs.push({ envKey, pageId: liveRec.id, differenceType: 'PAGE_ADDED' });
+        }
+      }
+
+      for (const frozenRec of frozenBase.records || []) {
+        const liveRec = liveMap.get(frozenRec.id);
+        if (!liveRec) {
+          diffs.push({ envKey, pageId: frozenRec.id, differenceType: 'PAGE_REMOVED' });
+          continue;
+        }
+
+        if (Boolean(frozenRec.archived) !== Boolean(liveRec.archived)) {
+          diffs.push({ envKey, pageId: frozenRec.id, differenceType: 'ARCHIVED_STATUS_MODIFIED' });
+        }
+
+        const allProps = new Set([
+          ...Object.keys(frozenRec.properties || {}),
+          ...Object.keys(liveRec.properties || {}),
+        ]);
+        for (const prop of Array.from(allProps).sort()) {
+          const fVal = JSON.stringify(canonicalizeValue(frozenRec.properties?.[prop]));
+          const lVal = JSON.stringify(canonicalizeValue(liveRec.properties?.[prop]));
+          if (fVal !== lVal) {
+            diffs.push({
+              envKey,
+              pageId: frozenRec.id,
+              differenceType: 'PROPERTY_MODIFIED',
+              propertyName: prop,
+            });
+          }
+        }
+      }
+    }
+    return diffs;
+  }
+
   public verifySnapshotReadiness(): {
     ciphertextIntegrityValid: boolean;
     manifestIntegrityValid: boolean;
     manifestStructureAndHashReferencesValid: boolean;
     plaintextRestoreVerified: boolean;
+    frozenTargetStateHash?: string;
   } {
-    let ciphertextIntegrityValid = false;
-    let manifestIntegrityValid = false;
-    let plaintextRestoreVerified = false;
-
     try {
-      const manifestPath =
-        this.options.targetSnapshotManifestPath ??
-        this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
-        process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
-
-      if (!manifestPath || !fs.existsSync(manifestPath)) {
-        return {
-          ciphertextIntegrityValid: false,
-          manifestIntegrityValid: false,
-          manifestStructureAndHashReferencesValid: false,
-          plaintextRestoreVerified: false,
-        };
-      }
-
-      const manifestContent = fs.readFileSync(manifestPath, 'utf8');
-      const manifest = JSON.parse(manifestContent);
-
-      if (
-        !manifest.encryptedFileSha256 ||
-        !manifest.originalJsonSha256 ||
-        !manifest.backupFileName ||
-        manifest.totalBases !== 13
-      ) {
-        manifestIntegrityValid = false;
-      } else {
-        manifestIntegrityValid = true;
-      }
-
-      const encryptedFilePath = path.resolve(path.dirname(manifestPath), manifest.backupFileName);
-      if (!fs.existsSync(encryptedFilePath)) {
-        return {
-          ciphertextIntegrityValid: false,
-          manifestIntegrityValid,
-          manifestStructureAndHashReferencesValid: manifestIntegrityValid,
-          plaintextRestoreVerified: false,
-        };
-      }
-
-      const encryptedBuffer = fs.readFileSync(encryptedFilePath);
-      const actualEncSha256 = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
-      if (actualEncSha256 === manifest.encryptedFileSha256) {
-        ciphertextIntegrityValid = true;
-      }
-
-      const rawKey =
-        this.envVars.AUDIT_ENCRYPTION_KEY ||
-        this.envVars.MIGRATION_BACKUP_KEY ||
-        process.env.AUDIT_ENCRYPTION_KEY ||
-        process.env.MIGRATION_BACKUP_KEY;
-
-      if (ciphertextIntegrityValid && manifestIntegrityValid && rawKey) {
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-snapshot-dryrun-'));
-        const tempPlaintextFile = path.join(tempDir, 'restored-snapshot.json');
-        try {
-          const snapshotManager = new NotionLiveDataSnapshotManager({
-            backupKey: rawKey,
-            apiKey: this.options.apiKey || this.envVars.NOTION_API_KEY || 'dry-run-key',
-          });
-          let keyBuffer: Buffer;
-          if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-            keyBuffer = Buffer.from(rawKey, 'hex');
-          } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
-            keyBuffer = Buffer.from(rawKey, 'base64');
-          } else {
-            keyBuffer = crypto.createHash('sha256').update(rawKey).digest();
-          }
-          const magicHeader = Buffer.from('FIN_ENC_V1', 'utf8');
-          const iv = encryptedBuffer.subarray(magicHeader.length, magicHeader.length + 12);
-          const authTag = encryptedBuffer.subarray(magicHeader.length + 12, magicHeader.length + 12 + 16);
-          const ciphertext = encryptedBuffer.subarray(magicHeader.length + 12 + 16);
-
-          const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
-          decipher.setAuthTag(authTag);
-          const decryptedBuffer = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-
-          fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
-
-          const actualJsonSha256 = crypto.createHash('sha256').update(fs.readFileSync(tempPlaintextFile)).digest('hex');
-          const parsedRestored = JSON.parse(decryptedBuffer.toString('utf8'));
-
-          if (
-            actualJsonSha256 === manifest.originalJsonSha256 &&
-            parsedRestored.totalBases === 13 &&
-            parsedRestored.snapshotType === 'NOTION_LIVE_DATA_SNAPSHOT'
-          ) {
-            plaintextRestoreVerified = true;
-          }
-        } catch {
-          plaintextRestoreVerified = false;
-        } finally {
-          try {
-            if (fs.existsSync(tempPlaintextFile)) {
-              fs.unlinkSync(tempPlaintextFile);
-            }
-            if (fs.existsSync(tempDir)) {
-              fs.rmSync(tempDir, { recursive: true, force: true });
-            }
-          } catch {
-            // cleanup error ignored
-          }
-        }
-      }
+      const session = this.prepareValidatedTargetSnapshot();
+      session.cleanup();
+      return {
+        ciphertextIntegrityValid: true,
+        manifestIntegrityValid: true,
+        manifestStructureAndHashReferencesValid: true,
+        plaintextRestoreVerified: true,
+        frozenTargetStateHash: session.frozenTargetStateHash,
+      };
     } catch {
       return {
         ciphertextIntegrityValid: false,
@@ -278,14 +403,8 @@ export class BackfillDryRunAnalyzer {
         plaintextRestoreVerified: false,
       };
     }
-
-    return {
-      ciphertextIntegrityValid,
-      manifestIntegrityValid,
-      manifestStructureAndHashReferencesValid: manifestIntegrityValid,
-      plaintextRestoreVerified,
-    };
   }
+
 
   public prepareValidatedSourceDatabase(): ValidatedSourceSession {
     const manifestPath =
@@ -352,16 +471,8 @@ export class BackfillDryRunAnalyzer {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-source-snapshot-'));
     const tempPlaintextFile = path.join(tempDir, 'restored-source.db');
 
-    let keyBuffer: Buffer;
-    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-      keyBuffer = Buffer.from(rawKey, 'hex');
-    } else if (/^[A-Za-z0-9+/]{42,43}={0,2}$/.test(rawKey) || /^[A-Za-z0-9+/]{44}$/.test(rawKey)) {
-      keyBuffer = Buffer.from(rawKey, 'base64');
-    } else {
-      throw new Error(
-        'FAIL_CLOSED_SOURCE_SNAPSHOT: Formato de chave MIGRATION_BACKUP_KEY inválido (exigido hex de 64 caracteres ou base64 de 44 caracteres).',
-      );
-    }
+    const keyBuffer = parseKey32Bytes(rawKey, 'MIGRATION_BACKUP_KEY');
+
 
     try {
       const backupMgr = new FinancialBackupManager({ dbPath: tempPlaintextFile, key: rawKey });
@@ -468,7 +579,6 @@ export class BackfillDryRunAnalyzer {
   public async runAnalysis(): Promise<BackfillDryRunReport> {
     const timestampIso = new Date().toISOString();
 
-    // 1. Fetch live metadata from Notion for Contas and Categorias (FAIL-CLOSED)
     const accountsDsId = this.envVars.NOTION_DS_ACCOUNTS?.trim();
     const categoriesDsId = this.envVars.NOTION_DS_CATEGORIES?.trim();
 
@@ -476,51 +586,69 @@ export class BackfillDryRunAnalyzer {
       throw new Error('FAIL_CLOSED_ENV: NOTION_DS_ACCOUNTS e NOTION_DS_CATEGORIES devem estar configurados.');
     }
 
-    let notionAccounts: any[] = [];
-    try {
-      const notionAccountsRes = (await this.client.dataSources.query({
-        data_source_id: accountsDsId,
-      })) as any;
-      notionAccounts = (notionAccountsRes.results || []).map((p: any) => ({
-        id: p.id,
-        name: (p.properties['Conta']?.title || p.properties['Nome da Conta']?.title || [])
-          .map((t: any) => t.plain_text)
-          .join('')
-          .trim(),
-        type: p.properties['Tipo']?.select?.name,
-        creditLimit: p.properties['Limite contratado']?.number,
-        customLimit: p.properties['Limite personalizado']?.number,
-        availableLimit: p.properties['Limite disponível']?.number,
-      }));
-    } catch (err: any) {
-      throw new Error(`FAIL_CLOSED_NOTION_QUERY: Falha ao consultar Contas no Notion Live: ${err?.message || err}`);
-    }
-
-    let notionCategories: any[] = [];
-    try {
-      const notionCategoriesRes = (await this.client.dataSources.query({
-        data_source_id: categoriesDsId,
-      })) as any;
-      notionCategories = (notionCategoriesRes.results || []).map((p: any) => ({
-        id: p.id,
-        name: (p.properties['Categoria']?.title || p.properties['Nome da Categoria']?.title || [])
-          .map((t: any) => t.plain_text)
-          .join('')
-          .trim(),
-        group: p.properties['Grupo']?.select?.name,
-      }));
-    } catch (err: any) {
-      throw new Error(`FAIL_CLOSED_NOTION_QUERY: Falha ao consultar Categorias no Notion Live: ${err?.message || err}`);
-    }
-
-    // 2. Prepare validated source SQLite database from frozen snapshot (FAIL-CLOSED, ANTI-TOCTOU)
+    // 1. Prepare validated target snapshot from frozen snapshot (FAIL-CLOSED, ANTI-TOCTOU)
+    // The Backfill Plan is built EXCLUSIVELY against this frozen snapshot; live Notion is never used to build operations.
+    const targetSession = this.prepareValidatedTargetSnapshot();
     const sourceSession = this.prepareValidatedSourceDatabase();
+
     let activeDb: Database.Database | null = null;
 
     try {
       activeDb = new Database(sourceSession.restoredDbPath, { readonly: true });
       const sqliteAccounts = activeDb.prepare('SELECT * FROM accounts').all() as any[];
       const sqliteTransactions = activeDb.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
+
+      // 2. Read-Only Notion Live Drift Proof (Fail-Closed)
+      let targetDriftReport: TargetDriftReport | undefined = undefined;
+      let targetLiveDriftZero = false;
+
+      if (this.options.liveBases) {
+        const liveTargetStateHash = calculateTargetStateHash(this.options.liveBases);
+        const driftDetected = liveTargetStateHash !== targetSession.frozenTargetStateHash;
+        const differences = this.calculateTargetDifferences(targetSession.payload.bases, this.options.liveBases);
+        targetDriftReport = {
+          frozenTargetStateHash: targetSession.frozenTargetStateHash,
+          liveTargetStateHash,
+          driftDetected,
+          differences,
+        };
+        targetLiveDriftZero = !driftDetected;
+      } else if (!this.options.skipLiveDriftCheck && (this.options.apiKey || this.envVars.NOTION_API_KEY)) {
+        try {
+          const snapshotMgr = new NotionLiveDataSnapshotManager({
+            client: this.client,
+            apiKey: this.options.apiKey || this.envVars.NOTION_API_KEY,
+            envVars: this.envVars,
+          });
+          const liveBases: Record<string, BaseSnapshotData> = {};
+          for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
+            const dsId = this.envVars[contract.envKey]?.trim();
+            if (!dsId) continue;
+            const records = await snapshotMgr.fetchBaseRecords(contract.envKey, dsId);
+            liveBases[contract.envKey] = {
+              envKey: contract.envKey,
+              defaultTitle: contract.defaultTitle,
+              dataSourceId: dsId,
+              recordCount: records.length,
+              records,
+            };
+          }
+          if (Object.keys(liveBases).length === 13) {
+            const liveTargetStateHash = calculateTargetStateHash(liveBases);
+            const driftDetected = liveTargetStateHash !== targetSession.frozenTargetStateHash;
+            const differences = this.calculateTargetDifferences(targetSession.payload.bases, liveBases);
+            targetDriftReport = {
+              frozenTargetStateHash: targetSession.frozenTargetStateHash,
+              liveTargetStateHash,
+              driftDetected,
+              differences,
+            };
+            targetLiveDriftZero = !driftDetected;
+          }
+        } catch {
+          // Live drift proof unverified (offline or network error)
+        }
+      }
 
       // 3. Obtain Schema Conformance Evidence if available
       let schemaEvidence = this.options.schemaEvidence;
@@ -549,30 +677,13 @@ export class BackfillDryRunAnalyzer {
         }
       }
 
-      // 3.5. Verify Target Snapshot Readiness (Fail-Closed, Real Decryption to Isolated Temp)
-      const targetManifestPath =
-        this.options.targetSnapshotManifestPath ??
-        this.envVars.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim() ??
-        process.env.NOTION_TARGET_SNAPSHOT_MANIFEST?.trim();
-
-      if (!targetManifestPath) {
-        throw new Error(
-          'FAIL_CLOSED_TARGET_SNAPSHOT: Caminho do manifesto do snapshot alvo não informado nem configurado em NOTION_TARGET_SNAPSHOT_MANIFEST.',
-        );
-      }
-      if (!fs.existsSync(targetManifestPath)) {
-        throw new Error(
-          `FAIL_CLOSED_TARGET_SNAPSHOT: Manifesto do snapshot alvo não encontrado em '${targetManifestPath}'.`,
-        );
-      }
-
-      const targetSnapshotValidation = this.verifySnapshotReadiness();
-
       const snapshotValidation = {
-        ciphertextIntegrityValid: targetSnapshotValidation.ciphertextIntegrityValid,
-        manifestIntegrityValid: targetSnapshotValidation.manifestIntegrityValid,
-        manifestStructureAndHashReferencesValid: targetSnapshotValidation.manifestStructureAndHashReferencesValid,
-        plaintextRestoreVerified: targetSnapshotValidation.plaintextRestoreVerified,
+        ciphertextIntegrityValid: true,
+        manifestIntegrityValid: true,
+        manifestStructureAndHashReferencesValid: true,
+        plaintextRestoreVerified: true,
+        frozenTargetStateHash: targetSession.frozenTargetStateHash,
+        targetLiveDriftZero,
         sourceSnapshotCiphertextValid: true,
         sourceSnapshotManifestValid: true,
         sourceSnapshotRestoreVerified: true,
@@ -581,7 +692,7 @@ export class BackfillDryRunAnalyzer {
         sourceSnapshotManifestPath: sourceSession.manifestPath,
       };
 
-      // 3.6. Resolve Planner Config (External config required, zero silent defaults)
+      // 4. Resolve Planner Config (External config required, zero silent defaults)
       let plannerConfig = this.options.plannerConfig;
       if (!plannerConfig) {
         try {
@@ -595,7 +706,7 @@ export class BackfillDryRunAnalyzer {
         }
       }
 
-      // 4. Generate deterministic BackfillPlanArtifact and audits
+      // 5. Generate deterministic BackfillPlanArtifact and audits from frozen target metadata
       const planner = new BackfillPlanner({ dbPath: sourceSession.restoredDbPath, envVars: this.envVars });
       const {
         artifact: planArtifact,
@@ -610,14 +721,17 @@ export class BackfillDryRunAnalyzer {
         dbPath: sourceSession.restoredDbPath,
         envVars: this.envVars,
         commitSha: this.options.commitSha,
-        targetSnapshotManifestPath: targetManifestPath,
-      targetNotionSnapshotHash: this.options.targetNotionSnapshotHash,
-      plannerConfig,
-      snapshotValidation,
-      notionAccounts,
-      notionCategories,
-      schemaEvidence,
-    });
+        targetSnapshotManifestPath: targetSession.manifestPath,
+        targetNotionSnapshotHash: this.options.targetNotionSnapshotHash || targetSession.plaintextSha256,
+        targetStateHash: targetSession.frozenTargetStateHash,
+        targetLiveDriftZero,
+        plannerConfig,
+        snapshotValidation,
+        notionAccounts: targetSession.notionAccounts,
+        notionCategories: targetSession.notionCategories,
+        schemaEvidence,
+      });
+
 
     // 5. Detailed Temporal & Financial Reconciliation (Decoupled Physical vs Liability vs Economic)
     let minDate = sqliteTransactions[0]?.date ?? '';
@@ -745,14 +859,19 @@ export class BackfillDryRunAnalyzer {
     const uniqueStableIds = new Set(planArtifact.operations.map((o) => o.stableId));
     const collisionsFound = planArtifact.operations.length - uniqueStableIds.size;
 
-    // 7. Base Analyses
+    // 7. Base Analyses (derived dynamically from frozen target snapshot)
+    const accountsCount = targetSession.payload.bases['NOTION_DS_ACCOUNTS']?.recordCount ?? 0;
+    const txCount = targetSession.payload.bases['NOTION_DS_TRANSACTIONS']?.recordCount ?? 0;
+    const cardBillsCount = targetSession.payload.bases['NOTION_DS_CARD_BILLS']?.recordCount ?? 0;
+    const budgetCount = targetSession.payload.bases['NOTION_DS_MONTHLY_BUDGET']?.recordCount ?? 0;
+
     const contasAnalysis: BackfillBaseAnalysis = {
       envKey: 'NOTION_DS_ACCOUNTS',
       databaseTitle: 'Contas',
-      currentNotionRows: notionAccounts.length,
+      currentNotionRows: accountsCount,
       rowsToCreate: 0,
       rowsToUpdate: 0,
-      rowsUnchanged: notionAccounts.length,
+      rowsUnchanged: accountsCount,
       relationsToPopulate: {},
       duplicatesDetected: 0,
       ambiguousItems: [],
@@ -761,10 +880,10 @@ export class BackfillDryRunAnalyzer {
     const txAnalysis: BackfillBaseAnalysis = {
       envKey: 'NOTION_DS_TRANSACTIONS',
       databaseTitle: 'Transações',
-      currentNotionRows: 0,
+      currentNotionRows: txCount,
       rowsToCreate: sqliteTransactions.length,
       rowsToUpdate: 0,
-      rowsUnchanged: 0,
+      rowsUnchanged: txCount,
       relationsToPopulate: {
         Conta: sqliteTransactions.length,
         Categoria: sqliteTransactions.length - incomingTransferAudits.filter((t) => t.counterpartyType !== 'SAME_OWNERSHIP_TRANSFER').length,
@@ -777,10 +896,10 @@ export class BackfillDryRunAnalyzer {
     const cardBillsAnalysis: BackfillBaseAnalysis = {
       envKey: 'NOTION_DS_CARD_BILLS',
       databaseTitle: 'Faturas / Ciclos de Cartão',
-      currentNotionRows: 0,
+      currentNotionRows: cardBillsCount,
       rowsToCreate: cardBillAudits.length,
       rowsToUpdate: 0,
-      rowsUnchanged: 0,
+      rowsUnchanged: cardBillsCount,
       relationsToPopulate: {
         'Cartão Vinculado': cardBillAudits.length,
         'Lançamentos do Ciclo': cardPurchases.length,
@@ -796,10 +915,10 @@ export class BackfillDryRunAnalyzer {
     const budgetAnalysis: BackfillBaseAnalysis = {
       envKey: 'NOTION_DS_MONTHLY_BUDGET',
       databaseTitle: 'Planejamento Mensal',
-      currentNotionRows: 1,
+      currentNotionRows: budgetCount,
       rowsToCreate: 0,
       rowsToUpdate: 0,
-      rowsUnchanged: 1,
+      rowsUnchanged: budgetCount,
       relationsToPopulate: {},
       duplicatesDetected: 0,
       ambiguousItems: [],
@@ -895,6 +1014,7 @@ export class BackfillDryRunAnalyzer {
         paymentLegAudits,
         incomingTransferAudits,
         paymentEventAllocations,
+        targetDriftReport,
       };
     } finally {
       if (activeDb) {
@@ -905,6 +1025,8 @@ export class BackfillDryRunAnalyzer {
         }
       }
       sourceSession.cleanup();
+      targetSession.cleanup();
     }
+
   }
 }

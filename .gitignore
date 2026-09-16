@@ -43,3 +43,6 @@ exploration/
 
 # Documentation files
 docs/
+
+# Privacy blocklist
+.privacy-blocklist*
