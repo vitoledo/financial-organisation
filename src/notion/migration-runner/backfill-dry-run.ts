@@ -59,6 +59,7 @@ export interface BackfillDryRunAnalyzerOptions {
   accountMappingPath?: string;
   liveBases?: Record<string, BaseSnapshotData>;
   skipLiveDriftCheck?: boolean;
+  _deliberateErrorAfterRestore?: boolean;
 }
 
 
@@ -249,81 +250,53 @@ export class BackfillDryRunAnalyzer {
 
     const keyBuffer = parseKey32Bytes(rawKey, 'MIGRATION_BACKUP_KEY');
 
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fin-target-snapshot-'));
-    const tempPlaintextFile = path.join(tempDir, 'restored-target.json');
-
-    try {
-      const magicHeader = Buffer.from('FIN_ENC_V1', 'utf8');
-      if (encryptedBuffer.length < magicHeader.length + 12 + 16) {
-        throw new Error('CORRUPTED_SNAPSHOT: Arquivo de snapshot corrompido ou formato inválido: cabeçalho insuficiente.');
-      }
-      const magic = encryptedBuffer.subarray(0, magicHeader.length);
-      if (!magic.equals(magicHeader)) {
-        throw new Error('CORRUPTED_SNAPSHOT: Formato de snapshot inválido: cabeçalho mágico não reconhecido.');
-      }
-
-      const iv = encryptedBuffer.subarray(magicHeader.length, magicHeader.length + 12);
-      const authTag = encryptedBuffer.subarray(magicHeader.length + 12, magicHeader.length + 12 + 16);
-      const ciphertext = encryptedBuffer.subarray(magicHeader.length + 12 + 16);
-
-      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
-      decipher.setAuthTag(authTag);
-      const decryptedBuffer = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-
-      fs.writeFileSync(tempPlaintextFile, decryptedBuffer);
-
-      const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
-      if (actualPlaintextSha !== manifest.originalJsonSha256) {
-        throw new Error(
-          `CORRUPTED_SNAPSHOT: Hash do JSON restaurado (${actualPlaintextSha}) diverge do manifesto (${manifest.originalJsonSha256}).`,
-        );
-      }
-
-      const payload = JSON.parse(decryptedBuffer.toString('utf8')) as LiveDataSnapshotPayload;
-      if (payload.snapshotType !== 'NOTION_LIVE_DATA_SNAPSHOT' || payload.totalBases !== 13) {
-        throw new Error('FAIL_CLOSED_TARGET_SNAPSHOT: Estrutura inválida no snapshot alvo restaurado.');
-      }
-
-      const frozenTargetStateHash = calculateTargetStateHash(payload.bases);
-      const notionAccounts = extractNotionAccountsFromSnapshot(payload.bases['NOTION_DS_ACCOUNTS']?.records || []);
-      const notionCategories = extractNotionCategoriesFromSnapshot(payload.bases['NOTION_DS_CATEGORIES']?.records || []);
-
-      const cleanup = () => {
-        try {
-          if (fs.existsSync(tempPlaintextFile)) {
-            fs.unlinkSync(tempPlaintextFile);
-          }
-          if (fs.existsSync(tempDir)) {
-            fs.rmSync(tempDir, { recursive: true, force: true });
-          }
-        } catch {
-          // ignore cleanup errors
-        }
-      };
-
-      return {
-        payload,
-        plaintextSha256: manifest.originalJsonSha256,
-        ciphertextSha256: manifest.encryptedFileSha256,
-        manifestPath,
-        frozenTargetStateHash,
-        notionAccounts,
-        notionCategories,
-        cleanup,
-      };
-    } catch (err) {
-      try {
-        if (fs.existsSync(tempPlaintextFile)) {
-          fs.unlinkSync(tempPlaintextFile);
-        }
-        if (fs.existsSync(tempDir)) {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        }
-      } catch {
-        // ignore
-      }
-      throw err;
+    const magicHeader = Buffer.from('FIN_ENC_V1', 'utf8');
+    if (encryptedBuffer.length < magicHeader.length + 12 + 16) {
+      throw new Error('CORRUPTED_SNAPSHOT: Arquivo de snapshot corrompido ou formato inválido: cabeçalho insuficiente.');
     }
+    const magic = encryptedBuffer.subarray(0, magicHeader.length);
+    if (!magic.equals(magicHeader)) {
+      throw new Error('CORRUPTED_SNAPSHOT: Formato de snapshot inválido: cabeçalho mágico não reconhecido.');
+    }
+
+    const iv = encryptedBuffer.subarray(magicHeader.length, magicHeader.length + 12);
+    const authTag = encryptedBuffer.subarray(magicHeader.length + 12, magicHeader.length + 12 + 16);
+    const ciphertext = encryptedBuffer.subarray(magicHeader.length + 12 + 16);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+    decipher.setAuthTag(authTag);
+    const decryptedBuffer = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+    const actualPlaintextSha = crypto.createHash('sha256').update(decryptedBuffer).digest('hex');
+    if (actualPlaintextSha !== manifest.originalJsonSha256) {
+      throw new Error(
+        `CORRUPTED_SNAPSHOT: Hash do JSON restaurado (${actualPlaintextSha}) diverge do manifesto (${manifest.originalJsonSha256}).`,
+      );
+    }
+
+    let parsedPayload: LiveDataSnapshotPayload | null = JSON.parse(decryptedBuffer.toString('utf8')) as LiveDataSnapshotPayload;
+    if (parsedPayload.snapshotType !== 'NOTION_LIVE_DATA_SNAPSHOT' || parsedPayload.totalBases !== 13) {
+      throw new Error('FAIL_CLOSED_TARGET_SNAPSHOT: Estrutura inválida no snapshot alvo restaurado.');
+    }
+
+    const frozenTargetStateHash = calculateTargetStateHash(parsedPayload.bases);
+    const notionAccounts = extractNotionAccountsFromSnapshot(parsedPayload.bases['NOTION_DS_ACCOUNTS']?.records || []);
+    const notionCategories = extractNotionCategoriesFromSnapshot(parsedPayload.bases['NOTION_DS_CATEGORIES']?.records || []);
+
+    const cleanup = () => {
+      parsedPayload = null;
+    };
+
+    return {
+      payload: parsedPayload,
+      plaintextSha256: manifest.originalJsonSha256,
+      ciphertextSha256: manifest.encryptedFileSha256,
+      manifestPath,
+      frozenTargetStateHash,
+      notionAccounts,
+      notionCategories,
+      cleanup,
+    };
   }
 
   public calculateTargetDifferences(
@@ -586,14 +559,20 @@ export class BackfillDryRunAnalyzer {
       throw new Error('FAIL_CLOSED_ENV: NOTION_DS_ACCOUNTS e NOTION_DS_CATEGORIES devem estar configurados.');
     }
 
-    // 1. Prepare validated target snapshot from frozen snapshot (FAIL-CLOSED, ANTI-TOCTOU)
-    // The Backfill Plan is built EXCLUSIVELY against this frozen snapshot; live Notion is never used to build operations.
-    const targetSession = this.prepareValidatedTargetSnapshot();
-    const sourceSession = this.prepareValidatedSourceDatabase();
-
+    let targetSession: ValidatedTargetSession | null = null;
+    let sourceSession: ValidatedSourceSession | null = null;
     let activeDb: Database.Database | null = null;
 
     try {
+      // 1. Prepare validated target snapshot from frozen snapshot (FAIL-CLOSED, ANTI-TOCTOU)
+      // The Backfill Plan is built EXCLUSIVELY against this frozen snapshot; live Notion is never used to build operations.
+      targetSession = this.prepareValidatedTargetSnapshot();
+      sourceSession = this.prepareValidatedSourceDatabase();
+
+      if (this.options._deliberateErrorAfterRestore) {
+        throw new Error('DELIBERATE_TEST_ERROR_AFTER_RESTORE: Simulação de falha posterior ao restore para validação de cleanup.');
+      }
+
       activeDb = new Database(sourceSession.restoredDbPath, { readonly: true });
       const sqliteAccounts = activeDb.prepare('SELECT * FROM accounts').all() as any[];
       const sqliteTransactions = activeDb.prepare('SELECT * FROM transactions ORDER BY date ASC, id ASC').all() as any[];
@@ -1024,8 +1003,16 @@ export class BackfillDryRunAnalyzer {
           // ignore
         }
       }
-      sourceSession.cleanup();
-      targetSession.cleanup();
+      try {
+        sourceSession?.cleanup();
+      } catch {
+        // ignore
+      }
+      try {
+        targetSession?.cleanup();
+      } catch {
+        // ignore
+      }
     }
 
   }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -377,5 +377,107 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     expect(driftedReport.planArtifact.backfillPlanHash).toBe(matchedReport.planArtifact.backfillPlanHash);
     expect(driftedReport.planArtifact.summary.totalOperations).toBe(159);
     expect(driftedReport.summary.totalRowsToCreate).toBe(159);
+  });
+
+  describe('Hotfix Fase 2A.7 - Fail-Safe Cleanup & Memory-Only Target Snapshot', () => {
+    function getTempDirsWithPrefix(prefix: string): string[] {
+      try {
+        return fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith(prefix));
+      } catch {
+        return [];
+      }
+    }
+
+    beforeEach(() => {
+      // Purge any stale directories from prior interrupted test runs
+      for (const prefix of ['fin-target-snapshot-', 'fin-source-snapshot-']) {
+        try {
+          const stale = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith(prefix));
+          for (const item of stale) {
+            try {
+              fs.rmSync(path.join(os.tmpdir(), item), { recursive: true, force: true });
+            } catch {}
+          }
+        } catch {}
+      }
+    });
+
+    it('zero target snapshot plaintext on disk: prepareValidatedTargetSnapshot operates 100% in-memory without tempDir', () => {
+      const beforeTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      const analyzer = new BackfillDryRunAnalyzer({
+        client: fakeClient,
+        envVars: testEnv,
+      });
+
+      const session = analyzer.prepareValidatedTargetSnapshot();
+
+      const afterTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      expect(afterTargetDirs).toEqual(beforeTargetDirs);
+      expect(afterTargetDirs).toHaveLength(0); // Strictly zero fin-target-snapshot-* directories created!
+
+      expect(session.payload.snapshotType).toBe('NOTION_LIVE_DATA_SNAPSHOT');
+      expect(session.payload.totalBases).toBe(13);
+      expect(session.frozenTargetStateHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(session.notionAccounts.length).toBeGreaterThan(0);
+      expect(session.notionCategories.length).toBeGreaterThan(0);
+
+      session.cleanup();
+    });
+
+    it('target snapshot válido + source manifest ausente => nenhuma pasta/arquivo target plaintext criado', async () => {
+      const beforeTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      const beforeSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+
+      const envMissingSource = { ...testEnv, SOURCE_SQLITE_SNAPSHOT_MANIFEST: '' };
+      const analyzer = new BackfillDryRunAnalyzer({
+        client: fakeClient,
+        envVars: envMissingSource,
+      });
+
+      await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_SOURCE_SNAPSHOT/);
+
+      const afterTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      const afterSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+
+      expect(afterTargetDirs).toEqual(beforeTargetDirs);
+      expect(afterTargetDirs).toHaveLength(0);
+      expect(afterSourceDirs).toEqual(beforeSourceDirs);
+    });
+
+    it('target snapshot válido + source key inválida => nenhum plaintext target residual', async () => {
+      const beforeTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      const beforeSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+
+      const envInvalidKey = { ...testEnv, MIGRATION_BACKUP_KEY: 'invalid-non-32-byte-key' };
+      const analyzer = new BackfillDryRunAnalyzer({
+        client: fakeClient,
+        envVars: envInvalidKey,
+      });
+
+      await expect(analyzer.runAnalysis()).rejects.toThrow(/FAIL_CLOSED_TARGET_SNAPSHOT_KEY/);
+
+      const afterTargetDirs = getTempDirsWithPrefix('fin-target-snapshot-');
+      const afterSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+
+      expect(afterTargetDirs).toEqual(beforeTargetDirs);
+      expect(afterTargetDirs).toHaveLength(0);
+      expect(afterSourceDirs).toEqual(beforeSourceDirs);
+    });
+
+    it('source snapshot restaurado + erro posterior deliberado => restored-source.db removido no finally', async () => {
+      const beforeSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+
+      const analyzer = new BackfillDryRunAnalyzer({
+        client: fakeClient,
+        envVars: testEnv,
+        _deliberateErrorAfterRestore: true,
+      });
+
+      await expect(analyzer.runAnalysis()).rejects.toThrow(/DELIBERATE_TEST_ERROR_AFTER_RESTORE/);
+
+      const afterSourceDirs = getTempDirsWithPrefix('fin-source-snapshot-');
+      // The finally block must have cleanly unlinked restored-source.db and removed fin-source-snapshot-*
+      expect(afterSourceDirs).toEqual(beforeSourceDirs);
+    });
   });
 });
