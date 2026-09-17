@@ -13,6 +13,7 @@ sessao.txt
 # Local data (sensitive)
 data/
 !data/.gitkeep
+.local/
 
 # Backups (encrypted financial snapshots)
 backups/

@@ -9,4 +9,8 @@ export * from './schema-executor';
 export * from './runner';
 export * from './step-verifier';
 export * from './materializer';
-
+export * from './backfill-constants';
+export * from './backfill-serializer';
+export * from './backfill-journal';
+export * from './backfill-adapter';
+export * from './backfill-executor';
