@@ -118,15 +118,20 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
     if (!baseMap) return [];
 
     const contract = findPropertyContract(targetDataSourceEnvKey, stableIdProperty);
-    const resolvedPropName = contract ? contract.notionProperty : stableIdProperty;
+    const candidateKeys = contract
+      ? [stableIdProperty, contract.notionProperty, ...(contract.aliases || [])]
+      : [stableIdProperty];
 
     const matches: NotionPageRecord[] = [];
     for (const record of baseMap.values()) {
       if (record.archived) continue;
-      const propVal =
-        record.properties[resolvedPropName] !== undefined
-          ? record.properties[resolvedPropName]
-          : record.properties[stableIdProperty];
+      let propVal: any = undefined;
+      for (const k of candidateKeys) {
+        if (record.properties[k] !== undefined) {
+          propVal = record.properties[k];
+          break;
+        }
+      }
       let extractedStr = '';
 
       if (typeof propVal === 'string') {
@@ -396,13 +401,32 @@ export class LiveNotionAdapter implements BackfillNotionAdapter {
     }
 
     const contract = findPropertyContract(targetDataSourceEnvKey, stableIdProperty);
-    const resolvedPropName = contract ? contract.notionProperty : stableIdProperty;
+    if (!contract) {
+      throw new Error(
+        `FAIL_PROPERTY_CONTRACT_NOT_FOUND: Propriedade '${stableIdProperty}' não encontrada no contrato de '${targetDataSourceEnvKey}'.`,
+      );
+    }
+
+    const isCanonical = stableIdProperty === contract.notionProperty;
+    const isExplicitAlias = Boolean(contract.aliases && contract.aliases.includes(stableIdProperty));
+    const isDomainField = stableIdProperty === contract.domainField;
+
+    if (!isCanonical && !isExplicitAlias && !isDomainField) {
+      throw new Error(
+        `FAIL_UNKNOWN_PROPERTY: Propriedade '${stableIdProperty}' não é canônica, alias explícito nem domainField de '${targetDataSourceEnvKey}'.`,
+      );
+    }
+
+    let physicalPropName = stableIdProperty;
+    if (isDomainField && !isCanonical && !isExplicitAlias) {
+      physicalPropName = contract.aliases?.find((a) => a === 'ID da fonte') || contract.notionProperty;
+    }
 
     try {
       const response = await (this.client as any).dataSources.query({
         data_source_id: dsId,
         filter: {
-          property: resolvedPropName,
+          property: physicalPropName,
           rich_text: {
             equals: stableIdValue,
           },

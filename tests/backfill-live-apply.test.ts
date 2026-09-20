@@ -1406,7 +1406,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         FINANCIAL_BACKFILL_PLAN_HASH: FROZEN_BACKFILL_PLAN_HASH,
         FINANCIAL_BACKFILL_PLAN_COMMIT_SHA: PLAN_ORIGIN_COMMIT_SHA,
         FINANCIAL_BACKFILL_EXECUTOR_COMMIT_SHA: currentCommit,
-        MOCK_ACTUAL_REMOTE_HEAD_SHA: 'divergent-sha-0000000000000000000000000000000000000000',
+        MOCK_ACTUAL_REMOTE_HEAD_SHA: '0000000000000000000000000000000000000001',
       };
 
       await expect(runLiveApply(['--execute-live', '--canary', '1'], env)).rejects.toThrow(

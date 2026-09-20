@@ -223,7 +223,7 @@ export class NotionSchemaValidator {
     return report;
   }
 
-  private async fetchDataSourceProperties(
+  public async fetchDataSourceProperties(
     dataSourceId: string,
   ): Promise<Record<string, NotionPropertySnapshot>> {
     if (!this.client) throw new Error('Notion client not initialized');

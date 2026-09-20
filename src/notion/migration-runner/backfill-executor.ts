@@ -21,6 +21,7 @@ import {
   calculateRecordFingerprint,
   canonicalizePageRecord,
   findPropertyContract,
+  resolveStableIdentitySpec,
 } from './backfill-serializer';
 import {
   BackfillPlanArtifact,
@@ -688,11 +689,13 @@ export class BackfillExecutor {
       const uncertainOps = this.journal.getUncertainOperations(runId);
       for (const uOp of uncertainOps) {
         if (uOp.action === 'CREATE') {
-          const stableIdProp =
-            uOp.targetDataSource === 'NOTION_DS_CARD_BILLS' ? 'ID Estável da Fatura' : 'ID da Fonte';
+          const matchingPlanOp = plan.operations[uOp.operationIndex];
+          const idSpec = resolveStableIdentitySpec(
+            matchingPlanOp || { targetDataSource: uOp.targetDataSource, stableId: uOp.stableId },
+          );
           const existingMatches = await this.adapter.findByStableIdentity(
             uOp.targetDataSource,
-            stableIdProp,
+            idSpec.physicalProperty,
             uOp.stableId,
           );
 
@@ -799,16 +802,12 @@ export class BackfillExecutor {
       if (op.operationType !== 'CREATE') continue;
       semanticCreates++;
 
-      const stableIdProp =
-        op.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS'
-          ? 'ID Estável da Fatura'
-          : 'ID da Fonte';
+      const idSpec = resolveStableIdentitySpec(op);
+      const stableIdProp = idSpec.physicalProperty;
 
       // Pre-create validation: validate all EXISTING_PAGE_ID relations against target state
       for (const [propName, refList] of Object.entries(op.relations)) {
-        const propContract = TARGET_CONTRACT[op.targetDataSource.envKey]?.properties.find(
-          (p) => p.notionProperty === propName,
-        );
+        const propContract = findPropertyContract(op.targetDataSource.envKey, propName);
         const targetEnvKey = propContract?.relationTargetEnvKey;
         if (!targetEnvKey) {
           this.journal.recordFailed(runId, i, 'FAIL_RELATION_TARGET_TYPE_MISMATCH');

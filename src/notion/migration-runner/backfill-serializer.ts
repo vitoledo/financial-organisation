@@ -69,6 +69,79 @@ export function findPropertyContract(
   );
 }
 
+export interface StableIdentitySpec {
+  domainField: string;
+  physicalProperty: string;
+  canonicalProperty: string;
+  stableIdValue: string;
+}
+
+/**
+ * Resolves the deterministic stable identity specification for a given operation.
+ * For Transactions: domainField='sourceTransactionId', physicalProperty='ID da fonte'
+ * For Card Bills: domainField='stableBillId', physicalProperty='ID Estável da Fatura'
+ */
+export function resolveStableIdentitySpec(
+  operation: {
+    targetDataSource: { envKey: string } | string;
+    sanitizedPayload?: Record<string, any>;
+    stableId?: string;
+  },
+): StableIdentitySpec {
+  const envKey =
+    typeof operation.targetDataSource === 'string'
+      ? operation.targetDataSource
+      : operation.targetDataSource.envKey;
+
+  const dsContract = TARGET_CONTRACT[envKey];
+  if (!dsContract) {
+    throw new Error(`FAIL_UNKNOWN_DATA_SOURCE: Data source '${envKey}' não existe no TARGET_CONTRACT.`);
+  }
+
+  let domainField = '';
+  if (envKey === 'NOTION_DS_TRANSACTIONS') {
+    domainField = 'sourceTransactionId';
+  } else if (envKey === 'NOTION_DS_CARD_BILLS') {
+    domainField = 'stableBillId';
+  } else {
+    domainField = 'sourceTransactionId';
+  }
+
+  const propContract = dsContract.properties.find((p) => p.domainField === domainField);
+  if (!propContract) {
+    throw new Error(
+      `FAIL_CONTRACT_NOT_FOUND: Propriedade com domainField '${domainField}' não encontrada em '${envKey}'.`,
+    );
+  }
+
+  // Find physical property key in sanitizedPayload if present
+  let physicalProperty = propContract.notionProperty;
+  if (operation.sanitizedPayload) {
+    for (const key of Object.keys(operation.sanitizedPayload)) {
+      const match = findPropertyContract(envKey, key);
+      if (match && match.domainField === domainField) {
+        physicalProperty = key;
+        break;
+      }
+    }
+  } else {
+    // If no sanitizedPayload, check explicit aliases known to be physical live names
+    if (envKey === 'NOTION_DS_TRANSACTIONS' && propContract.aliases?.includes('ID da fonte')) {
+      physicalProperty = 'ID da fonte';
+    }
+  }
+
+  const stableIdValue =
+    operation.stableId || (operation.sanitizedPayload ? String(operation.sanitizedPayload[physicalProperty] ?? '') : '');
+
+  return {
+    domainField,
+    physicalProperty,
+    canonicalProperty: propContract.notionProperty,
+    stableIdValue,
+  };
+}
+
 /**
  * Canonicalizes a single property value for deterministic comparison and fingerprinting.
  */
@@ -219,6 +292,14 @@ export function serializePayloadForNotion(
       );
     }
 
+    const isCanonical = key === contract.notionProperty;
+    const isExplicitAlias = Boolean(contract.aliases && contract.aliases.includes(key));
+    if (!isCanonical && !isExplicitAlias) {
+      throw new Error(
+        `FAIL_UNKNOWN_PROPERTY: Propriedade '${key}' não é canônica nem alias explícito do contrato '${contract.notionProperty}'.`,
+      );
+    }
+
     // null means unknown -> omit on create, do not convert to 0 or ""
     if (value === null || value === undefined) {
       continue;
@@ -227,57 +308,57 @@ export function serializePayloadForNotion(
     const canonicalVal = canonicalizePropertyValue(contract, value);
     canonicalProperties[contract.notionProperty] = canonicalVal;
 
-    // Format for Notion API
+    // Format for Notion API preserving physical property key
     switch (contract.notionType) {
       case 'title':
-        if (!canonicalVal && isCreate) {
-          throw new Error(`FAIL_MISSING_TITLE: Propriedade de título '${contract.notionProperty}' não pode ser vazia.`);
+        if ((!canonicalVal || String(canonicalVal).trim().length === 0) && isCreate) {
+          throw new Error(`FAIL_MISSING_TITLE: Propriedade de título '${key}' não pode ser vazia.`);
         }
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           title: [{ text: { content: String(canonicalVal) } }],
         };
         break;
 
       case 'rich_text':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           rich_text: canonicalVal ? [{ text: { content: String(canonicalVal) } }] : [],
         };
         break;
 
       case 'number': {
         const floatVal = contract.numberFormat === 'real' ? minorUnitsToMoney(canonicalVal) : canonicalVal;
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           number: floatVal,
         };
         break;
       }
 
       case 'select':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           select: { name: canonicalVal },
         };
         break;
 
       case 'multi_select':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           multi_select: (canonicalVal as string[]).map((name) => ({ name })),
         };
         break;
 
       case 'date':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           date: canonicalVal,
         };
         break;
 
       case 'checkbox':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           checkbox: canonicalVal,
         };
         break;
 
       case 'relation':
-        notionProperties[contract.notionProperty] = {
+        notionProperties[key] = {
           relation: (canonicalVal as string[]).map((id) => ({ id })),
         };
         break;
@@ -295,6 +376,13 @@ export function serializePayloadForNotion(
         `FAIL_UNKNOWN_PROPERTY: Propriedade relacional '${relKey}' não existe no TARGET_CONTRACT para '${envKey}'.`,
       );
     }
+    const isCanonical = relKey === contract.notionProperty;
+    const isExplicitAlias = Boolean(contract.aliases && contract.aliases.includes(relKey));
+    if (!isCanonical && !isExplicitAlias) {
+      throw new Error(
+        `FAIL_UNKNOWN_PROPERTY: Propriedade relacional '${relKey}' não é canônica nem alias explícito do contrato '${contract.notionProperty}'.`,
+      );
+    }
     if (contract.notionType !== 'relation') {
       throw new Error(
         `FAIL_TYPE_MISMATCH: Propriedade '${relKey}' no TARGET_CONTRACT não é do tipo relation.`,
@@ -303,17 +391,28 @@ export function serializePayloadForNotion(
 
     const sortedIds = [...targetPageIds].sort();
     canonicalProperties[contract.notionProperty] = sortedIds;
-    notionProperties[contract.notionProperty] = {
+    notionProperties[relKey] = {
       relation: sortedIds.map((id) => ({ id })),
     };
   }
 
-  // 3. Verify title requirement on create
+  // 3. Verify title requirement semantically on create
   if (isCreate) {
-    const titleProp = dsContract.properties.find((p) => p.notionType === 'title');
-    if (titleProp && !notionProperties[titleProp.notionProperty]) {
+    let hasValidTitle = false;
+    for (const key of Object.keys(notionProperties)) {
+      const contract = findPropertyContract(envKey, key);
+      if (contract && contract.notionType === 'title') {
+        const titleItems = notionProperties[key]?.title;
+        if (Array.isArray(titleItems) && titleItems.length > 0 && titleItems[0]?.text?.content) {
+          hasValidTitle = true;
+          break;
+        }
+      }
+    }
+    if (!hasValidTitle) {
+      const titleProp = dsContract.properties.find((p) => p.notionType === 'title');
       throw new Error(
-        `FAIL_MISSING_TITLE: Propriedade obrigatória de título '${titleProp.notionProperty}' ausente na criação em '${envKey}'.`,
+        `FAIL_MISSING_TITLE: Propriedade obrigatória de título '${titleProp?.notionProperty || 'title'}' ausente na criação em '${envKey}'.`,
       );
     }
   }
@@ -355,11 +454,29 @@ export function canonicalizePageRecord(
   }
 
   const canonical: Record<string, any> = {};
+  const recordKeys = Object.keys(recordProperties);
 
   for (const contract of dsContract.properties) {
     const propName = contract.notionProperty;
-    const rawValue = recordProperties[propName];
-    if (rawValue === undefined) continue;
+    const allowedKeys = [propName, ...(contract.aliases || [])];
+
+    // Find all matching keys in recordProperties that are present (not undefined)
+    const matches = recordKeys.filter(
+      (k) => allowedKeys.includes(k) && recordProperties[k] !== undefined,
+    );
+
+    if (matches.length === 0) {
+      continue;
+    }
+
+    if (matches.length > 1) {
+      throw new Error(
+        `FAIL_AMBIGUOUS_RUNTIME_PROPERTY: Múltiplas propriedades conflitantes para '${contract.notionProperty}' em '${envKey}': [${matches.join(', ')}].`,
+      );
+    }
+
+    const matchedKey = matches[0];
+    const rawValue = recordProperties[matchedKey];
 
     let parsedVal: any = null;
 

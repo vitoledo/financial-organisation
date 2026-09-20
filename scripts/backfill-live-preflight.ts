@@ -26,6 +26,12 @@ async function main() {
     console.log(`  • Relações Existentes: ${artifact.existingRelationsSummary.verified}/${artifact.existingRelationsSummary.total} válidas (Ausentes: ${artifact.existingRelationsSummary.missing}, Alvo incorreto: ${artifact.existingRelationsSummary.wrongTarget})`);
     console.log(`  • Stable Identities: ${artifact.stableIdentitiesSummary.totalChecked} verificadas (Conflitos: ${artifact.stableIdentitiesSummary.conflicts}, Duplicatas: ${artifact.stableIdentitiesSummary.duplicates})`);
     console.log(`  • Journal Segregado: ${artifact.journalStatus.path} (Gravável: ${artifact.journalStatus.writable}, GitIgnored: ${artifact.journalStatus.gitIgnored})`);
+    if (artifact.mutationWriteSurfaceCompatibility) {
+      console.log(`  • Exact Write Surface: ${artifact.mutationWriteSurfaceCompatibility.executableOperationsChecked} ops verificadas (Incompatíveis: ${artifact.mutationWriteSurfaceCompatibility.incompatibleOperations}, Ausentes: ${artifact.mutationWriteSurfaceCompatibility.missingPhysicalProperties}, Mismatches: ${artifact.mutationWriteSurfaceCompatibility.typeMismatches})`);
+    }
+    if (artifact.canaryOperation) {
+      console.log(`  • Canary Op #0: property='${artifact.canaryOperation.stableIdentityPhysicalProperty}', exists=${artifact.canaryOperation.everyPhysicalPropertyExists}, matches=${artifact.canaryOperation.matches}, valid=${artifact.canaryOperation.stableIdentityQueryValidated}`);
+    }
     console.log(`  • Mutações Live Notion: ${artifact.liveMutations} (ZERO)`);
     console.log(`  • Artefato Salvo em: .local/backfill-live-preflight.json`);
     console.log(`  • Validade: ${artifact.generatedAt} -> ${artifact.expiresAt} (${artifact.ttlMinutes} min)`);

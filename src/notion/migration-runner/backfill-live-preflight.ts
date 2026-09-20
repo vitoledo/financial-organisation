@@ -19,7 +19,7 @@ import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
-import { findPropertyContract, serializePayloadForNotion } from './backfill-serializer';
+import { findPropertyContract, serializePayloadForNotion, resolveStableIdentitySpec } from './backfill-serializer';
 import { BackfillJournal } from './backfill-journal';
 import { NotionSchemaValidator } from '../schema-validator';
 import { LiveNotionAdapter } from './backfill-adapter';
@@ -102,6 +102,24 @@ export interface LivePreflightArtifact {
     property: string;
     differenceType: string;
   }>;
+  mutationWriteSurfaceCompatibility?: {
+    executableOperationsChecked: number;
+    incompatibleOperations: number;
+    missingPhysicalProperties: number;
+    typeMismatches: number;
+    invalidSelectOptions: number;
+    relationTargetMismatches: number;
+  };
+  canaryOperation?: {
+    operationIndex: number;
+    targetDataSource: string;
+    physicalPropertyKeys: string[];
+    everyPhysicalPropertyExists: boolean;
+    stableIdentityPhysicalProperty: string;
+    stableIdentityQueryValidated: boolean;
+    matches: number;
+    validationError: number;
+  };
 }
 
 export class BackfillLivePreflight {
@@ -187,7 +205,7 @@ export class BackfillLivePreflight {
     // 2. Validação Real do Schema LIVE (Item 5)
     // ─────────────────────────────────────────────────────────────────────────
     const apiKey = this.envVars.NOTION_API_KEY?.trim() || '';
-    const schemaValidator = new NotionSchemaValidator(apiKey);
+    const schemaValidator = new NotionSchemaValidator(apiKey, '2026-03-11', this.client);
     const introspectionReport = await schemaValidator.runIntrospection(this.envVars, { treatAllAsExisting: true });
 
     let missingPropertiesCount = 0;
@@ -418,28 +436,254 @@ export class BackfillLivePreflight {
     const billsBase = liveTargetBases['NOTION_DS_CARD_BILLS'];
 
     for (const op of plan.operations) {
+      const idSpec = resolveStableIdentitySpec(op);
       if (op.targetDataSource.envKey === 'NOTION_DS_TRANSACTIONS') {
-        const matches = txBase.records.filter((r) => r.properties['ID da Fonte'] === op.stableId);
+        const matches = txBase.records.filter(
+          (r) =>
+            r.properties[idSpec.physicalProperty] === op.stableId ||
+            r.properties[idSpec.canonicalProperty] === op.stableId,
+        );
         if (matches.length === 1) {
           stableIdentityConflicts++;
-          reasons.push(`PREEXISTING_STABLE_ID: ID da Fonte '${op.stableId}' já existe no Notion live.`);
-        } else if (matches.length > 1) {
-          duplicateStableIds++;
-          reasons.push(`DUPLICATE_STABLE_ID: ID da Fonte '${op.stableId}' duplicado (${matches.length} páginas) no Notion live.`);
-        }
-      } else if (op.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS') {
-        const matches = billsBase.records.filter((r) => r.properties['ID Estável da Fatura'] === op.stableId);
-        if (matches.length === 1) {
-          stableIdentityConflicts++;
-          reasons.push(`PREEXISTING_STABLE_ID: ID Estável da Fatura '${op.stableId}' já existe no Notion live.`);
+          reasons.push(`PREEXISTING_STABLE_ID: ${idSpec.physicalProperty} '${op.stableId}' já existe no Notion live.`);
         } else if (matches.length > 1) {
           duplicateStableIds++;
           reasons.push(
-            `DUPLICATE_STABLE_ID: ID Estável da Fatura '${op.stableId}' duplicado (${matches.length} páginas) no Notion live.`,
+            `DUPLICATE_STABLE_ID: ${idSpec.physicalProperty} '${op.stableId}' duplicado (${matches.length} páginas) no Notion live.`,
+          );
+        }
+      } else if (op.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS') {
+        const matches = billsBase.records.filter(
+          (r) =>
+            r.properties[idSpec.physicalProperty] === op.stableId ||
+            r.properties[idSpec.canonicalProperty] === op.stableId,
+        );
+        if (matches.length === 1) {
+          stableIdentityConflicts++;
+          reasons.push(`PREEXISTING_STABLE_ID: ${idSpec.physicalProperty} '${op.stableId}' já existe no Notion live.`);
+        } else if (matches.length > 1) {
+          duplicateStableIds++;
+          reasons.push(
+            `DUPLICATE_STABLE_ID: ${idSpec.physicalProperty} '${op.stableId}' duplicado (${matches.length} páginas) no Notion live.`,
           );
         }
       }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8.1. Exact Write Surface Check: mutationWriteSurfaceCompatibility (Fase 2D)
+    // ─────────────────────────────────────────────────────────────────────────
+    let executableOperationsChecked = 0;
+    let incompatibleOperations = 0;
+    let missingPhysicalProperties = 0;
+    let typeMismatches = 0;
+    let invalidSelectOptions = 0;
+    let relationTargetMismatches = 0;
+
+    const liveSchemaByEnvKey: Record<string, Record<string, any>> = {};
+    const writeTargetKeys = ['NOTION_DS_TRANSACTIONS', 'NOTION_DS_CARD_BILLS'];
+
+    for (const targetKey of writeTargetKeys) {
+      const targetDsId = this.envVars[targetKey]?.trim();
+      if (targetDsId) {
+        try {
+          liveSchemaByEnvKey[targetKey] = await schemaValidator.fetchDataSourceProperties(targetDsId);
+        } catch (err: any) {
+          if (this.client || apiKey) {
+            reasons.push(
+              `FAIL_SCHEMA_INTROSPECTION: Não foi possível obter schema físico de ${targetKey}: ${err.message}`,
+            );
+          }
+        }
+      }
+    }
+
+    for (const op of plan.operations as BackfillOperation[]) {
+      if (op.operationType !== 'CREATE') continue;
+      executableOperationsChecked++;
+
+      const envKey = op.targetDataSource.envKey;
+      const liveSchema = liveSchemaByEnvKey[envKey];
+
+      if (liveSchema) {
+        const existingRelations: Record<string, string[]> = {};
+        for (const [propName, refList] of Object.entries(op.relations)) {
+          const existingIds = (refList as any[])
+            .filter((r) => r.type === 'EXISTING_PAGE_ID')
+            .map((r) => r.target);
+          if (existingIds.length > 0) {
+            existingRelations[propName] = existingIds;
+          }
+        }
+
+        let serialized: { notionProperties: Record<string, any> };
+        try {
+          serialized = serializePayloadForNotion(
+            envKey,
+            op.sanitizedPayload,
+            existingRelations,
+            true,
+          );
+        } catch (err: any) {
+          incompatibleOperations++;
+          reasons.push(
+            `FAIL_SERIALIZE_STAGE1: Falha ao serializar payload da op ${op.stableId}: ${err.message}`,
+          );
+          continue;
+        }
+
+        let opHasIncompatibility = false;
+
+        for (const [propKey, propVal] of Object.entries(serialized.notionProperties)) {
+          const liveProp = liveSchema[propKey];
+          if (!liveProp) {
+            missingPhysicalProperties++;
+            opHasIncompatibility = true;
+            continue;
+          }
+
+          let expectedNotionType = 'unknown';
+          if ('title' in propVal) expectedNotionType = 'title';
+          else if ('rich_text' in propVal) expectedNotionType = 'rich_text';
+          else if ('number' in propVal) expectedNotionType = 'number';
+          else if ('select' in propVal) expectedNotionType = 'select';
+          else if ('multi_select' in propVal) expectedNotionType = 'multi_select';
+          else if ('date' in propVal) expectedNotionType = 'date';
+          else if ('checkbox' in propVal) expectedNotionType = 'checkbox';
+          else if ('relation' in propVal) expectedNotionType = 'relation';
+
+          if (liveProp.type !== expectedNotionType) {
+            typeMismatches++;
+            opHasIncompatibility = true;
+          }
+
+          if (expectedNotionType === 'select' && propVal.select && propVal.select.name) {
+            const optName = propVal.select.name;
+            if (liveProp.selectOptions && !liveProp.selectOptions.includes(optName)) {
+              invalidSelectOptions++;
+              opHasIncompatibility = true;
+            }
+          }
+
+          if (expectedNotionType === 'relation') {
+            const contractProp = findPropertyContract(envKey, propKey);
+            const expTargetKey = contractProp?.relationTargetEnvKey;
+            if (expTargetKey) {
+              const expTargetDsId = this.envVars[expTargetKey]?.trim().replace(/-/g, '').toLowerCase();
+              const actualDsId = liveProp.relationDataSourceId?.replace(/-/g, '').toLowerCase();
+              const actualDbId = liveProp.relationDatabaseId?.replace(/-/g, '').toLowerCase();
+              if (
+                expTargetDsId &&
+                actualDsId !== expTargetDsId &&
+                actualDbId !== expTargetDsId
+              ) {
+                relationTargetMismatches++;
+                opHasIncompatibility = true;
+              }
+            }
+          }
+        }
+
+        if (opHasIncompatibility) {
+          incompatibleOperations++;
+        }
+      }
+    }
+
+    if (
+      incompatibleOperations > 0 ||
+      missingPhysicalProperties > 0 ||
+      typeMismatches > 0 ||
+      invalidSelectOptions > 0 ||
+      relationTargetMismatches > 0
+    ) {
+      reasons.push(
+        `FAIL_WRITE_SURFACE_INCOMPATIBLE: Exact write surface check falhou (${incompatibleOperations} ops incompatíveis, ${missingPhysicalProperties} props ausentes, ${typeMismatches} types divergentes, ${invalidSelectOptions} opções inválidas, ${relationTargetMismatches} relation targets incorretos).`,
+      );
+    }
+
+    const mutationWriteSurfaceCompatibility = {
+      executableOperationsChecked,
+      incompatibleOperations,
+      missingPhysicalProperties,
+      typeMismatches,
+      invalidSelectOptions,
+      relationTargetMismatches,
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8.2. Operation 0 Read-Only Identity Query Test (Canary Safe Read)
+    // ─────────────────────────────────────────────────────────────────────────
+    const op0 = (plan.operations as BackfillOperation[])[0];
+    const op0EnvKey = op0.targetDataSource.envKey;
+    const op0IdSpec = resolveStableIdentitySpec(op0);
+
+    const op0ExistingRelations: Record<string, string[]> = {};
+    for (const [propName, refList] of Object.entries(op0.relations)) {
+      const existingIds = (refList as any[])
+        .filter((r) => r.type === 'EXISTING_PAGE_ID')
+        .map((r) => r.target);
+      if (existingIds.length > 0) {
+        op0ExistingRelations[propName] = existingIds;
+      }
+    }
+
+    const op0Serialized = serializePayloadForNotion(
+      op0EnvKey,
+      op0.sanitizedPayload,
+      op0ExistingRelations,
+      true,
+    );
+
+    const op0PhysicalPropertyKeys = Object.keys(op0Serialized.notionProperties).sort();
+    const op0LiveSchema = liveSchemaByEnvKey[op0EnvKey] || {};
+    const op0EveryPhysicalPropertyExists =
+      Object.keys(op0LiveSchema).length > 0
+        ? op0PhysicalPropertyKeys.every((k) => op0LiveSchema[k] !== undefined)
+        : true;
+
+    let op0Matches = 0;
+    let op0ValidationError = 0;
+    let op0QueryValidated = false;
+
+    try {
+      const matches = await liveAdapter.findByStableIdentity(
+        op0EnvKey,
+        op0IdSpec.physicalProperty,
+        op0.stableId,
+      );
+      op0Matches = matches.length;
+      op0QueryValidated = true;
+    } catch (err: any) {
+      op0ValidationError++;
+      reasons.push(
+        `FAIL_CANARY_STABLE_IDENTITY_QUERY: Erro na query read-only da op 0 com property '${op0IdSpec.physicalProperty}': ${err.message}`,
+      );
+    }
+
+    if (!op0EveryPhysicalPropertyExists) {
+      const missingKeys = op0PhysicalPropertyKeys.filter((k) => op0LiveSchema[k] === undefined);
+      reasons.push(
+        `FAIL_CANARY_PHYSICAL_PROPERTIES_MISSING: Propriedades da op 0 ausentes no schema live: [${missingKeys.join(', ')}].`,
+      );
+    }
+
+    if (op0Matches > 0) {
+      reasons.push(
+        `PREEXISTING_CANARY_PAGE: Query read-only da op 0 retornou ${op0Matches} páginas existentes para stableId '${op0.stableId}'.`,
+      );
+    }
+
+    const canaryOperation = {
+      operationIndex: 0,
+      targetDataSource: op0EnvKey,
+      physicalPropertyKeys: op0PhysicalPropertyKeys,
+      everyPhysicalPropertyExists: op0EveryPhysicalPropertyExists,
+      stableIdentityPhysicalProperty: op0IdSpec.physicalProperty,
+      stableIdentityQueryValidated: op0QueryValidated,
+      matches: op0Matches,
+      validationError: op0ValidationError,
+    };
 
     // ─────────────────────────────────────────────────────────────────────────
     // 9. Validar Journal de Produção Vazio / Segregado (Item 14)
@@ -555,6 +799,8 @@ export class BackfillLivePreflight {
         existingRunsCount,
       },
       structuralDiff: structuralDiff.length > 0 ? structuralDiff : undefined,
+      mutationWriteSurfaceCompatibility,
+      canaryOperation,
     };
 
     // Gravação segura e atômica do artefato .local/backfill-live-preflight.json
@@ -661,6 +907,33 @@ export function validatePreflightBinding(
   }
   if (!artifact.targets || artifact.targets.transactions !== 0 || artifact.targets.bills !== 0) {
     return { valid: false, reason: `FAIL_PREFLIGHT_TARGETS_NOT_PRISTINE: Targets ausentes ou não pristine (transactions: ${artifact.targets?.transactions}, bills: ${artifact.targets?.bills}).` };
+  }
+
+  if (
+    artifact.mutationWriteSurfaceCompatibility &&
+    (artifact.mutationWriteSurfaceCompatibility.incompatibleOperations !== 0 ||
+      artifact.mutationWriteSurfaceCompatibility.missingPhysicalProperties !== 0 ||
+      artifact.mutationWriteSurfaceCompatibility.typeMismatches !== 0 ||
+      artifact.mutationWriteSurfaceCompatibility.invalidSelectOptions !== 0 ||
+      artifact.mutationWriteSurfaceCompatibility.relationTargetMismatches !== 0)
+  ) {
+    return {
+      valid: false,
+      reason: `FAIL_PREFLIGHT_WRITE_SURFACE_INCOMPATIBLE: mutationWriteSurfaceCompatibility possui erros (${artifact.mutationWriteSurfaceCompatibility.incompatibleOperations} incompatíveis, ${artifact.mutationWriteSurfaceCompatibility.missingPhysicalProperties} props ausentes).`,
+    };
+  }
+
+  if (
+    artifact.canaryOperation &&
+    (!artifact.canaryOperation.everyPhysicalPropertyExists ||
+      !artifact.canaryOperation.stableIdentityQueryValidated ||
+      artifact.canaryOperation.matches !== 0 ||
+      artifact.canaryOperation.validationError !== 0)
+  ) {
+    return {
+      valid: false,
+      reason: `FAIL_PREFLIGHT_CANARY_OP_INVALID: canaryOperation falhou na validação prévia (matches: ${artifact.canaryOperation.matches}, validationError: ${artifact.canaryOperation.validationError}).`,
+    };
   }
 
   const expPlanOrigin = expected.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;

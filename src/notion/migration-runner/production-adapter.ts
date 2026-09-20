@@ -387,15 +387,30 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       throw new Error(`FAIL_CONTRACT_NOT_FOUND: Contrato não encontrado para '${targetDataSourceEnvKey}'.`);
     }
 
-    const propContract = contract.properties.find((p) => p.notionProperty === stableIdProperty);
+    const propContract = findPropertyContract(targetDataSourceEnvKey, stableIdProperty);
     if (!propContract) {
       throw new Error(
         `FAIL_PROPERTY_CONTRACT_NOT_FOUND: Propriedade '${stableIdProperty}' não encontrada no contrato de '${targetDataSourceEnvKey}'.`,
       );
     }
 
+    const isCanonical = stableIdProperty === propContract.notionProperty;
+    const isExplicitAlias = Boolean(propContract.aliases && propContract.aliases.includes(stableIdProperty));
+    const isDomainField = stableIdProperty === propContract.domainField;
+
+    if (!isCanonical && !isExplicitAlias && !isDomainField) {
+      throw new Error(
+        `FAIL_UNKNOWN_PROPERTY: Propriedade '${stableIdProperty}' não é canônica, alias explícito nem domainField de '${targetDataSourceEnvKey}'.`,
+      );
+    }
+
+    let physicalPropName = stableIdProperty;
+    if (isDomainField && !isCanonical && !isExplicitAlias) {
+      physicalPropName = propContract.aliases?.find((a) => a === 'ID da fonte') || propContract.notionProperty;
+    }
+
     const filter = {
-      property: stableIdProperty,
+      property: physicalPropName,
       rich_text: {
         equals: stableIdValue,
       },

@@ -354,4 +354,114 @@ describe('Phase 2C: Real Read-Only Live Preflight and Production Wiring', { time
       }
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 6. EXACT WRITE SURFACE COMPATIBILITY & CANARY PRE-CHECK (Fase 2D)
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('6. Exact Write Surface Compatibility & Canary Pre-Check', () => {
+    function buildBaseArtifact(): LivePreflightArtifact {
+      return {
+        preflightVersion: '1.0.0',
+        timestamp: new Date().toISOString(),
+        generatedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        ttlMinutes: 15,
+        executorCommitSha: 'test-commit',
+        executorParentCommitSha: 'parent-commit',
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        frozenTargetStateHash: FROZEN_TARGET_STATE_HASH,
+        liveTargetStateHash: FROZEN_TARGET_STATE_HASH,
+        workspaceIdentityHash: 'ws-hash',
+        actorType: 'bot',
+        schema: { total: 13, verified: 13, missing: 0, mismatches: 0 },
+        targets: { transactions: 0, bills: 0 },
+        stableIdentityConflicts: 0,
+        relationTargetErrors: 0,
+        liveMutations: 0,
+        readyForLiveApplyReview: true,
+        readyForApply: false,
+        reasons: [],
+        rowCountsByDataSource: {},
+        existingRelationsSummary: { total: 320, verified: 320, missing: 0, wrongTarget: 0 },
+        stableIdentitiesSummary: { totalChecked: 159, conflicts: 0, duplicates: 0 },
+        journalStatus: {
+          path: '.local/backfill-journal.db',
+          gitIgnored: true,
+          exists: false,
+          writable: true,
+        },
+        mutationWriteSurfaceCompatibility: {
+          executableOperationsChecked: 159,
+          incompatibleOperations: 0,
+          missingPhysicalProperties: 0,
+          typeMismatches: 0,
+          invalidSelectOptions: 0,
+          relationTargetMismatches: 0,
+        },
+        canaryOperation: {
+          operationIndex: 0,
+          targetDataSource: 'NOTION_DS_TRANSACTIONS',
+          physicalPropertyKeys: ['Conta', 'Data', 'HMAC Contraparte', 'Hash Canônico', 'ID da fonte', 'Lançamento', 'Moeda', 'Movimento', 'Natureza', 'Status', 'Valor', 'Valor Bruto da Fonte'],
+          everyPhysicalPropertyExists: true,
+          stableIdentityPhysicalProperty: 'ID da fonte',
+          stableIdentityQueryValidated: true,
+          matches: 0,
+          validationError: 0,
+        },
+      };
+    }
+
+    it('validatePreflightBinding rejects artifact when mutationWriteSurfaceCompatibility has missing properties', () => {
+      const artifact = buildBaseArtifact();
+      artifact.mutationWriteSurfaceCompatibility = {
+        executableOperationsChecked: 159,
+        incompatibleOperations: 1,
+        missingPhysicalProperties: 1,
+        typeMismatches: 0,
+        invalidSelectOptions: 0,
+        relationTargetMismatches: 0,
+      };
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_WRITE_SURFACE_INCOMPATIBLE');
+    });
+
+    it('validatePreflightBinding rejects artifact when canaryOperation matches > 0 (preexisting page)', () => {
+      const artifact = buildBaseArtifact();
+      artifact.canaryOperation!.matches = 1;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_CANARY_OP_INVALID');
+    });
+
+    it('validatePreflightBinding rejects artifact when canaryOperation has validation errors', () => {
+      const artifact = buildBaseArtifact();
+      artifact.canaryOperation!.validationError = 1;
+      artifact.canaryOperation!.stableIdentityQueryValidated = false;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_CANARY_OP_INVALID');
+    });
+
+    it('validatePreflightBinding rejects artifact when canaryOperation has missing physical properties', () => {
+      const artifact = buildBaseArtifact();
+      artifact.canaryOperation!.everyPhysicalPropertyExists = false;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_CANARY_OP_INVALID');
+    });
+
+    it('validatePreflightBinding accepts clean artifact with 159 valid operations and 0 canary matches', () => {
+      const artifact = buildBaseArtifact();
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(true);
+    });
+  });
 });
