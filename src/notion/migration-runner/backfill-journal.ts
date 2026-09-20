@@ -42,6 +42,7 @@ export interface BackfillOperationRecord {
 }
 
 export interface BackfillPageMapRecord {
+  planHash: string;
   stableId: string;
   notionPageId: string;
   targetDataSource: string;
@@ -115,10 +116,12 @@ export class BackfillJournal {
         ON backfill_operations (stable_id);
 
       CREATE TABLE IF NOT EXISTS backfill_page_map (
-        stable_id TEXT PRIMARY KEY,
-        notion_page_id TEXT NOT NULL UNIQUE,
+        plan_hash TEXT NOT NULL,
+        stable_id TEXT NOT NULL,
+        notion_page_id TEXT NOT NULL,
         target_data_source TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (plan_hash, stable_id)
       );
     `);
   }
@@ -346,8 +349,7 @@ export class BackfillJournal {
       .prepare(`
         SELECT * FROM backfill_operations
         WHERE run_id = ? AND (
-          (status = 'PENDING' AND attempts > 0) OR
-          (status = 'APPLIED')
+          status NOT IN ('VERIFIED', 'NO_OP_VERIFIED') AND (attempts > 0 OR status = 'APPLIED')
         )
         ORDER BY operation_index ASC
       `)
@@ -370,25 +372,39 @@ export class BackfillJournal {
   }
 
   public savePageMapping(
+    planHash: string,
     stableId: string,
     notionPageId: string,
     targetDataSource: string,
     createdAt: string = new Date().toISOString(),
   ): void {
+    const existing = this.db
+      .prepare('SELECT notion_page_id FROM backfill_page_map WHERE plan_hash = ? AND stable_id = ?')
+      .get(planHash, stableId) as any;
+
+    if (existing) {
+      if (existing.notion_page_id !== notionPageId) {
+        throw new Error(
+          `FAIL_PAGE_MAPPING_CONFLICT: Conflito de mapeamento para stableId '${stableId}' no plano '${planHash}'. Existente: '${existing.notion_page_id}', Tentado: '${notionPageId}'.`,
+        );
+      }
+      return;
+    }
+
     const stmt = this.db.prepare(`
-      INSERT INTO backfill_page_map (stable_id, notion_page_id, target_data_source, created_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(stable_id) DO UPDATE SET notion_page_id = excluded.notion_page_id
+      INSERT INTO backfill_page_map (plan_hash, stable_id, notion_page_id, target_data_source, created_at)
+      VALUES (?, ?, ?, ?, ?)
     `);
-    stmt.run(stableId, notionPageId, targetDataSource, createdAt);
+    stmt.run(planHash, stableId, notionPageId, targetDataSource, createdAt);
   }
 
-  public getPageMapping(stableId: string): BackfillPageMapRecord | null {
+  public getPageMapping(planHash: string, stableId: string): BackfillPageMapRecord | null {
     const row = this.db
-      .prepare('SELECT * FROM backfill_page_map WHERE stable_id = ?')
-      .get(stableId) as any;
+      .prepare('SELECT * FROM backfill_page_map WHERE plan_hash = ? AND stable_id = ?')
+      .get(planHash, stableId) as any;
     if (!row) return null;
     return {
+      planHash: row.plan_hash,
       stableId: row.stable_id,
       notionPageId: row.notion_page_id,
       targetDataSource: row.target_data_source,
@@ -396,15 +412,43 @@ export class BackfillJournal {
     };
   }
 
-  public getAllPageMappings(): Map<string, string> {
+  public getAllPageMappings(planHash: string): Map<string, string> {
     const rows = this.db
-      .prepare('SELECT stable_id, notion_page_id FROM backfill_page_map')
-      .all() as any[];
+      .prepare('SELECT stable_id, notion_page_id FROM backfill_page_map WHERE plan_hash = ?')
+      .all(planHash) as any[];
     const map = new Map<string, string>();
     for (const r of rows) {
       map.set(r.stable_id, r.notion_page_id);
     }
     return map;
+  }
+
+  public validateRunMetadata(
+    runId: string,
+    expected: {
+      planHash: string;
+      planOriginCommitSha: string;
+      sourceSnapshotHash: string;
+      targetSnapshotHash: string;
+      targetStateHash: string;
+    },
+  ): void {
+    const run = this.getRun(runId);
+    if (!run) {
+      throw new Error(`FAIL_JOURNAL_BINDING_MISMATCH: Run '${runId}' não encontrado no journal.`);
+    }
+
+    if (
+      run.planHash !== expected.planHash ||
+      run.planOriginCommitSha !== expected.planOriginCommitSha ||
+      run.sourceSnapshotHash !== expected.sourceSnapshotHash ||
+      run.targetSnapshotHash !== expected.targetSnapshotHash ||
+      run.targetStateHash !== expected.targetStateHash
+    ) {
+      throw new Error(
+        `FAIL_JOURNAL_BINDING_MISMATCH: Metadados do run no journal divergem dos hashes de baseline congelados da execução.`,
+      );
+    }
   }
 
   public countByStatus(runId: string): Record<BackfillOperationStatus, number> {

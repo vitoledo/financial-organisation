@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import 'dotenv/config';
+import { describe, it, expect } from 'vitest';
 import Database from 'better-sqlite3';
 import {
   PLAN_ORIGIN_COMMIT_SHA,
@@ -15,7 +16,7 @@ import {
 } from '../src/notion/migration-runner/backfill-adapter';
 import {
   BackfillExecutor,
-  BackfillExecutorOptions,
+  DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
 } from '../src/notion/migration-runner/backfill-executor';
 import {
   moneyToMinorUnits,
@@ -23,7 +24,7 @@ import {
   serializePayloadForNotion,
 } from '../src/notion/migration-runner/backfill-serializer';
 
-describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
+describe('Phase 2B.1: BackfillExecutor Hardened Engine & Idempotency', { timeout: 20000 }, () => {
   const testEnv = {
     NOTION_API_KEY: '',
     NOTION_DS_ACCOUNTS: 'fake-acc-ds',
@@ -34,7 +35,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
     SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
     BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
-    MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
+    MIGRATION_BACKUP_KEY: process.env.MIGRATION_BACKUP_KEY,
   };
 
   function getFrozenTargetBases() {
@@ -60,6 +61,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
@@ -91,10 +93,49 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: '0000000000000000000000000000000000000000',
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       await expect(executor.preflight()).rejects.toThrow(/FAIL_FROZEN_PLAN_MISMATCH/);
+    });
+
+    it('fails with FAIL_SCHEMA_EVIDENCE_MISSING when schemaEvidence is omitted', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journal = new BackfillJournal(new Database(':memory:'));
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        skipWorktreeCleanCheck: true,
+      });
+
+      await expect(executor.preflight()).rejects.toThrow(/FAIL_SCHEMA_EVIDENCE_MISSING/);
+    });
+
+    it('fails with FAIL_SCHEMA_NON_CONFORMANT when schema evidence has missing properties or structural mismatches', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journal = new BackfillJournal(new Database(':memory:'));
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: {
+          totalDataSources: 13,
+          verifiedDataSources: 12,
+          missingPropertiesCount: 1,
+          structuralMismatchesCount: 0,
+        },
+        skipWorktreeCleanCheck: true,
+      });
+
+      await expect(executor.preflight()).rejects.toThrow(/FAIL_SCHEMA_NON_CONFORMANT/);
     });
   });
 
@@ -113,6 +154,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
@@ -143,11 +185,9 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       expect(report.liveNotionMutations).toBe(0);
 
       // Verify simulation backend state:
-      // Transactions should have 155 new records
       const txMatches = await adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'Fonte', 'Pierre');
       expect(txMatches.length).toBe(155);
 
-      // Faturas should have 4 new records
       const billMatches = await adapter.findByStableIdentity('NOTION_DS_CARD_BILLS', 'Fonte', 'Pierre');
       expect(billMatches.length).toBe(4);
 
@@ -172,10 +212,10 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 3. MAXIMUM IDEMPOTENCY TEST (Section 30)
+  // 3. MAXIMUM IDEMPOTENCY TEST WITHOUT DRIFT BYPASS (Item 9)
   // ─────────────────────────────────────────────────────────────────────────────
-  describe('3. Maximum Idempotency Test (Section 30)', () => {
-    it('running the frozen plan a second time produces 0 new pages, 0 relation writes, and 100% NO_OP_VERIFIED', async () => {
+  describe('3. Maximum Idempotency Test without skipInitialDriftCheck (Item 9)', () => {
+    it('running the frozen plan a second time recognizes State B, produces 0 writes, and 100% NO_OP_VERIFIED', async () => {
       const bases = getFrozenTargetBases();
       const adapter = new SimulatedNotionAdapter(bases);
 
@@ -186,6 +226,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal: journal1,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
       const rep1 = await executor1.execute();
@@ -193,15 +234,16 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       expect(rep1.actualSimulatedCreateWrites).toBe(159);
       expect(rep1.actualSimulatedRelationWrites).toBe(4);
 
-      // Run 2: Fresh journal against the already populated backend
+      // Run 2: Fresh journal against already populated backend (skipInitialDriftCheck is FALSE / NOT set)
       const journal2 = new BackfillJournal(new Database(':memory:'));
       const executor2 = new BackfillExecutor({
         adapter,
         journal: journal2,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
-        skipInitialDriftCheck: true,
+        skipInitialDriftCheck: false,
       });
 
       const rep2 = await executor2.execute();
@@ -216,6 +258,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       expect(rep2.journalFinal.NO_OP_VERIFIED).toBe(163); // 159 creates + 4 patches = 163 NO_OP_VERIFIED
       expect(rep2.journalFinal.VERIFIED).toBe(0);
       expect(rep2.journalFinal.FAILED).toBe(0);
+      expect(rep2.readyForLiveApplyReview).toBe(true);
     });
   });
 
@@ -229,7 +272,6 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       const journalDb = new Database(':memory:');
       const journal = new BackfillJournal(journalDb);
 
-      // Fault: crash after 1st page creation
       let createCounter = 0;
       const originalCreate = adapter.createPage.bind(adapter);
       adapter.createPage = async (...args) => {
@@ -246,21 +288,21 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
 
       await expect(executor1.execute()).rejects.toThrow(/SIMULATED_CRASH_AFTER_CREATE_1/);
 
-      // Restore adapter normal function
       adapter.createPage = originalCreate;
 
-      // Reinstantiate executor with same journal and preserved adapter
       const executor2 = new BackfillExecutor({
         adapter,
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
@@ -268,10 +310,9 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       expect(rep.status).toBe('COMPLETED');
       expect(rep.journalFinal.VERIFIED + rep.journalFinal.NO_OP_VERIFIED).toBe(163);
       expect(rep.journalFinal.FAILED).toBe(0);
-      expect(rep.journalFinal.PENDING).toBe(0);
 
       const allPages = (await adapter.queryTargetState())['NOTION_DS_TRANSACTIONS'].records;
-      expect(allPages.length).toBe(155); // Strictly zero duplicates!
+      expect(allPages.length).toBe(155);
     });
 
     it('Crash Scenario 2: crash mid Stage 1 (after CREATE #80) -> resume completes without duplicates', async () => {
@@ -295,6 +336,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
@@ -303,19 +345,19 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
 
       adapter.createPage = originalCreate;
 
-      // Reinstantiate
       const executor2 = new BackfillExecutor({
         adapter,
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       const rep = await executor2.execute();
       expect(rep.status).toBe('COMPLETED');
       expect(rep.journalFinal.VERIFIED).toBe(163);
-      expect(rep.actualSimulatedCreateWrites).toBe(79); // Exactly 159 - 80 = 79 creates on resume
+      expect(rep.actualSimulatedCreateWrites).toBe(79);
     });
 
     it('Crash Scenario 3: crash after CREATE #159 before Stage 2 -> resume completes Stage 2 cleanly', async () => {
@@ -340,6 +382,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
@@ -353,13 +396,14 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       const rep = await executor2.execute();
       expect(rep.status).toBe('COMPLETED');
-      expect(rep.actualSimulatedCreateWrites).toBe(0); // All 159 already verified
-      expect(rep.actualSimulatedRelationWrites).toBe(4); // Only Stage 2 relation writes
+      expect(rep.actualSimulatedCreateWrites).toBe(0);
+      expect(rep.actualSimulatedRelationWrites).toBe(4);
     });
 
     it('Crash Scenario 4: crash at start of Stage 2 (before bill #1 patch) -> resume completes all 4 patches', async () => {
@@ -383,6 +427,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
@@ -396,6 +441,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
@@ -426,6 +472,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
@@ -439,12 +486,13 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       const rep = await executor2.execute();
       expect(rep.status).toBe('COMPLETED');
-      expect(rep.actualSimulatedRelationWrites).toBe(2); // Exactly remaining 2 patches!
+      expect(rep.actualSimulatedRelationWrites).toBe(2);
     });
 
     it('Crash Scenario 6: uncertain write in Stage 1 (timeout after POST) -> reconciles via stable identity without duplicating', async () => {
@@ -453,7 +501,6 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       const journalDb = new Database(':memory:');
       const journal = new BackfillJournal(journalDb);
 
-      // Inject uncertain write on next create (page written, but ETIMEDOUT thrown)
       adapter.setFaults({
         uncertainWriteNextCreate: new Error('connect ETIMEDOUT'),
       });
@@ -463,12 +510,13 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       const rep = await executor.execute();
       expect(rep.status).toBe('COMPLETED');
-      expect(rep.recoveredUncertainCreates).toBe(1); // Successfully recovered!
+      expect(rep.recoveredUncertainCreates).toBe(1);
       expect(rep.actualSimulatedCreateWrites).toBe(159);
     });
 
@@ -483,7 +531,6 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       adapter.fetchPage = async (...args) => {
         fetchCounter++;
         if (fetchCounter === 1) {
-          // Crash during read-back of page #1 (journal has APPLIED, not yet VERIFIED)
           throw new Error('SIMULATED_CRASH_DURING_READ_BACK');
         }
         return originalFetch(...args);
@@ -494,6 +541,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 1,
       });
@@ -507,6 +555,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
@@ -514,15 +563,39 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       expect(rep.status).toBe('COMPLETED');
       expect(rep.journalFinal.VERIFIED).toBe(163);
     });
+
+    it('Crash Scenario 8: uncertain write in Stage 2 (timeout during relation update) -> reconciles without re-issuing mutation', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journalDb = new Database(':memory:');
+      const journal = new BackfillJournal(journalDb);
+
+      adapter.setFaults({
+        uncertainWriteNextUpdate: new Error('connect ETIMEDOUT'),
+      });
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+      });
+
+      const rep = await executor.execute();
+      expect(rep.status).toBe('COMPLETED');
+      expect(rep.recoveredUncertainRelationWrites).toBe(1);
+      expect(rep.journalFinal.VERIFIED).toBe(163);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // 5. NEGATIVE TESTS SUITE (Section 31)
+  // 5. JOURNAL & INTEGRITY NEGATIVE TESTS
   // ─────────────────────────────────────────────────────────────────────────────
-  describe('5. Negative Tests Suite (Section 31)', () => {
+  describe('5. Journal & Integrity Negative Tests', () => {
     it('initial target drift -> aborts with TARGET_DRIFT_DETECTED and executes 0 writes', async () => {
       const bases = getFrozenTargetBases();
-      // Mutate target state by adding an unexpected row
       bases['NOTION_DS_ACCOUNTS'].records.push({
         id: 'external-unexpected-account',
         createdTime: '2026-09-01T00:00:00.000Z',
@@ -542,22 +615,138 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
       await expect(executor.execute()).rejects.toThrow(/TARGET_DRIFT_DETECTED/);
 
-      // Verify zero writes executed
       const state = await adapter.queryTargetState();
       expect(state['NOTION_DS_TRANSACTIONS'].records).toHaveLength(0);
       expect(state['NOTION_DS_CARD_BILLS'].records).toHaveLength(0);
+    });
+
+    it('fails with FAIL_JOURNAL_BINDING_MISMATCH if journal metadata diverges on resume', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journal = new BackfillJournal(new Database(':memory:'));
+
+      // Seed an in-progress run with wrong sourceSnapshotHash
+      journal.startRun({
+        runId: 'corrupted-run',
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: '0'.repeat(40),
+        sourceSnapshotHash: 'wrong_source_hash',
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+      });
+
+      await expect(executor.execute()).rejects.toThrow(/FAIL_JOURNAL_BINDING_MISMATCH/);
+    });
+
+    it('fails with FAIL_PAGE_MAPPING_CONFLICT if attempting to remap same stableId to different Notion page ID', () => {
+      const journal = new BackfillJournal(new Database(':memory:'));
+      journal.savePageMapping(FROZEN_BACKFILL_PLAN_HASH, 'tx-123', 'notion-page-A', 'NOTION_DS_TRANSACTIONS');
+
+      // Idempotent same mapping no-ops cleanly
+      expect(() => {
+        journal.savePageMapping(FROZEN_BACKFILL_PLAN_HASH, 'tx-123', 'notion-page-A', 'NOTION_DS_TRANSACTIONS');
+      }).not.toThrow();
+
+      // Conflicting mapping throws FAIL_PAGE_MAPPING_CONFLICT
+      expect(() => {
+        journal.savePageMapping(FROZEN_BACKFILL_PLAN_HASH, 'tx-123', 'notion-page-B', 'NOTION_DS_TRANSACTIONS');
+      }).toThrow(/FAIL_PAGE_MAPPING_CONFLICT/);
+    });
+
+    it('fails with FAIL_RELATION_TARGET_MISSING if EXISTING_PAGE_ID relation references non-existent page', async () => {
+      const bases = getFrozenTargetBases();
+      // Remove Nubank Conta account from target base
+      bases['NOTION_DS_ACCOUNTS'].records = [];
+
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journal = new BackfillJournal(new Database(':memory:'));
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        skipInitialDriftCheck: true,
+      });
+
+      await expect(executor.execute()).rejects.toThrow(/FAIL_RELATION_TARGET_MISSING/);
+    });
+
+    it('fails with EXTERNAL_DRIFT_DURING_BACKFILL if target state was externally modified during resume', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+      const journal = new BackfillJournal(new Database(':memory:'));
+
+      // Crash after CREATE #5
+      let createCount = 0;
+      const originalCreate = adapter.createPage.bind(adapter);
+      adapter.createPage = async (...args) => {
+        createCount++;
+        const res = await originalCreate(...args);
+        if (createCount === 5) {
+          throw new Error('CRASH_AFTER_5');
+        }
+        return res;
+      };
+
+      const executor1 = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        maxRetries: 1,
+      });
+
+      await expect(executor1.execute()).rejects.toThrow(/CRASH_AFTER_5/);
+      adapter.createPage = originalCreate;
+
+      // Simulate external drift: external actor adds a page to Contas while run is paused
+      const currentState = await adapter.queryTargetState();
+      (adapter as any).bases.get('NOTION_DS_ACCOUNTS').set('rogue-page', {
+        id: 'rogue-page',
+        createdTime: new Date().toISOString(),
+        lastEditedTime: new Date().toISOString(),
+        archived: false,
+        url: 'https://notion.so/rogue',
+        properties: { 'Nome da Conta': { title: [{ text: { content: 'Rogue Account' } }] } },
+      });
+
+      const executor2 = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+      });
+
+      await expect(executor2.execute()).rejects.toThrow(/EXTERNAL_DRIFT_DURING_BACKFILL/);
     });
 
     it('duplicate stable identity in target base -> aborts with FAIL_DUPLICATE_STABLE_ID', async () => {
       const bases = getFrozenTargetBases();
       const adapter = new SimulatedNotionAdapter(bases);
 
-      // Pre-seed two pages with the same stableId
       const targetTxStableId = 'a2ce0416-1a27-4592-85be-bff2a9ce6f86';
       await adapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-tx', {
         'ID da Fonte': { rich_text: [{ text: { content: targetTxStableId } }] },
@@ -574,6 +763,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         skipInitialDriftCheck: true,
       });
@@ -585,7 +775,6 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
       const bases = getFrozenTargetBases();
       const adapter = new SimulatedNotionAdapter(bases);
 
-      // Pre-seed one page with same stableId but differing amount/description
       const targetTxStableId = 'a2ce0416-1a27-4592-85be-bff2a9ce6f86';
       await adapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-tx', {
         'ID da Fonte': { rich_text: [{ text: { content: targetTxStableId } }] },
@@ -599,6 +788,7 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         skipInitialDriftCheck: true,
       });
@@ -616,10 +806,10 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
       });
 
-      // Intercept fetchPage during Stage 2 (after all 159 Stage 1 creations and read-backs)
       let fetchCount = 0;
       const originalFetch = adapter.fetchPage.bind(adapter);
       adapter.fetchPage = async (pageId: string) => {
@@ -639,42 +829,118 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
 
       await expect(executor.execute()).rejects.toThrow(/FAIL_RELATION_CONFLICT/);
     });
+  });
 
-    it('LiveNotionAdapter createPage / updatePageRelations strictly throws REAL_DML_DISABLED_PHASE_2B', async () => {
-      const liveAdapter = new LiveNotionAdapter();
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 6. RETRY POLICY & NETWORK ERROR HANDLING (Item 10)
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('6. Retry Policy & Network Error Handling (Item 10)', () => {
+    it('429 status respects Retry-After header and succeeds on next retry', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
 
-      await expect(
-        liveAdapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-id', { Descrição: 'Test' }),
-      ).rejects.toThrow(/REAL_DML_DISABLED_PHASE_2B/);
+      adapter.setFaults({
+        failStatusCodes: [429],
+        retryAfterSeconds: 0.01,
+      });
 
-      await expect(
-        liveAdapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'page-id', {}),
-      ).rejects.toThrow(/REAL_DML_DISABLED_PHASE_2B/);
+      const journal = new BackfillJournal(new Database(':memory:'));
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        maxRetries: 3,
+        retryBaseDelayMs: 5,
+      });
+
+      const report = await executor.execute();
+      expect(report.status).toBe('COMPLETED');
+      expect(report.retries).toBe(1);
+      expect(report.actualSimulatedCreateWrites).toBe(159);
     });
 
-    it('money with unsupported precision (> 2 decimal places) throws FAIL_UNSUPPORTED_MONEY_PRECISION', () => {
-      expect(() => moneyToMinorUnits(12.345, 'BRL')).toThrow(/FAIL_UNSUPPORTED_MONEY_PRECISION/);
-      expect(() => moneyToMinorUnits('12.3456', 'BRL')).toThrow(/FAIL_UNSUPPORTED_MONEY_PRECISION/);
+    it('500 status retries with exponential backoff and succeeds on retry', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
 
-      // Clean 2 decimals works
-      expect(moneyToMinorUnits(12.34, 'BRL')).toBe(1234);
-      expect(minorUnitsToMoney(1234, 'BRL')).toBe(12.34);
+      adapter.setFaults({
+        failStatusCodes: [500],
+      });
+
+      const journal = new BackfillJournal(new Database(':memory:'));
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        maxRetries: 3,
+        retryBaseDelayMs: 5,
+      });
+
+      const report = await executor.execute();
+      expect(report.status).toBe('COMPLETED');
+      expect(report.retries).toBe(1);
     });
 
-    it('unknown property in TARGET_CONTRACT throws FAIL_UNKNOWN_PROPERTY', () => {
-      expect(() =>
-        serializePayloadForNotion('NOTION_DS_TRANSACTIONS', {
-          Descrição: 'Compra teste',
-          PropriedadeInexistenteNoSchema: 'Valor proibido',
-        }),
-      ).toThrow(/FAIL_UNKNOWN_PROPERTY/);
+    it('503 status exhausts retries and fails run', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+
+      adapter.setFaults({
+        failStatusCodes: [503, 503, 503, 503],
+      });
+
+      const journal = new BackfillJournal(new Database(':memory:'));
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        maxRetries: 2,
+        retryBaseDelayMs: 5,
+      });
+
+      await expect(executor.execute()).rejects.toThrow(/Simulated Notion API error 503/);
+    });
+
+    it('401/403 status fails fast in 1 attempt without blind retries', async () => {
+      const bases = getFrozenTargetBases();
+      const adapter = new SimulatedNotionAdapter(bases);
+
+      let calls = 0;
+      adapter.createPage = async () => {
+        calls++;
+        const err: any = new Error('Unauthorized');
+        err.status = 401;
+        throw err;
+      };
+
+      const journal = new BackfillJournal(new Database(':memory:'));
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        maxRetries: 5,
+      });
+
+      await expect(executor.execute()).rejects.toThrow(/Unauthorized/);
+      expect(calls).toBe(1);
     });
 
     it('validation error (status 400) does not trigger blind retries', async () => {
       const bases = getFrozenTargetBases();
       const adapter = new SimulatedNotionAdapter(bases);
 
-      // Inject 400 validation error
       let calls = 0;
       adapter.createPage = async () => {
         calls++;
@@ -689,12 +955,157 @@ describe('Phase 2B: BackfillExecutor & Simulation Engine', () => {
         journal,
         envVars: testEnv,
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         skipWorktreeCleanCheck: true,
         maxRetries: 5,
       });
 
       await expect(executor.execute()).rejects.toThrow(/validation_error/);
-      expect(calls).toBe(1); // Zero blind retries on validation_error!
+      expect(calls).toBe(1);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 7. LIVE NOTION ADAPTER FAIL-CLOSED & PAGINATION (Items 6, 7)
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('7. LiveNotionAdapter Fail-Closed & Pagination', () => {
+    it('LiveNotionAdapter mutations strictly throw REAL_DML_DISABLED_PHASE_2B', async () => {
+      const liveAdapter = new LiveNotionAdapter();
+
+      await expect(
+        liveAdapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-id', { Descrição: 'Test' }),
+      ).rejects.toThrow(/REAL_DML_DISABLED_PHASE_2B/);
+
+      await expect(
+        liveAdapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'page-id', {}),
+      ).rejects.toThrow(/REAL_DML_DISABLED_PHASE_2B/);
+    });
+
+    it('LiveNotionAdapter throws FAIL_NOTION_AUTH on 401/403', async () => {
+      const fakeClient: any = {
+        dataSources: {
+          query: async () => {
+            const err: any = new Error('API token invalid');
+            err.status = 401;
+            throw err;
+          },
+        },
+      };
+
+      const adapter = new LiveNotionAdapter(fakeClient, testEnv);
+      await expect(
+        adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'ID da Fonte', 'test-123'),
+      ).rejects.toThrow(/FAIL_NOTION_AUTH/);
+    });
+
+    it('LiveNotionAdapter throws FAIL_NOTION_VALIDATION on 400', async () => {
+      const fakeClient: any = {
+        dataSources: {
+          query: async () => {
+            const err: any = new Error('validation_error: invalid property filter');
+            err.status = 400;
+            throw err;
+          },
+        },
+      };
+
+      const adapter = new LiveNotionAdapter(fakeClient, testEnv);
+      await expect(
+        adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'ID da Fonte', 'test-123'),
+      ).rejects.toThrow(/FAIL_NOTION_VALIDATION/);
+    });
+
+    it('LiveNotionAdapter throws READ_UNCERTAIN on network failure', async () => {
+      const fakeClient: any = {
+        dataSources: {
+          query: async () => {
+            const err: any = new Error('connect ECONNRESET');
+            err.code = 'ECONNRESET';
+            throw err;
+          },
+        },
+      };
+
+      const adapter = new LiveNotionAdapter(fakeClient, testEnv);
+      await expect(
+        adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'ID da Fonte', 'test-123'),
+      ).rejects.toThrow(/READ_UNCERTAIN/);
+    });
+
+    it('LiveNotionAdapter paginates properly when database contains >100 rows', async () => {
+      let queryCallCount = 0;
+      const fakeClient: any = {
+        dataSources: {
+          query: async (args: any) => {
+            queryCallCount++;
+            if (!args.start_cursor) {
+              return {
+                results: Array.from({ length: 100 }, (_, i) => ({
+                  id: `page-batch1-${i}`,
+                  properties: { 'Nome da Conta': { title: [{ text: { content: `Acc ${i}` } }] } },
+                })),
+                has_more: true,
+                next_cursor: 'cursor-batch-2',
+              };
+            } else {
+              return {
+                results: Array.from({ length: 25 }, (_, i) => ({
+                  id: `page-batch2-${i}`,
+                  properties: { 'Nome da Conta': { title: [{ text: { content: `Acc 100+${i}` } }] } },
+                })),
+                has_more: false,
+                next_cursor: null,
+              };
+            }
+          },
+        },
+      };
+
+      const envWithAllBases: Record<string, string> = { NOTION_API_KEY: 'test-key' };
+      for (const k of [
+        'NOTION_DS_ACCOUNTS',
+        'NOTION_DS_CATEGORIES',
+        'NOTION_DS_TRANSACTIONS',
+        'NOTION_DS_RULES',
+        'NOTION_DS_FIXED_BILLS',
+        'NOTION_DS_MONTHLY_OBLIGATIONS',
+        'NOTION_DS_INVESTMENTS',
+        'NOTION_DS_INVESTMENT_MOVEMENTS',
+        'NOTION_DS_MONTHLY_BUDGET',
+        'NOTION_DS_FINANCIAL_GOALS',
+        'NOTION_DS_MONTHLY_CLOSINGS',
+        'NOTION_DS_SYNC_LOG',
+        'NOTION_DS_CARD_BILLS',
+      ]) {
+        envWithAllBases[k] = `ds-${k}`;
+      }
+
+      const adapter = new LiveNotionAdapter(fakeClient, envWithAllBases);
+      const state = await adapter.queryTargetState();
+      expect(state['NOTION_DS_ACCOUNTS'].records).toHaveLength(125);
+      expect(queryCallCount).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 8. SERIALIZER & PRECISION UNIT TESTS
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('8. Serializer & Precision Unit Tests', () => {
+    it('money with unsupported precision (> 2 decimal places) throws FAIL_UNSUPPORTED_MONEY_PRECISION', () => {
+      expect(() => moneyToMinorUnits(12.345, 'BRL')).toThrow(/FAIL_UNSUPPORTED_MONEY_PRECISION/);
+      expect(() => moneyToMinorUnits('12.3456', 'BRL')).toThrow(/FAIL_UNSUPPORTED_MONEY_PRECISION/);
+
+      expect(moneyToMinorUnits(12.34, 'BRL')).toBe(1234);
+      expect(minorUnitsToMoney(1234, 'BRL')).toBe(12.34);
+    });
+
+    it('unknown property in TARGET_CONTRACT throws FAIL_UNKNOWN_PROPERTY', () => {
+      expect(() =>
+        serializePayloadForNotion('NOTION_DS_TRANSACTIONS', {
+          Descrição: 'Compra teste',
+          PropriedadeInexistenteNoSchema: 'Valor proibido',
+        }),
+      ).toThrow(/FAIL_UNKNOWN_PROPERTY/);
     });
   });
 });

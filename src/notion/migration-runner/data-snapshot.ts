@@ -82,6 +82,39 @@ export interface NotionLiveDataSnapshotOptions {
   backupDir?: string;
 }
 
+export function sanitizeNotionProperty(prop: any): any {
+  if (!prop || typeof prop !== 'object') return prop;
+  const type = prop.type;
+  if (!type) return prop;
+
+  switch (type) {
+    case 'title':
+      return (prop.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
+    case 'rich_text':
+      return (prop.rich_text || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
+    case 'number':
+      return prop.number;
+    case 'select':
+      return prop.select?.name ?? null;
+    case 'multi_select':
+      return (prop.multi_select || []).map((s: any) => s.name);
+    case 'date':
+      return prop.date ? { start: prop.date.start, end: prop.date.end } : null;
+    case 'checkbox':
+      return prop.checkbox;
+    case 'relation':
+      return (prop.relation || []).map((r: any) => r.id);
+    case 'status':
+      return prop.status?.name ?? null;
+    case 'formula':
+      return prop.formula;
+    case 'rollup':
+      return prop.rollup;
+    default:
+      return prop[type] ?? prop;
+  }
+}
+
 export class NotionLiveDataSnapshotManager {
   private client: Client;
   private envVars: Record<string, string | undefined>;
@@ -112,36 +145,7 @@ export class NotionLiveDataSnapshotManager {
 
 
   private sanitizeProperty(prop: any): any {
-    if (!prop || typeof prop !== 'object') return prop;
-    const type = prop.type;
-    if (!type) return prop;
-
-    switch (type) {
-      case 'title':
-        return (prop.title || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
-      case 'rich_text':
-        return (prop.rich_text || []).map((t: any) => t.plain_text || t.text?.content || '').join('');
-      case 'number':
-        return prop.number;
-      case 'select':
-        return prop.select?.name ?? null;
-      case 'multi_select':
-        return (prop.multi_select || []).map((s: any) => s.name);
-      case 'date':
-        return prop.date ? { start: prop.date.start, end: prop.date.end } : null;
-      case 'checkbox':
-        return prop.checkbox;
-      case 'relation':
-        return (prop.relation || []).map((r: any) => r.id);
-      case 'status':
-        return prop.status?.name ?? null;
-      case 'formula':
-        return prop.formula;
-      case 'rollup':
-        return prop.rollup;
-      default:
-        return prop[type] ?? prop;
-    }
+    return sanitizeNotionProperty(prop);
   }
 
   public async fetchBaseRecords(envKey: string, dataSourceId: string): Promise<NotionPageRecord[]> {

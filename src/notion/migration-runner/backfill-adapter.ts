@@ -1,5 +1,5 @@
 import { Client } from '@notionhq/client';
-import { NotionPageRecord, BaseSnapshotData } from './data-snapshot';
+import { NotionPageRecord, BaseSnapshotData, sanitizeNotionProperty } from './data-snapshot';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
 import { findPropertyContract } from './backfill-serializer';
 
@@ -27,6 +27,8 @@ export interface BackfillNotionAdapter {
     pageId: string,
     relations: Record<string, string[]>,
   ): Promise<{ id: string; properties: Record<string, any> }>;
+
+  getMutationCount(): number;
 }
 
 export interface SimulationFaultInjector {
@@ -36,13 +38,15 @@ export interface SimulationFaultInjector {
   uncertainWriteNextUpdate?: Error;
   retryableErrorsCount?: number;
   retryableStatusCode?: number;
+  retryAfterSeconds?: number;
+  failStatusCodes?: number[];
 }
 
 /**
  * Simulated Notion Adapter for Phase 2B.
  * Populated strictly from frozen target snapshot bases.
  * Generates deterministic page IDs (sim-page-000001, sim-page-000002, ...).
- * Maintains dual relations synchronization in memory.
+ * Maintains dynamic dual relations synchronization in memory via TARGET_CONTRACT.
  */
 export class SimulatedNotionAdapter implements BackfillNotionAdapter {
   private bases: Map<string, Map<string, NotionPageRecord>> = new Map();
@@ -80,6 +84,11 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
 
   public setFaults(faults: SimulationFaultInjector): void {
     this.faults = { ...faults };
+  }
+
+  public getMutationCount(): number {
+    // In Phase 2B simulation mode, zero live Notion mutations occur
+    return 0;
   }
 
   private generateDeterministicPageId(): string {
@@ -166,13 +175,26 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
     dataSourceId: string,
     properties: Record<string, any>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
+    // Check failStatusCodes injection
+    if (this.faults.failStatusCodes && this.faults.failStatusCodes.length > 0) {
+      const status = this.faults.failStatusCodes.shift()!;
+      const err: any = new Error(`Simulated Notion API error ${status}`);
+      err.status = status;
+      if (status === 429) {
+        err.headers = { 'retry-after': String(this.faults.retryAfterSeconds ?? 0.01) };
+      }
+      throw err;
+    }
+
     // Check retryable errors simulation
     if (this.faults.retryableErrorsCount && this.faults.retryableErrorsCount > 0) {
       this.faults.retryableErrorsCount -= 1;
       const status = this.faults.retryableStatusCode || 429;
       const err: any = new Error(`Simulated Notion API error ${status}`);
       err.status = status;
-      if (status === 429) err.headers = { 'retry-after': '0.01' };
+      if (status === 429) {
+        err.headers = { 'retry-after': String(this.faults.retryAfterSeconds ?? 0.01) };
+      }
       throw err;
     }
 
@@ -220,6 +242,17 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
     pageId: string,
     relations: Record<string, string[]>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
+    // Check failStatusCodes injection
+    if (this.faults.failStatusCodes && this.faults.failStatusCodes.length > 0) {
+      const status = this.faults.failStatusCodes.shift()!;
+      const err: any = new Error(`Simulated Notion API error ${status}`);
+      err.status = status;
+      if (status === 429) {
+        err.headers = { 'retry-after': String(this.faults.retryAfterSeconds ?? 0.01) };
+      }
+      throw err;
+    }
+
     if (this.faults.failNextUpdate) {
       const err = this.faults.failNextUpdate;
       this.faults.failNextUpdate = undefined;
@@ -242,17 +275,27 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
         relation: targetIds.map((id) => ({ id })),
       };
 
-      // Handle dual relation synchronization:
-      // Faturas."Lançamentos do Ciclo" <-> Transações."Fatura Vinculada"
-      if (targetDataSourceEnvKey === 'NOTION_DS_CARD_BILLS' && relName === 'Lançamentos do Ciclo') {
-        const txBase = this.bases.get('NOTION_DS_TRANSACTIONS');
-        if (txBase) {
-          for (const txId of targetIds) {
-            const txRecord = txBase.get(txId);
-            if (txRecord) {
-              txRecord.properties['Fatura Vinculada'] = {
-                relation: [{ id: pageId }],
-              };
+      // Dynamic dual relation synchronization via TARGET_CONTRACT
+      const propContract = TARGET_CONTRACT[targetDataSourceEnvKey]?.properties.find(
+        (p) => p.notionProperty === relName || (p.aliases && p.aliases.includes(relName)),
+      );
+      if (
+        propContract?.isBidirectionalRelation &&
+        propContract.relationTargetEnvKey &&
+        propContract.syncedPropertyName
+      ) {
+        const targetBase = this.bases.get(propContract.relationTargetEnvKey);
+        if (targetBase) {
+          for (const targetId of targetIds) {
+            const targetRec = targetBase.get(targetId);
+            if (targetRec) {
+              const existingRel = targetRec.properties[propContract.syncedPropertyName]?.relation || [];
+              const alreadyLinked = existingRel.some((r: any) => (r.id || r) === pageId);
+              if (!alreadyLinked) {
+                targetRec.properties[propContract.syncedPropertyName] = {
+                  relation: [...existingRel, { id: pageId }],
+                };
+              }
             }
           }
         }
@@ -274,7 +317,7 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
 
 /**
  * Live Notion Adapter for Phase 2B.
- * Read-only methods query the real Notion API for preflight / drift detection.
+ * Read-only methods query the real Notion API for preflight / drift detection with fail-closed behavior.
  * Mutation methods (createPage, updatePageRelations) are STRICTLY DISABLED and throw REAL_DML_DISABLED_PHASE_2B.
  */
 export class LiveNotionAdapter implements BackfillNotionAdapter {
@@ -292,6 +335,44 @@ export class LiveNotionAdapter implements BackfillNotionAdapter {
       });
   }
 
+  public getMutationCount(): number {
+    // In Phase 2B, mutations on live adapter are strictly disabled and count is always 0
+    return 0;
+  }
+
+  private handleLiveNotionError(err: any, operation: string): never {
+    const status = err?.status || err?.code;
+    const msg = err?.message || String(err);
+    if (status === 401 || status === 403) {
+      throw new Error(
+        `FAIL_NOTION_AUTH: Autenticação/autorização falhou na Notion API (${status}) em ${operation}: ${msg}`,
+      );
+    }
+    if (status === 400 || (msg && msg.includes('validation_error'))) {
+      throw new Error(
+        `FAIL_NOTION_VALIDATION: Validação da requisição Notion falhou (${status}) em ${operation}: ${msg}`,
+      );
+    }
+    throw new Error(
+      `READ_UNCERTAIN: Erro de leitura ou rede na Notion API (${status || 'NETWORK_ERROR'}) em ${operation}: ${msg}`,
+    );
+  }
+
+  private mapPageToRecord(page: any): NotionPageRecord {
+    const sanitizedProperties: Record<string, any> = {};
+    for (const [propName, propVal] of Object.entries(page.properties || {})) {
+      sanitizedProperties[propName] = sanitizeNotionProperty(propVal);
+    }
+    return {
+      id: page.id,
+      createdTime: page.created_time || new Date().toISOString(),
+      lastEditedTime: page.last_edited_time || new Date().toISOString(),
+      archived: Boolean(page.is_archived || page.in_trash || page.archived),
+      url: page.url || `https://notion.so/${(page.id || '').replace(/-/g, '')}`,
+      properties: sanitizedProperties,
+    };
+  }
+
   public async findByStableIdentity(
     targetDataSourceEnvKey: string,
     stableIdProperty: string,
@@ -302,63 +383,87 @@ export class LiveNotionAdapter implements BackfillNotionAdapter {
       throw new Error(`FAIL_MISSING_ENV: Variável '${targetDataSourceEnvKey}' não configurada.`);
     }
 
+    const contract = findPropertyContract(targetDataSourceEnvKey, stableIdProperty);
+    const resolvedPropName = contract ? contract.notionProperty : stableIdProperty;
+
     try {
       const response = await (this.client as any).dataSources.query({
         data_source_id: dsId,
         filter: {
-          property: stableIdProperty,
+          property: resolvedPropName,
           rich_text: {
             equals: stableIdValue,
           },
         },
       });
 
-      return (response.results || []).map((page: any) => ({
-        id: page.id,
-        createdTime: page.created_time || new Date().toISOString(),
-        lastEditedTime: page.last_edited_time || new Date().toISOString(),
-        archived: Boolean(page.archived),
-        url: page.url || `https://notion.so/${(page.id || '').replace(/-/g, '')}`,
-        properties: page.properties || {},
-      }));
-    } catch {
-      return [];
+      return (response.results || []).map((page: any) => this.mapPageToRecord(page));
+    } catch (err: any) {
+      this.handleLiveNotionError(err, `findByStableIdentity(${targetDataSourceEnvKey})`);
     }
   }
 
   public async fetchPage(pageId: string): Promise<NotionPageRecord | null> {
     try {
       const page: any = await this.client.pages.retrieve({ page_id: pageId });
-      return {
-        id: page.id,
-        createdTime: page.created_time || new Date().toISOString(),
-        lastEditedTime: page.last_edited_time || new Date().toISOString(),
-        archived: Boolean(page.archived),
-        url: page.url || `https://notion.so/${(page.id || '').replace(/-/g, '')}`,
-        properties: page.properties || {},
-      };
-    } catch {
-      return null;
+      return this.mapPageToRecord(page);
+    } catch (err: any) {
+      if (err?.status === 404 || err?.code === 'object_not_found') {
+        return null;
+      }
+      this.handleLiveNotionError(err, `fetchPage(${pageId})`);
     }
   }
 
   public async queryTargetState(): Promise<Record<string, BaseSnapshotData>> {
-    // Read-only state retrieval across canonical bases
     const result: Record<string, BaseSnapshotData> = {};
     for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
       const dsId = this.envVars[key]?.trim();
-      if (!dsId) continue;
+      if (!dsId) {
+        if (contract.isExisting) {
+          throw new Error(`FAIL_MISSING_ENV: Variável obrigatória '${key}' não configurada no ambiente.`);
+        } else {
+          // 13th base (Faturas) is not yet created prior to DDL apply
+          result[key] = {
+            envKey: key,
+            defaultTitle: contract.defaultTitle,
+            dataSourceId: key,
+            recordCount: 0,
+            records: [],
+          };
+          continue;
+        }
+      }
+
       try {
-        const resp = await (this.client as any).dataSources.query({ data_source_id: dsId });
+        const records: NotionPageRecord[] = [];
+        let hasMore = true;
+        let startCursor: string | undefined = undefined;
+
+        while (hasMore) {
+          const resp: any = await (this.client as any).dataSources.query({
+            data_source_id: dsId,
+            page_size: 100,
+            start_cursor: startCursor,
+          });
+
+          for (const page of resp.results || []) {
+            records.push(this.mapPageToRecord(page));
+          }
+
+          hasMore = Boolean(resp.has_more && resp.next_cursor);
+          startCursor = resp.next_cursor ?? undefined;
+        }
+
         result[key] = {
           envKey: key,
           defaultTitle: contract.defaultTitle,
           dataSourceId: dsId,
-          recordCount: (resp.results || []).length,
-          records: resp.results || [],
+          recordCount: records.length,
+          records,
         };
-      } catch {
-        // offline or unverified
+      } catch (err: any) {
+        this.handleLiveNotionError(err, `queryTargetState(${key})`);
       }
     }
     return result;

@@ -73,6 +73,25 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     { id: 'cat-18', name: 'Outros' },
   ];
 
+  function getLocalBackupKey(): string | undefined {
+    if (process.env.MIGRATION_BACKUP_KEY) {
+      return process.env.MIGRATION_BACKUP_KEY;
+    }
+    const envPath = path.resolve(process.cwd(), '.env');
+    if (fs.existsSync(envPath)) {
+      const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('MIGRATION_BACKUP_KEY=')) {
+          return trimmed.slice('MIGRATION_BACKUP_KEY='.length).trim();
+        }
+      }
+    }
+    return undefined;
+  }
+
+  delete process.env.BACKFILL_ACCOUNT_MAPPING_PATH;
+
   const testEnv = {
     NOTION_API_KEY: 'test-key',
     NOTION_DS_ACCOUNTS: 'fake-acc-ds',
@@ -83,7 +102,7 @@ describe('BackfillPlanner - Contract Validation & Safety Gates', () => {
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
     SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
     BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
-    MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
+    MIGRATION_BACKUP_KEY: getLocalBackupKey(),
     COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   };
 

@@ -28,8 +28,15 @@ import {
   BackfillSchemaConformanceEvidence,
   TargetDriftDifference,
 } from './types';
-import { calculateTargetStateHash, BaseSnapshotData } from './data-snapshot';
+import { calculateTargetStateHash, BaseSnapshotData, NotionPageRecord } from './data-snapshot';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
+
+export const DEFAULT_CONFORMANT_SCHEMA_EVIDENCE: BackfillSchemaConformanceEvidence = {
+  totalDataSources: 13,
+  verifiedDataSources: 13,
+  missingPropertiesCount: 0,
+  structuralMismatchesCount: 0,
+};
 
 export interface BackfillExecutorOptions {
   adapter: BackfillNotionAdapter;
@@ -79,7 +86,6 @@ export interface BackfillExecutorReport {
 
 function sanitizeErrorMessage(msg: string): string {
   if (!msg) return 'UNKNOWN_ERROR';
-  // Remove possible keys, long tokens, or PII
   return msg
     .replace(/[a-f0-9]{64}/gi, '[HASH_REDACTED]')
     .replace(/secret_[a-zA-Z0-9]+/g, '[SECRET_REDACTED]')
@@ -97,6 +103,21 @@ function isUncertainError(err: any): boolean {
     err?.code === 'ETIMEDOUT' ||
     err?.code === 'ECONNRESET'
   );
+}
+
+function parseRetryAfterMs(err: any, fallbackMs: number): number {
+  const headerVal =
+    err?.headers?.['retry-after'] ||
+    err?.response?.headers?.['retry-after'] ||
+    err?.headers?.get?.('retry-after');
+
+  if (headerVal) {
+    const parsedSec = parseFloat(String(headerVal));
+    if (!isNaN(parsedSec) && parsedSec >= 0) {
+      return Math.round(parsedSec * 1000);
+    }
+  }
+  return fallbackMs;
 }
 
 export class BackfillExecutor {
@@ -164,6 +185,7 @@ export class BackfillExecutor {
     targetStateHash: string;
     sourceSnapshotHash: string;
     targetSnapshotHash: string;
+    preflightBases: Record<string, BaseSnapshotData>;
   }> {
     const planOriginSha = this.options.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
 
@@ -171,22 +193,50 @@ export class BackfillExecutor {
       throw new Error('PREFLIGHT_FAIL_WORKTREE_DIRTY: Working tree possui alterações não commitadas.');
     }
 
-    // Query initial adapter state for drift proof in preflight
-    const initialBases = await this.adapter.queryTargetState();
+    // Fail closed if schemaEvidence was not provided
+    if (!this.options.schemaEvidence) {
+      throw new Error('FAIL_SCHEMA_EVIDENCE_MISSING: Evidência de conformidade de schema (13/13) não fornecida ao executor.');
+    }
 
-    // Reproduce plan strictly with planOriginSha
+    // Validate schema evidence conformance
+    const evidence = this.options.schemaEvidence;
+    if (
+      evidence.missingPropertiesCount > 0 ||
+      evidence.structuralMismatchesCount > 0 ||
+      evidence.verifiedDataSources !== 13
+    ) {
+      throw new Error('FAIL_SCHEMA_NON_CONFORMANT: Schema Notion não cumpre conformidade integral 13/13.');
+    }
+
+    // Assert dual relation contract in TARGET_CONTRACT
+    const billContract = TARGET_CONTRACT['NOTION_DS_CARD_BILLS'];
+    const cicloProp = billContract?.properties.find((p) => p.notionProperty === 'Lançamentos do Ciclo');
+    if (!cicloProp || !cicloProp.isBidirectionalRelation || cicloProp.syncedPropertyName !== 'Fatura Vinculada') {
+      throw new Error(
+        'FAIL_SCHEMA_CONTRACT_ASSERTION: Relação dual Faturas.Lançamentos do Ciclo <-> Transações.Fatura Vinculada não configurada no TARGET_CONTRACT.',
+      );
+    }
+
+    // Prepare validated target snapshot to obtain frozen baseline bases for plan artifact reproduction
+    const targetAnalyzer = new BackfillDryRunAnalyzer({
+      envVars: this.envVars,
+      commitSha: planOriginSha,
+      targetSnapshotManifestPath: this.options.targetSnapshotManifestPath,
+      sourceSnapshotManifestPath: this.options.sourceSnapshotManifestPath,
+      schemaEvidence: evidence,
+    });
+    const targetSession = targetAnalyzer.prepareValidatedTargetSnapshot();
+    const frozenBases: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(targetSession.payload.bases));
+    targetSession.cleanup();
+
+    // Reproduce plan strictly with planOriginSha from frozen snapshot baseline
     const analyzer = new BackfillDryRunAnalyzer({
       envVars: this.envVars,
       commitSha: planOriginSha,
       targetSnapshotManifestPath: this.options.targetSnapshotManifestPath,
       sourceSnapshotManifestPath: this.options.sourceSnapshotManifestPath,
-      schemaEvidence: this.options.schemaEvidence || {
-        totalDataSources: 13,
-        verifiedDataSources: 13,
-        missingPropertiesCount: 0,
-        structuralMismatchesCount: 0,
-      },
-      liveBases: initialBases,
+      schemaEvidence: evidence,
+      liveBases: frozenBases,
     });
 
     const report = await analyzer.runAnalysis();
@@ -229,10 +279,30 @@ export class BackfillExecutor {
       );
     }
 
-    // 5. Verify Schema Conformance
+    // 5. Verify Schema Conformance & Readiness
     const checks = artifact.readiness.checks;
     if (!checks.schemaConformant13Of13 || !checks.missingPropertiesZero || !checks.structuralMismatchesZero) {
       throw new Error('FAIL_SCHEMA_NON_CONFORMANT: Schema Notion não cumpre conformidade integral 13/13.');
+    }
+
+    // 6. Verify Blockers (accounting for test flags)
+    const activeBlockers = artifact.readiness.blockers.filter((b) => {
+      if (this.options.skipWorktreeCleanCheck && (b.startsWith('WORKTREE_DIRTY') || b.startsWith('HEAD_NOT_IN_SYNC'))) {
+        return false;
+      }
+      if (this.options.skipHeadInSyncCheck && b.startsWith('HEAD_NOT_IN_SYNC')) {
+        return false;
+      }
+      if (this.options.skipInitialDriftCheck && b.startsWith('TARGET_DRIFT_DETECTED')) {
+        return false;
+      }
+      return true;
+    });
+
+    if (activeBlockers.length > 0) {
+      throw new Error(
+        `FAIL_NOT_READY_FOR_EXECUTOR: Plano não está pronto para implementação do executor: ${activeBlockers.join('; ')}`,
+      );
     }
 
     return {
@@ -241,52 +311,237 @@ export class BackfillExecutor {
       targetStateHash,
       sourceSnapshotHash: sourcePlaintextSha,
       targetSnapshotHash: targetPlaintextSha,
+      preflightBases: frozenBases,
     };
   }
 
   /**
-   * Builds the projected expected state for a given stage/journal.
-   * Prevents false positive drift detection on resume by accounting for previous verified writes.
+   * Projects the fully applied state of the frozen plan (State B).
+   * Used for initial drift check in idempotent re-executions.
    */
-  public projectExpectedState(
+  public projectFullyAppliedState(
     initialState: Record<string, BaseSnapshotData>,
-    runId: string,
+    plan: BackfillPlanArtifact,
   ): Record<string, BaseSnapshotData> {
     const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
 
-    const verifiedOps = this.journal
-      .getOperations(runId)
-      .filter((o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED');
+    const simulatedPageIds = new Map<string, string>();
+    let counter = 0;
 
-    for (const op of verifiedOps) {
-      if (op.action === 'CREATE' && op.targetPageId) {
-        let base = projected[op.targetDataSource];
-        if (!base) {
-          base = {
-            envKey: op.targetDataSource,
-            defaultTitle: TARGET_CONTRACT[op.targetDataSource]?.defaultTitle || op.targetDataSource,
-            dataSourceId: op.targetDataSource,
-            recordCount: 0,
-            records: [],
-          };
-          projected[op.targetDataSource] = base;
+    // Stage 1 Creations
+    for (const op of plan.operations) {
+      if (op.operationType !== 'CREATE') continue;
+      counter++;
+      const pageId = `sim-page-${String(counter).padStart(6, '0')}`;
+      simulatedPageIds.set(op.stableId, pageId);
+
+      const existingRelations: Record<string, string[]> = {};
+      for (const [propName, refList] of Object.entries(op.relations)) {
+        const existingIds = refList.filter((r) => r.type === 'EXISTING_PAGE_ID').map((r) => r.target);
+        if (existingIds.length > 0) existingRelations[propName] = existingIds;
+      }
+
+      const serialized = serializePayloadForNotion(
+        op.targetDataSource.envKey,
+        op.sanitizedPayload,
+        existingRelations,
+        true,
+      );
+
+      let base = projected[op.targetDataSource.envKey];
+      if (!base) {
+        base = {
+          envKey: op.targetDataSource.envKey,
+          defaultTitle: TARGET_CONTRACT[op.targetDataSource.envKey]?.defaultTitle || op.targetDataSource.envKey,
+          dataSourceId: op.targetDataSource.envKey,
+          recordCount: 0,
+          records: [],
+        };
+        projected[op.targetDataSource.envKey] = base;
+      }
+
+      const nowIso = new Date().toISOString();
+      const rec: NotionPageRecord = {
+        id: pageId,
+        createdTime: nowIso,
+        lastEditedTime: nowIso,
+        archived: false,
+        url: `https://notion.so/${pageId.replace(/-/g, '')}`,
+        properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
+      };
+      base.records.push(rec);
+      base.recordCount = base.records.length;
+    }
+
+    // Stage 2 Relation Patches
+    const billOps = plan.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
+    for (const billOp of billOps) {
+      const billPageId = simulatedPageIds.get(billOp.stableId);
+      if (!billPageId) continue;
+      const billBase = projected['NOTION_DS_CARD_BILLS'];
+      const billRec = billBase?.records.find((r) => r.id === billPageId);
+      if (!billRec) continue;
+
+      for (const [relProp, refList] of Object.entries(billOp.relations)) {
+        const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
+        if (plannedRefs.length === 0) continue;
+
+        const resolvedIds: string[] = [];
+        for (const ref of plannedRefs) {
+          const mapped = simulatedPageIds.get(ref.target);
+          if (mapped) resolvedIds.push(mapped);
         }
-        if (!base.records.some((r) => r.id === op.targetPageId)) {
-          const nowIso = new Date().toISOString();
-          base.records.push({
-            id: op.targetPageId,
-            createdTime: nowIso,
-            lastEditedTime: nowIso,
-            archived: false,
-            url: `https://notion.so/${op.targetPageId.replace(/-/g, '')}`,
-            properties: {},
-          });
-          base.recordCount = base.records.length;
+        resolvedIds.sort();
+        billRec.properties[relProp] = { relation: resolvedIds.map((id) => ({ id })) };
+
+        if (relProp === 'Lançamentos do Ciclo') {
+          const txBase = projected['NOTION_DS_TRANSACTIONS'];
+          if (txBase) {
+            for (const txId of resolvedIds) {
+              const txRec = txBase.records.find((r) => r.id === txId);
+              if (txRec) {
+                txRec.properties['Fatura Vinculada'] = { relation: [{ id: billPageId }] };
+              }
+            }
+          }
         }
       }
     }
 
     return projected;
+  }
+
+  /**
+   * Projects the expected state upon resume from an in-progress run.
+   * Incorporates actual verified page creations and relation patches from the journal.
+   */
+  public projectExpectedStateOnResume(
+    initialState: Record<string, BaseSnapshotData>,
+    plan: BackfillPlanArtifact,
+    runId: string,
+  ): Record<string, BaseSnapshotData> {
+    const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
+
+    const ops = this.journal.getOperations(runId);
+    const verifiedOrAppliedOps = ops.filter(
+      (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
+    );
+
+    const mappedPages = new Map<string, string>();
+    for (const op of verifiedOrAppliedOps) {
+      if (op.action === 'CREATE' && op.targetPageId) {
+        mappedPages.set(op.stableId, op.targetPageId);
+      }
+    }
+
+    // Apply creations
+    for (const opRec of verifiedOrAppliedOps) {
+      if (opRec.action !== 'CREATE' || !opRec.targetPageId) continue;
+      const planOp = plan.operations[opRec.operationIndex];
+      if (!planOp) continue;
+
+      const existingRelations: Record<string, string[]> = {};
+      for (const [propName, refList] of Object.entries(planOp.relations)) {
+        const existingIds = refList.filter((r) => r.type === 'EXISTING_PAGE_ID').map((r) => r.target);
+        if (existingIds.length > 0) existingRelations[propName] = existingIds;
+      }
+
+      const serialized = serializePayloadForNotion(
+        planOp.targetDataSource.envKey,
+        planOp.sanitizedPayload,
+        existingRelations,
+        true,
+      );
+
+      let base = projected[planOp.targetDataSource.envKey];
+      if (!base) {
+        base = {
+          envKey: planOp.targetDataSource.envKey,
+          defaultTitle: TARGET_CONTRACT[planOp.targetDataSource.envKey]?.defaultTitle || planOp.targetDataSource.envKey,
+          dataSourceId: planOp.targetDataSource.envKey,
+          recordCount: 0,
+          records: [],
+        };
+        projected[planOp.targetDataSource.envKey] = base;
+      }
+
+      if (!base.records.some((r) => r.id === opRec.targetPageId)) {
+        const nowIso = new Date().toISOString();
+        base.records.push({
+          id: opRec.targetPageId,
+          createdTime: nowIso,
+          lastEditedTime: nowIso,
+          archived: false,
+          url: `https://notion.so/${opRec.targetPageId.replace(/-/g, '')}`,
+          properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
+        });
+        base.recordCount = base.records.length;
+      }
+    }
+
+    // Apply relation patches
+    for (const opRec of verifiedOrAppliedOps) {
+      if (opRec.action !== 'RELATION_PATCH' || !opRec.targetPageId) continue;
+      const planOp =
+        plan.operations.find((o) => o.stableId === opRec.stableId) ||
+        plan.operations[opRec.operationIndex];
+      if (!planOp) continue;
+
+      const billBase = projected['NOTION_DS_CARD_BILLS'];
+      const billRec = billBase?.records.find((r) => r.id === opRec.targetPageId);
+      if (!billRec) continue;
+
+      for (const [relProp, refList] of Object.entries(planOp.relations)) {
+        const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
+        if (plannedRefs.length === 0) continue;
+
+        const resolvedIds: string[] = [];
+        for (const ref of plannedRefs) {
+          const mapped = mappedPages.get(ref.target);
+          if (mapped) resolvedIds.push(mapped);
+        }
+        resolvedIds.sort();
+        billRec.properties[relProp] = { relation: resolvedIds.map((id) => ({ id })) };
+
+        if (relProp === 'Lançamentos do Ciclo') {
+          const txBase = projected['NOTION_DS_TRANSACTIONS'];
+          if (txBase) {
+            for (const txId of resolvedIds) {
+              const txRec = txBase.records.find((r) => r.id === txId);
+              if (txRec) {
+                txRec.properties['Fatura Vinculada'] = { relation: [{ id: opRec.targetPageId! }] };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return projected;
+  }
+
+  private buildRelationPatchesForBill(
+    billOp: BackfillOperation,
+    planHash: string,
+  ): Record<string, string[]> {
+    const patches: Record<string, string[]> = {};
+    for (const [relProp, refList] of Object.entries(billOp.relations)) {
+      const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
+      if (plannedRefs.length === 0) continue;
+
+      const resolvedIds: string[] = [];
+      for (const ref of plannedRefs) {
+        const mapping = this.journal.getPageMapping(planHash, ref.target);
+        if (!mapping) {
+          throw new Error(
+            `FAIL_UNRESOLVED_PLANNED_RELATION: Stable ID '${ref.target}' referenciado em '${relProp}' não foi resolvido.`,
+          );
+        }
+        resolvedIds.push(mapping.notionPageId);
+      }
+      patches[relProp] = resolvedIds.sort();
+    }
+    return patches;
   }
 
   /**
@@ -301,11 +556,24 @@ export class BackfillExecutor {
     const preflightRes = await this.preflight();
     const plan = preflightRes.planArtifact;
 
+    // Validate logical relation references count (must be exactly 320)
+    let logicalRelationReferences = 0;
+    for (const op of plan.operations) {
+      for (const refs of Object.values(op.relations)) {
+        logicalRelationReferences += refs.length;
+      }
+    }
+    if (logicalRelationReferences !== 320) {
+      throw new Error(
+        `FAIL_LOGICAL_RELATIONS_COUNT: Esperado 320 referências lógicas de relação no plano, obtido ${logicalRelationReferences}.`,
+      );
+    }
+
     // 2. Query initial adapter target state
     const currentTargetState = await this.adapter.queryTargetState();
     const currentTargetHash = calculateTargetStateHash(currentTargetState);
 
-    // Check for initial run vs resume
+    // 3. Determine runId (new run vs resume)
     let runId: string;
     const existingRun = this.journal.getLatestRun();
     let isResume = false;
@@ -313,6 +581,14 @@ export class BackfillExecutor {
     if (existingRun && existingRun.status === 'IN_PROGRESS' && existingRun.planHash === plan.backfillPlanHash) {
       runId = existingRun.runId;
       isResume = true;
+      // Fail closed if journal binding diverges from frozen baseline
+      this.journal.validateRunMetadata(runId, {
+        planHash: plan.backfillPlanHash,
+        planOriginCommitSha: planOriginSha,
+        sourceSnapshotHash: preflightRes.sourceSnapshotHash,
+        targetSnapshotHash: preflightRes.targetSnapshotHash,
+        targetStateHash: preflightRes.targetStateHash,
+      });
     } else {
       runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
       this.journal.startRun({
@@ -326,26 +602,10 @@ export class BackfillExecutor {
       });
     }
 
-    // Verify Drift against projected state on resume, or frozen state on initial
-    if (!this.options.skipInitialDriftCheck) {
-      if (isResume) {
-        // In resume, verify that current target state has no external changes beyond our verified operations
-        // Note: we check that no foreign pages were added or modified
-      } else {
-        if (currentTargetHash !== FROZEN_TARGET_STATE_HASH) {
-          this.journal.failRun(runId, 'TARGET_DRIFT_DETECTED');
-          throw new Error(
-            `TARGET_DRIFT_DETECTED: Live/simulated target state (${currentTargetHash}) diverge do snapshot congelado (${FROZEN_TARGET_STATE_HASH}). 0 writes executados.`,
-          );
-        }
-      }
-    }
-
     // Metrics counters
     let semanticCreates = 0;
     let actualSimulatedCreateWrites = 0;
     let existingPageCreateNoOps = 0;
-    let logicalRelationReferences = 0;
     let canonicalRelationPatchGroups = 0;
     let actualSimulatedRelationWrites = 0;
     let writeRequestsSent = 0;
@@ -357,45 +617,117 @@ export class BackfillExecutor {
     const retryDelay = this.options.retryBaseDelayMs ?? 5;
 
     // =========================================================================
-    // RECONCILIATION: Check for uncertain writes from previous crash (attempts > 0 + PENDING)
+    // 4. RECONCILIATION: Check for uncertain writes from previous crash (if resume)
     // =========================================================================
-    const uncertainOps = this.journal.getUncertainOperations(runId);
-    for (const uOp of uncertainOps) {
-      const stableIdProp =
-        uOp.targetDataSource === 'NOTION_DS_CARD_BILLS'
-          ? 'ID Estável da Fatura'
-          : 'ID da Fonte';
-      const existingMatches = await this.adapter.findByStableIdentity(
-        uOp.targetDataSource,
-        stableIdProp,
-        uOp.stableId,
-      );
+    if (isResume) {
+      const uncertainOps = this.journal.getUncertainOperations(runId);
+      for (const uOp of uncertainOps) {
+        if (uOp.action === 'CREATE') {
+          const stableIdProp =
+            uOp.targetDataSource === 'NOTION_DS_CARD_BILLS' ? 'ID Estável da Fatura' : 'ID da Fonte';
+          const existingMatches = await this.adapter.findByStableIdentity(
+            uOp.targetDataSource,
+            stableIdProp,
+            uOp.stableId,
+          );
 
-      if (existingMatches.length === 1) {
-        const match = existingMatches[0];
-        const matchFingerprint = calculateRecordFingerprint(uOp.targetDataSource, match.properties);
-        if (matchFingerprint === uOp.expectedPostFingerprint) {
-          this.journal.recordVerified(runId, uOp.operationIndex, match.id, false);
-          this.journal.savePageMapping(uOp.stableId, match.id, uOp.targetDataSource);
-          recoveredUncertainCreates++;
-        } else {
-          this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_CONFLICTING_EXISTING_PAGE');
+          if (existingMatches.length === 1) {
+            const match = existingMatches[0];
+            const matchFingerprint = calculateRecordFingerprint(uOp.targetDataSource, match.properties);
+            if (matchFingerprint === uOp.expectedPostFingerprint) {
+              this.journal.recordVerified(runId, uOp.operationIndex, match.id, false);
+              this.journal.savePageMapping(plan.backfillPlanHash, uOp.stableId, match.id, uOp.targetDataSource);
+              recoveredUncertainCreates++;
+            } else {
+              this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_CONFLICTING_EXISTING_PAGE');
+              throw new Error(
+                `FAIL_CONFLICTING_EXISTING_PAGE: Recuperação de incerteza detectou página com dados conflitantes para '${uOp.stableId}'.`,
+              );
+            }
+          } else if (existingMatches.length > 1) {
+            this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_DUPLICATE_STABLE_ID');
+            throw new Error(
+              `FAIL_DUPLICATE_STABLE_ID: Múltiplas páginas encontradas com mesmo stableId '${uOp.stableId}'.`,
+            );
+          }
+        } else if (uOp.action === 'RELATION_PATCH') {
+          const billPageId =
+            uOp.targetPageId || this.journal.getPageMapping(plan.backfillPlanHash, uOp.stableId)?.notionPageId;
+          if (!billPageId) {
+            this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_PAGE_NOT_FOUND');
+            throw new Error(`FAIL_PAGE_NOT_FOUND: Fatura para patch de relação '${uOp.stableId}' não mapeada.`);
+          }
+
+          const page = await this.adapter.fetchPage(billPageId);
+          if (!page) {
+            this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_PAGE_NOT_FOUND');
+            throw new Error(`FAIL_PAGE_NOT_FOUND: Página '${billPageId}' não encontrada para reconciliação.`);
+          }
+
+          const planOp =
+            plan.operations.find((o) => o.stableId === uOp.stableId) ||
+            plan.operations[uOp.operationIndex];
+          if (!planOp) {
+            this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_OPERATION_NOT_FOUND');
+            throw new Error(`FAIL_OPERATION_NOT_FOUND: Operação do plano para '${uOp.stableId}' não encontrada.`);
+          }
+          const expectedPatches = this.buildRelationPatchesForBill(planOp, plan.backfillPlanHash);
+          let exactMatch = true;
+          let hasForeign = false;
+
+          for (const [propName, expectedIds] of Object.entries(expectedPatches)) {
+            const curIds = (page.properties[propName]?.relation || []).map((r: any) => r.id || r).sort();
+            const expSet = new Set(expectedIds);
+            for (const cid of curIds) {
+              if (!expSet.has(cid)) hasForeign = true;
+            }
+            if (JSON.stringify(curIds) !== JSON.stringify(expectedIds)) {
+              exactMatch = false;
+            }
+          }
+
+          if (hasForeign) {
+            this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_RELATION_CONFLICT');
+            throw new Error(`FAIL_RELATION_CONFLICT: Relação estranha detectada na fatura '${billPageId}'.`);
+          }
+
+          if (exactMatch) {
+            this.journal.recordVerified(runId, uOp.operationIndex, billPageId, false);
+            recoveredUncertainRelationWrites++;
+          }
+        }
+      }
+    }
+
+    // 5. Initial Drift Check (State A = pristine, State B = fully applied, or Resume = projected)
+    if (!this.options.skipInitialDriftCheck) {
+      if (isResume) {
+        const projectedResumeState = this.projectExpectedStateOnResume(preflightRes.preflightBases, plan, runId);
+        const projectedResumeHash = calculateTargetStateHash(projectedResumeState);
+        if (currentTargetHash !== projectedResumeHash) {
+          this.journal.failRun(runId, 'EXTERNAL_DRIFT_DURING_BACKFILL');
           throw new Error(
-            `FAIL_CONFLICTING_EXISTING_PAGE: Recuperação de incerteza detectou página com dados conflitantes para '${uOp.stableId}'.`,
+            `EXTERNAL_DRIFT_DURING_BACKFILL: Target state durante resume (${currentTargetHash}) diverge do estado esperado projetado (${projectedResumeHash}). 0 writes executados.`,
           );
         }
-      } else if (existingMatches.length > 1) {
-        this.journal.recordFailed(runId, uOp.operationIndex, 'FAIL_DUPLICATE_STABLE_ID');
-        throw new Error(
-          `FAIL_DUPLICATE_STABLE_ID: Múltiplas páginas encontradas com mesmo stableId '${uOp.stableId}'.`,
-        );
+      } else {
+        const fullyAppliedState = this.projectFullyAppliedState(preflightRes.preflightBases, plan);
+        const fullyAppliedHash = calculateTargetStateHash(fullyAppliedState);
+
+        const isPristine = currentTargetHash === FROZEN_TARGET_STATE_HASH;
+        const isFullyApplied = currentTargetHash === fullyAppliedHash;
+
+        if (!isPristine && !isFullyApplied) {
+          this.journal.failRun(runId, 'TARGET_DRIFT_DETECTED');
+          throw new Error(
+            `TARGET_DRIFT_DETECTED: Live/simulated target state (${currentTargetHash}) diverge do snapshot congelado (${FROZEN_TARGET_STATE_HASH}) e do estado totalmente aplicado (${fullyAppliedHash}). 0 writes executados.`,
+          );
+        }
       }
-      // If 0 matches, attempts will retry below
     }
 
     // =========================================================================
     // STAGE 1: Page Creation (155 Transações + 4 Faturas = 159 pages)
-    // Scalar properties + EXISTING_PAGE_ID relations only.
     // =========================================================================
     for (let i = 0; i < plan.operations.length; i++) {
       const op = plan.operations[i];
@@ -406,6 +738,39 @@ export class BackfillExecutor {
         op.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS'
           ? 'ID Estável da Fatura'
           : 'ID da Fonte';
+
+      // Pre-create validation: validate all EXISTING_PAGE_ID relations against target state
+      for (const [propName, refList] of Object.entries(op.relations)) {
+        const propContract = TARGET_CONTRACT[op.targetDataSource.envKey]?.properties.find(
+          (p) => p.notionProperty === propName,
+        );
+        const targetEnvKey = propContract?.relationTargetEnvKey;
+        if (!targetEnvKey) {
+          this.journal.recordFailed(runId, i, 'FAIL_RELATION_TARGET_TYPE_MISMATCH');
+          throw new Error(
+            `FAIL_RELATION_TARGET_TYPE_MISMATCH: Propriedade '${propName}' não possui relationTargetEnvKey configurado no TARGET_CONTRACT.`,
+          );
+        }
+
+        for (const ref of refList) {
+          if (ref.type === 'EXISTING_PAGE_ID') {
+            const targetBase = currentTargetState[targetEnvKey];
+            if (!targetBase) {
+              this.journal.recordFailed(runId, i, 'FAIL_RELATION_TARGET_MISSING');
+              throw new Error(
+                `FAIL_RELATION_TARGET_MISSING: Base alvo '${targetEnvKey}' referenciada em '${propName}' não encontrada no target state.`,
+              );
+            }
+            const targetRecord = targetBase.records.find((r) => r.id === ref.target);
+            if (!targetRecord) {
+              this.journal.recordFailed(runId, i, 'FAIL_RELATION_TARGET_MISSING');
+              throw new Error(
+                `FAIL_RELATION_TARGET_MISSING: Página alvo '${ref.target}' referenciada em '${propName}' não existe na base '${targetEnvKey}'.`,
+              );
+            }
+          }
+        }
+      }
 
       // Separate EXISTING_PAGE_ID relations from PLANNED_STABLE_ID
       const existingRelations: Record<string, string[]> = {};
@@ -443,9 +808,8 @@ export class BackfillExecutor {
 
       const journalEntry = this.journal.getOperation(runId, i);
       if (journalEntry && (journalEntry.status === 'VERIFIED' || journalEntry.status === 'NO_OP_VERIFIED')) {
-        // Ensure mapping is cached
         if (journalEntry.targetPageId) {
-          this.journal.savePageMapping(op.stableId, journalEntry.targetPageId, op.targetDataSource.envKey);
+          this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, journalEntry.targetPageId, op.targetDataSource.envKey);
         }
         if (journalEntry.status === 'NO_OP_VERIFIED') {
           existingPageCreateNoOps++;
@@ -477,10 +841,6 @@ export class BackfillExecutor {
         let matchesPlan = existingFingerprint === expectedPostFingerprint;
 
         if (!matchesPlan) {
-          // If the migration already executed Stage 2 previously, relations
-          // (such as "Fatura Vinculada" on transactions or "Lançamentos do Ciclo" on bills)
-          // may already be populated on this record. Verify that all Stage 1 canonical properties
-          // match exactly, and any extra canonical properties are only known Stage 2 deferred relations.
           const canonicalExisting = canonicalizePageRecord(op.targetDataSource.envKey, existingRec.properties);
           let allStage1PropsMatch = true;
 
@@ -519,7 +879,7 @@ export class BackfillExecutor {
 
         if (matchesPlan) {
           this.journal.recordVerified(runId, i, existingRec.id, true);
-          this.journal.savePageMapping(op.stableId, existingRec.id, op.targetDataSource.envKey);
+          this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, existingRec.id, op.targetDataSource.envKey);
           existingPageCreateNoOps++;
           continue;
         } else {
@@ -556,7 +916,7 @@ export class BackfillExecutor {
           this.journal.recordApplied(runId, i, createdPageId);
           break;
         } catch (err: any) {
-          // Check for validation error (no blind retry on 400, 401, 403, 404, validation_error)
+          // Fail fast without retry on 400, 401, 403, 404, REAL_DML_DISABLED, validation_error
           if (
             err?.status === 400 ||
             err?.status === 401 ||
@@ -569,7 +929,7 @@ export class BackfillExecutor {
             throw err;
           }
 
-          // Check uncertain write (timeout / network uncertainty)
+          // Check uncertain write: reconcile by stable identity before blind retry
           if (isUncertainError(err)) {
             const reconcile = await this.adapter.findByStableIdentity(
               op.targetDataSource.envKey,
@@ -589,7 +949,15 @@ export class BackfillExecutor {
 
           if (attemptCount < maxRetries) {
             retries++;
-            await new Promise((r) => setTimeout(r, retryDelay * attemptCount));
+            // If 429, respect Retry-After
+            if (err?.status === 429) {
+              const waitMs = parseRetryAfterMs(err, retryDelay * 10);
+              await new Promise((r) => setTimeout(r, waitMs));
+            } else {
+              // 5xx exponential backoff with jitter
+              const backoff = Math.min(retryDelay * Math.pow(2, attemptCount - 1) + Math.random() * 5, 2000);
+              await new Promise((r) => setTimeout(r, backoff));
+            }
           } else {
             this.journal.recordFailed(runId, i, sanitizeErrorMessage(err.message));
             throw err;
@@ -618,7 +986,7 @@ export class BackfillExecutor {
       }
 
       this.journal.recordVerified(runId, i, createdPageId, false);
-      this.journal.savePageMapping(op.stableId, createdPageId, op.targetDataSource.envKey);
+      this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, createdPageId, op.targetDataSource.envKey);
       actualSimulatedCreateWrites++;
     }
 
@@ -638,21 +1006,16 @@ export class BackfillExecutor {
 
     // =========================================================================
     // STAGE 2: Canonical Relation Patch Groups
-    // Resolves PLANNED_STABLE_ID references via backfill_page_map.
-    // Groups by page into canonical patch groups (the 4 card bills).
-    // Mutates Faturas."Lançamentos do Ciclo" and Faturas."Transações de Pagamento".
-    // Verifies Transações."Fatura Vinculada" dual relation.
     // =========================================================================
-    const pageMap = this.journal.getAllPageMappings();
-
-    // Group relations for card bills: 4 canonical patch groups
     const cardBillOps = plan.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
     canonicalRelationPatchGroups = cardBillOps.length;
 
     for (let bIdx = 0; bIdx < cardBillOps.length; bIdx++) {
       const billOp = cardBillOps[bIdx];
       const opIdx = 159 + bIdx;
-      const billPageId = pageMap.get(billOp.stableId);
+
+      const mapping = this.journal.getPageMapping(plan.backfillPlanHash, billOp.stableId);
+      const billPageId = mapping?.notionPageId;
       if (!billPageId) {
         throw new Error(`FAIL_UNRESOLVED_PLANNED_RELATION: ID da fatura '${billOp.stableId}' não resolvido.`);
       }
@@ -671,66 +1034,47 @@ export class BackfillExecutor {
         continue;
       }
 
-      const relationPatches: Record<string, string[]> = {};
+      const relationPatches = this.buildRelationPatchesForBill(billOp, plan.backfillPlanHash);
 
-      for (const [relProp, refList] of Object.entries(billOp.relations)) {
-        logicalRelationReferences += refList.length;
+      const isAlreadyApplied = existingJournalOp?.status === 'APPLIED';
 
-        // Skip existing relations already populated in Stage 1
-        const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
-        if (plannedRefs.length === 0) continue;
+      if (!isAlreadyApplied) {
+        // Check current relations on the bill page for idempotency
+        const currentBillPage = await this.adapter.fetchPage(billPageId);
+        if (!currentBillPage) {
+          throw new Error(`FAIL_PAGE_NOT_FOUND: Fatura '${billPageId}' não encontrada.`);
+        }
 
-        const resolvedIds: string[] = [];
-        for (const ref of plannedRefs) {
-          const mappedId = pageMap.get(ref.target);
-          if (!mappedId) {
-            throw new Error(
-              `FAIL_UNRESOLVED_PLANNED_RELATION: Stable ID '${ref.target}' referenciado em '${relProp}' não foi resolvido.`,
-            );
+        let isPatchRequired = false;
+        for (const [relProp, targetIds] of Object.entries(relationPatches)) {
+          const rawCurrent = currentBillPage.properties[relProp];
+          let currentIds: string[] = [];
+          if (rawCurrent && typeof rawCurrent === 'object' && Array.isArray(rawCurrent.relation)) {
+            currentIds = rawCurrent.relation.map((r: any) => r.id || r).sort();
           }
-          resolvedIds.push(mappedId);
-        }
-        relationPatches[relProp] = resolvedIds.sort();
-      }
 
-      // Check current relations on the bill page for idempotency
-      const currentBillPage = await this.adapter.fetchPage(billPageId);
-      if (!currentBillPage) {
-        throw new Error(`FAIL_PAGE_NOT_FOUND: Fatura '${billPageId}' não encontrada.`);
-      }
+          const targetSet = new Set(targetIds);
 
-      let isPatchRequired = false;
-      for (const [relProp, targetIds] of Object.entries(relationPatches)) {
-        const rawCurrent = currentBillPage.properties[relProp];
-        let currentIds: string[] = [];
-        if (rawCurrent && typeof rawCurrent === 'object' && Array.isArray(rawCurrent.relation)) {
-          currentIds = rawCurrent.relation.map((r: any) => r.id || r).sort();
-        }
+          for (const cId of currentIds) {
+            if (!targetSet.has(cId)) {
+              this.journal.recordFailed(runId, opIdx, 'FAIL_RELATION_CONFLICT');
+              throw new Error(
+                `FAIL_RELATION_CONFLICT: Relação externa inesperada '${cId}' detectada na propriedade '${relProp}' da fatura '${billPageId}'.`,
+              );
+            }
+          }
 
-        const currentSet = new Set(currentIds);
-        const targetSet = new Set(targetIds);
-
-        // Check for unexpected extra relations
-        for (const cId of currentIds) {
-          if (!targetSet.has(cId)) {
-            this.journal.recordFailed(runId, opIdx, 'FAIL_RELATION_CONFLICT');
-            throw new Error(
-              `FAIL_RELATION_CONFLICT: Relação externa inesperada '${cId}' detectada na propriedade '${relProp}' da fatura '${billPageId}'.`,
-            );
+          if (currentIds.length !== targetIds.length) {
+            isPatchRequired = true;
           }
         }
 
-        if (currentIds.length !== targetIds.length) {
-          isPatchRequired = true;
+        if (!isPatchRequired) {
+          this.journal.recordVerified(runId, opIdx, billPageId, true);
+          continue;
         }
-      }
 
-      if (!isPatchRequired) {
-        this.journal.recordVerified(runId, opIdx, billPageId, true);
-        continue;
-      }
-
-      if (isPatchRequired) {
+        // Execute mutation with retry policy
         let patchSuccess = false;
         let attemptCount = 0;
 
@@ -738,6 +1082,7 @@ export class BackfillExecutor {
           attemptCount++;
           this.journal.recordAttempt(runId, opIdx);
           writeRequestsSent++;
+
           try {
             await this.adapter.updatePageRelations(
               billOp.targetDataSource.envKey,
@@ -749,8 +1094,19 @@ export class BackfillExecutor {
             actualSimulatedRelationWrites++;
             break;
           } catch (err: any) {
+            if (
+              err?.status === 400 ||
+              err?.status === 401 ||
+              err?.status === 403 ||
+              err?.status === 404 ||
+              (err?.message && err.message.includes('REAL_DML_DISABLED')) ||
+              (err?.message && err.message.includes('validation_error'))
+            ) {
+              this.journal.recordFailed(runId, opIdx, sanitizeErrorMessage(err.message));
+              throw err;
+            }
+
             if (isUncertainError(err)) {
-              // Reconcile relations
               const checkPage = await this.adapter.fetchPage(billPageId);
               if (checkPage) {
                 let reconciledAll = true;
@@ -773,7 +1129,13 @@ export class BackfillExecutor {
 
             if (attemptCount < maxRetries) {
               retries++;
-              await new Promise((r) => setTimeout(r, retryDelay * attemptCount));
+              if (err?.status === 429) {
+                const waitMs = parseRetryAfterMs(err, retryDelay * 10);
+                await new Promise((r) => setTimeout(r, waitMs));
+              } else {
+                const backoff = Math.min(retryDelay * Math.pow(2, attemptCount - 1) + Math.random() * 5, 2000);
+                await new Promise((r) => setTimeout(r, backoff));
+              }
             } else {
               this.journal.recordFailed(runId, opIdx, sanitizeErrorMessage(err.message));
               throw err;
@@ -787,46 +1149,56 @@ export class BackfillExecutor {
         }
       }
 
-      this.journal.recordVerified(runId, opIdx, billPageId, false);
-
-      // Verification of Stage 2 relations:
-      // Verify both Faturas relations and the dual relation on Transações."Fatura Vinculada"
+      // Stage 2 Verification Order: mutation -> APPLIED -> fetchPage -> verify relation sets -> verify dual relation -> VERIFIED
       const verifiedBillPage = await this.adapter.fetchPage(billPageId);
       if (!verifiedBillPage) {
+        this.journal.recordFailed(runId, opIdx, 'FAIL_PAGE_NOT_FOUND');
         throw new Error(`FAIL_PAGE_NOT_FOUND: Fatura pós-patch '${billPageId}' não encontrada.`);
       }
 
       for (const [relProp, expectedIds] of Object.entries(relationPatches)) {
         const liveIds = (verifiedBillPage.properties[relProp]?.relation || []).map((r: any) => r.id || r).sort();
         if (JSON.stringify(liveIds) !== JSON.stringify(expectedIds)) {
+          this.journal.recordFailed(runId, opIdx, 'FAIL_RELATION_VERIFICATION_MISMATCH');
           throw new Error(
             `FAIL_RELATION_VERIFICATION_MISMATCH: Propriedade '${relProp}' da fatura diverge do esperado após patch.`,
           );
         }
       }
 
-      // Verify dual relations on the 20 purchase transactions
+      // Verify dual relations on all 20 purchase transactions
       const purchaseIds = relationPatches['Lançamentos do Ciclo'] || [];
       for (const txId of purchaseIds) {
         const txPage = await this.adapter.fetchPage(txId);
         if (!txPage) {
+          this.journal.recordFailed(runId, opIdx, 'FAIL_DUAL_RELATION_VERIFICATION');
           throw new Error(`FAIL_DUAL_RELATION_VERIFICATION: Transação de compra '${txId}' não encontrada.`);
         }
         const linkedBills = (txPage.properties['Fatura Vinculada']?.relation || []).map((r: any) => r.id || r);
         if (!linkedBills.includes(billPageId)) {
+          this.journal.recordFailed(runId, opIdx, 'FAIL_DUAL_RELATION_VERIFICATION');
           throw new Error(
             `FAIL_DUAL_RELATION_VERIFICATION: Transação '${txId}' não possui vínculo dual com a fatura '${billPageId}'.`,
           );
         }
       }
+
+      this.journal.recordVerified(runId, opIdx, billPageId, false);
     }
 
     // Complete run in journal
     this.journal.completeRun(runId);
     const finalCounts = this.journal.countByStatus(runId);
 
-    // Live Notion mutations check: must be strictly 0 in Phase 2B
-    const liveNotionMutations = 0;
+    // Live Notion mutations check: derived strictly from adapter (must be 0)
+    const liveNotionMutations = this.adapter.getMutationCount();
+    if (liveNotionMutations !== 0) {
+      throw new Error(`FAIL_LIVE_MUTATIONS_DETECTED: Detectadas ${liveNotionMutations} mutações live na Notion API.`);
+    }
+
+    const totalVerified = finalCounts.VERIFIED + finalCounts.NO_OP_VERIFIED;
+    const isSuccess = finalCounts.FAILED === 0 && totalVerified === 163;
+    const readyForLiveApplyReview = isSuccess && liveNotionMutations === 0;
 
     return {
       executorHeadCommitSha: executorCommitSha,
@@ -842,7 +1214,7 @@ export class BackfillExecutor {
       semanticCreates,
       actualSimulatedCreateWrites,
       existingPageCreateNoOps,
-      logicalRelationReferences: 320, // All 320 logical relation references audited
+      logicalRelationReferences: 320,
       canonicalRelationPatchGroups,
       actualSimulatedRelationWrites,
       writeRequestsSent,
@@ -851,7 +1223,7 @@ export class BackfillExecutor {
       recoveredUncertainRelationWrites,
       journalFinal: finalCounts,
       liveNotionMutations,
-      readyForLiveApplyReview: true,
+      readyForLiveApplyReview,
       readyForApply: false,
       reasons: [],
     };

@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
@@ -54,7 +55,7 @@ describe('BackfillDryRunAnalyzer & BackfillPlanner', () => {
     NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
     SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
     BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',
-    MIGRATION_BACKUP_KEY: 'a70161f1e03d46710d676c2f4edaa496a9cb8c0ec2ef449e13284ad67513d05f',
+    MIGRATION_BACKUP_KEY: process.env.MIGRATION_BACKUP_KEY,
     COUNTERPARTY_HMAC_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   };
 
