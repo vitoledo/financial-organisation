@@ -1108,4 +1108,54 @@ describe('Phase 2B.1: BackfillExecutor Hardened Engine & Idempotency', { timeout
       ).toThrow(/FAIL_UNKNOWN_PROPERTY/);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 9. REALISTIC PAGE IDS & PROJECTION TESTS (Phase 2C Item 13)
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('9. Realistic Page IDs & Projection Tests', () => {
+    it('projectFullyAppliedState resolves realistic UUIDs without sim-page-* prefix', async () => {
+      const bases = getFrozenTargetBases();
+      const uuidCounter = 5000;
+      const realisticIdGenerator = (counter: number) => {
+        return `aabbccdd-1234-5678-90ab-${(uuidCounter + counter).toString().padStart(12, '0')}`;
+      };
+
+      const adapter = new SimulatedNotionAdapter(bases, { pageIdGenerator: realisticIdGenerator });
+      const journalDb = new Database(':memory:');
+      const journal = new BackfillJournal(journalDb);
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: testEnv,
+        commitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        skipWorktreeCleanCheck: true,
+        skipHeadInSyncCheck: true,
+      });
+
+      const report = await executor.execute();
+      expect(report.status).toBe('COMPLETED');
+
+      const preflightRes = await executor.preflight();
+      const projected = executor.projectFullyAppliedState(
+        preflightRes.preflightBases,
+        preflightRes.planArtifact,
+      );
+
+      const txRecords = projected['NOTION_DS_TRANSACTIONS'].records;
+      expect(txRecords.length).toBe(155);
+      for (const r of txRecords) {
+        expect(r.id).toMatch(/^aabbccdd-1234-5678-90ab-\d{12}$/);
+        expect(r.id).not.toContain('sim-page-');
+      }
+
+      const billRecords = projected['NOTION_DS_CARD_BILLS'].records;
+      expect(billRecords.length).toBe(4);
+      for (const r of billRecords) {
+        expect(r.id).toMatch(/^aabbccdd-1234-5678-90ab-\d{12}$/);
+        expect(r.id).not.toContain('sim-page-');
+      }
+    });
+  });
 });

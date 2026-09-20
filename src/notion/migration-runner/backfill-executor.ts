@@ -322,6 +322,7 @@ export class BackfillExecutor {
   public projectFullyAppliedState(
     initialState: Record<string, BaseSnapshotData>,
     plan: BackfillPlanArtifact,
+    pageIdResolver?: (stableId: string, index: number) => string,
   ): Record<string, BaseSnapshotData> {
     const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
 
@@ -332,7 +333,11 @@ export class BackfillExecutor {
     for (const op of plan.operations) {
       if (op.operationType !== 'CREATE') continue;
       counter++;
-      const pageId = `sim-page-${String(counter).padStart(6, '0')}`;
+      const mapping = this.journal.getPageMapping(plan.backfillPlanHash, op.stableId);
+      const pageId =
+        pageIdResolver?.(op.stableId, counter) ||
+        mapping?.notionPageId ||
+        `sim-page-${String(counter).padStart(6, '0')}`;
       simulatedPageIds.set(op.stableId, pageId);
 
       const existingRelations: Record<string, string[]> = {};

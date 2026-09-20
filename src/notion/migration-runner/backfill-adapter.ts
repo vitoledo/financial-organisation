@@ -54,9 +54,18 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
   private pageIdToEnvKey: Map<string, string> = new Map();
   private pageCounter: number = 0;
   private faults: SimulationFaultInjector = {};
+  private pageIdGenerator?: (index: number) => string;
 
-  constructor(initialBases: Record<string, BaseSnapshotData> = {}) {
+  constructor(
+    initialBases: Record<string, BaseSnapshotData> = {},
+    options?: { pageIdGenerator?: (index: number) => string },
+  ) {
+    this.pageIdGenerator = options?.pageIdGenerator;
     this.initFromSnapshot(initialBases);
+  }
+
+  public setPageIdGenerator(generator?: (index: number) => string): void {
+    this.pageIdGenerator = generator;
   }
 
   private initFromSnapshot(initialBases: Record<string, BaseSnapshotData>): void {
@@ -93,6 +102,9 @@ export class SimulatedNotionAdapter implements BackfillNotionAdapter {
 
   private generateDeterministicPageId(): string {
     this.pageCounter += 1;
+    if (this.pageIdGenerator) {
+      return this.pageIdGenerator(this.pageCounter);
+    }
     const padded = String(this.pageCounter).padStart(6, '0');
     return `sim-page-${padded}`;
   }
@@ -475,7 +487,7 @@ export class LiveNotionAdapter implements BackfillNotionAdapter {
     _properties: Record<string, any>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
     throw new Error(
-      'REAL_DML_DISABLED_PHASE_2B: Mutation methods are strictly disabled in Phase 2B. Live DML writes are not authorized.',
+      'REAL_DML_DISABLED_PRE_APPLY: Mutation methods are strictly disabled in pre-apply / Phase 2C (REAL_DML_DISABLED_PHASE_2B). Live DML writes are not authorized.',
     );
   }
 
@@ -485,7 +497,7 @@ export class LiveNotionAdapter implements BackfillNotionAdapter {
     _relations: Record<string, string[]>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
     throw new Error(
-      'REAL_DML_DISABLED_PHASE_2B: Mutation methods are strictly disabled in Phase 2B. Live DML writes are not authorized.',
+      'REAL_DML_DISABLED_PRE_APPLY: Mutation methods are strictly disabled in pre-apply / Phase 2C (REAL_DML_DISABLED_PHASE_2B). Live DML writes are not authorized.',
     );
   }
 }
