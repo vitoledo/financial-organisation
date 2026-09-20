@@ -20,7 +20,8 @@
     "notion:snapshot-data": "ts-node scripts/snapshot-notion-data.ts",
     "notion:backfill-dry": "ts-node scripts/backfill-dry-run.ts",
     "notion:backfill-simulate": "ts-node scripts/backfill-simulate.ts",
-    "notion:backfill-live-preflight": "ts-node scripts/backfill-live-preflight.ts"
+    "notion:backfill-live-preflight": "ts-node scripts/backfill-live-preflight.ts",
+    "notion:backfill-live-apply": "ts-node scripts/backfill-live-apply.ts"
   },
   "keywords": [
     "finance",

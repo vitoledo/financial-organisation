@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 
-export type BackfillRunStatus = 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
+export type BackfillRunStatus = 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'PAUSED_AFTER_CANARY';
 
 export type BackfillOperationStatus =
   | 'PENDING'
@@ -74,7 +74,8 @@ export class BackfillJournal {
 
   private initSchema(): void {
     this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('synchronous = FULL');
+    this.db.pragma('foreign_keys = ON');
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS backfill_runs (
@@ -202,6 +203,19 @@ export class BackfillJournal {
         "UPDATE backfill_runs SET status = 'COMPLETED', completed_at = ? WHERE run_id = ?",
       )
       .run(completedAt, runId);
+  }
+
+  public pauseAfterCanary(runId: string): void {
+    this.db
+      .prepare(
+        "UPDATE backfill_runs SET status = 'PAUSED_AFTER_CANARY' WHERE run_id = ?",
+      )
+      .run(runId);
+  }
+
+  public hasAnyRuns(): boolean {
+    const row = this.db.prepare('SELECT count(*) as count FROM backfill_runs').get() as any;
+    return (row?.count ?? 0) > 0;
   }
 
   public failRun(

@@ -54,6 +54,9 @@ export interface BackfillExecutorOptions {
   skipInitialDriftCheck?: boolean;
   maxRetries?: number;
   retryBaseDelayMs?: number;
+  canary?: number;
+  resumeRunId?: string;
+  isLive?: boolean;
 }
 
 export interface BackfillExecutorReport {
@@ -66,7 +69,7 @@ export interface BackfillExecutorReport {
   targetSnapshotHash: string;
   targetStateHash: string;
   simulationRunId: string;
-  status: 'COMPLETED' | 'FAILED';
+  status: 'COMPLETED' | 'FAILED' | 'PAUSED_AFTER_CANARY';
   semanticCreates: number;
   actualSimulatedCreateWrites: number;
   existingPageCreateNoOps: number;
@@ -580,10 +583,32 @@ export class BackfillExecutor {
 
     // 3. Determine runId (new run vs resume)
     let runId: string;
-    const existingRun = this.journal.getLatestRun();
     let isResume = false;
+    const isLive = Boolean(
+      this.options.isLive ||
+      (this.adapter as any).isProductionMutationAuthorized ||
+      (this.adapter as any).totalMutationRequests !== undefined
+    );
 
-    if (existingRun && existingRun.status === 'IN_PROGRESS' && existingRun.planHash === plan.backfillPlanHash) {
+    if (isLive && !this.options.resumeRunId && this.journal.hasAnyRuns()) {
+      throw new Error(
+        'FAIL_INITIAL_RUN_JOURNAL_EXISTS: Journal já possui execuções registradas. Execução live exige a flag explícita --resume <run_id> para continuar.',
+      );
+    }
+
+    const existingRun = this.options.resumeRunId
+      ? this.journal.getRun(this.options.resumeRunId)
+      : this.journal.getLatestRun();
+
+    if (this.options.resumeRunId && !existingRun) {
+      throw new Error(`FAIL_RESUME_NO_RUN_FOUND: Run '${this.options.resumeRunId}' não encontrado no journal.`);
+    }
+
+    if (
+      existingRun &&
+      (existingRun.status === 'IN_PROGRESS' || existingRun.status === 'PAUSED_AFTER_CANARY') &&
+      existingRun.planHash === plan.backfillPlanHash
+    ) {
       runId = existingRun.runId;
       isResume = true;
       // Fail closed if journal binding diverges from frozen baseline
@@ -595,6 +620,16 @@ export class BackfillExecutor {
         targetStateHash: preflightRes.targetStateHash,
       });
     } else {
+      // Item 12: For initial run in live mode, journal must not contain preexisting runs unless explicit resume
+      if (this.journal.hasAnyRuns() && isLive && !isResume) {
+        throw new Error('FAIL_INITIAL_RUN_JOURNAL_EXISTS: Journal já possui execuções registradas. Novo run inicial requer journal limpo ou flag explícita de resume.');
+      }
+
+      // Item 14: Initial live run requires --canary 1
+      if (isLive && !isResume && this.options.canary !== 1) {
+        throw new Error('CANARY_REQUIRED_FOR_INITIAL_RUN: A execução inicial em ambiente live exige o parâmetro --canary 1 para verificação controlada.');
+      }
+
       runId = `run-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
       this.journal.startRun({
         runId,
@@ -886,6 +921,36 @@ export class BackfillExecutor {
           this.journal.recordVerified(runId, i, existingRec.id, true);
           this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, existingRec.id, op.targetDataSource.envKey);
           existingPageCreateNoOps++;
+          if (this.options.canary === 1) {
+            this.journal.pauseAfterCanary(runId);
+            return {
+              executorHeadCommitSha: executorCommitSha,
+              executorParentCommitSha,
+              planOriginCommitSha: planOriginSha,
+              frozenBackfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+              reproducedBackfillPlanHash: plan.backfillPlanHash,
+              sourceSnapshotHash: preflightRes.sourceSnapshotHash,
+              targetSnapshotHash: preflightRes.targetSnapshotHash,
+              targetStateHash: preflightRes.targetStateHash,
+              simulationRunId: runId,
+              status: 'PAUSED_AFTER_CANARY',
+              semanticCreates: 1,
+              actualSimulatedCreateWrites,
+              existingPageCreateNoOps,
+              logicalRelationReferences: 320,
+              canonicalRelationPatchGroups: 0,
+              actualSimulatedRelationWrites: 0,
+              writeRequestsSent,
+              retries,
+              recoveredUncertainCreates,
+              recoveredUncertainRelationWrites,
+              journalFinal: this.journal.countByStatus(runId),
+              liveNotionMutations: this.adapter.getMutationCount(),
+              readyForLiveApplyReview: true,
+              readyForApply: false,
+              reasons: ['PAUSED_AFTER_CANARY: Execução canary de 1 operação CREATE concluída com sucesso e pausada para auditoria.'],
+            };
+          }
           continue;
         } else {
           this.journal.recordFailed(runId, i, 'FAIL_CONFLICTING_EXISTING_PAGE');
@@ -993,6 +1058,37 @@ export class BackfillExecutor {
       this.journal.recordVerified(runId, i, createdPageId, false);
       this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, createdPageId, op.targetDataSource.envKey);
       actualSimulatedCreateWrites++;
+
+      if (this.options.canary === 1) {
+        this.journal.pauseAfterCanary(runId);
+        return {
+          executorHeadCommitSha: executorCommitSha,
+          executorParentCommitSha,
+          planOriginCommitSha: planOriginSha,
+          frozenBackfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+          reproducedBackfillPlanHash: plan.backfillPlanHash,
+          sourceSnapshotHash: preflightRes.sourceSnapshotHash,
+          targetSnapshotHash: preflightRes.targetSnapshotHash,
+          targetStateHash: preflightRes.targetStateHash,
+          simulationRunId: runId,
+          status: 'PAUSED_AFTER_CANARY',
+          semanticCreates: 1,
+          actualSimulatedCreateWrites,
+          existingPageCreateNoOps,
+          logicalRelationReferences: 320,
+          canonicalRelationPatchGroups: 0,
+          actualSimulatedRelationWrites: 0,
+          writeRequestsSent,
+          retries,
+          recoveredUncertainCreates,
+          recoveredUncertainRelationWrites,
+          journalFinal: this.journal.countByStatus(runId),
+          liveNotionMutations: this.adapter.getMutationCount(),
+          readyForLiveApplyReview: true,
+          readyForApply: false,
+          reasons: ['PAUSED_AFTER_CANARY: Execução canary de 1 operação CREATE concluída com sucesso e pausada para auditoria.'],
+        };
+      }
     }
 
     // Verify Stage 1 completeness: all 159 operations must be VERIFIED or NO_OP_VERIFIED
@@ -1007,6 +1103,24 @@ export class BackfillExecutor {
       throw new Error(
         `STAGE_1_INCOMPLETE: ${unverifiedStage1.length} operações do Stage 1 não atingiram estado VERIFIED. Stage 2 não autorizado.`,
       );
+    }
+
+    // Item 18: Checkpoint antes do Stage 2: recalcular estado esperado pelo journal e comparar com live
+    if (!this.options.skipInitialDriftCheck) {
+      const projectedStage1State = this.projectExpectedStateOnResume(preflightRes.preflightBases, plan, runId);
+      const projectedStage1Hash = calculateTargetStateHash(projectedStage1State);
+      const currentLiveState = await this.adapter.queryTargetState();
+      const currentLiveHash = calculateTargetStateHash(currentLiveState);
+
+      const fullyAppliedState = this.projectFullyAppliedState(preflightRes.preflightBases, plan);
+      const fullyAppliedHash = calculateTargetStateHash(fullyAppliedState);
+
+      if (currentLiveHash !== projectedStage1Hash && currentLiveHash !== fullyAppliedHash) {
+        this.journal.failRun(runId, 'EXTERNAL_DRIFT_DURING_BACKFILL');
+        throw new Error(
+          `EXTERNAL_DRIFT_DURING_BACKFILL: Target state após Stage 1 (${currentLiveHash}) diverge do estado esperado projetado pelo journal (${projectedStage1Hash}). Stage 2 abortado.`,
+        );
+      }
     }
 
     // =========================================================================
@@ -1195,15 +1309,15 @@ export class BackfillExecutor {
     this.journal.completeRun(runId);
     const finalCounts = this.journal.countByStatus(runId);
 
-    // Live Notion mutations check: derived strictly from adapter (must be 0)
+    // Live Notion mutations check: derived strictly from adapter
     const liveNotionMutations = this.adapter.getMutationCount();
-    if (liveNotionMutations !== 0) {
-      throw new Error(`FAIL_LIVE_MUTATIONS_DETECTED: Detectadas ${liveNotionMutations} mutações live na Notion API.`);
+    if (!isLive && liveNotionMutations !== 0) {
+      throw new Error(`FAIL_LIVE_MUTATIONS_DETECTED: Detectadas ${liveNotionMutations} mutações live na Notion API em modo simulação.`);
     }
 
     const totalVerified = finalCounts.VERIFIED + finalCounts.NO_OP_VERIFIED;
     const isSuccess = finalCounts.FAILED === 0 && totalVerified === 163;
-    const readyForLiveApplyReview = isSuccess && liveNotionMutations === 0;
+    const readyForLiveApplyReview = isSuccess && (!isLive ? liveNotionMutations === 0 : true);
 
     return {
       executorHeadCommitSha: executorCommitSha,

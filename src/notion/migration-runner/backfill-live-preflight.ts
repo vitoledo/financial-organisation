@@ -19,7 +19,8 @@ import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
-import { findPropertyContract } from './backfill-serializer';
+import { findPropertyContract, serializePayloadForNotion } from './backfill-serializer';
+import { BackfillJournal } from './backfill-journal';
 import { NotionSchemaValidator } from '../schema-validator';
 import { LiveNotionAdapter } from './backfill-adapter';
 import { calculateTargetStateHash, BaseSnapshotData } from './data-snapshot';
@@ -566,17 +567,47 @@ export class BackfillLivePreflight {
 }
 
 /**
- * Valida se um artefato de preflight ainda está dentro de sua janela de TTL (Item 16).
+ * Valida se um artefato de preflight ainda está dentro de sua janela de TTL (Item 4).
  */
 export function isPreflightValid(
   artifact: LivePreflightArtifact,
   maxAgeMs: number = 15 * 60 * 1000,
 ): { valid: boolean; reason?: string } {
+  if (!artifact.generatedAt || !artifact.expiresAt) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: generatedAt ou expiresAt ausentes no artefato.' };
+  }
+
   const generatedTime = new Date(artifact.generatedAt).getTime();
+  const expiresTime = new Date(artifact.expiresAt).getTime();
+
+  if (isNaN(generatedTime) || isNaN(expiresTime)) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: Formato de timestamp ISO inválido no artefato.' };
+  }
+
   const now = Date.now();
+  const CLOCK_TOLERANCE_MS = 60 * 1000; // 60s tolerância para clock skew
+
+  // 1. generatedAt no futuro além da tolerância
+  if (generatedTime > now + CLOCK_TOLERANCE_MS) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: generatedAt no futuro detectado além da tolerância permitida (60s).' };
+  }
+
+  // 2. expiresAt já passou
+  if (expiresTime <= now) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_EXPIRED: O preflight expirou (expiresAt <= now). Novo preflight read-only exigido.' };
+  }
+
+  // 3. Idade desde generatedAt excede maxAgeMs
   if (now - generatedTime > maxAgeMs) {
     return { valid: false, reason: 'LIVE_PREFLIGHT_EXPIRED: O preflight expirou (> 15 minutos). Novo preflight read-only exigido.' };
   }
+
+  // 4. Consistência do intervalo expiresAt - generatedAt
+  const ttlWindow = expiresTime - generatedTime;
+  if (ttlWindow <= 0 || ttlWindow > maxAgeMs + CLOCK_TOLERANCE_MS) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: Janela de expiração (expiresAt - generatedAt) inconsistente ou adulterada.' };
+  }
+
   return { valid: true };
 }
 
@@ -621,6 +652,284 @@ export function validatePreflightBinding(
   }
   if (expected.executorCommitSha && artifact.executorCommitSha !== expected.executorCommitSha) {
     return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: executorCommitSha diverge (${artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
+  }
+
+  return { valid: true };
+}
+
+export interface ResumePreflightOptions {
+  client?: Client;
+  envVars?: Record<string, string | undefined>;
+  runId?: string;
+  planOriginCommitSha?: string;
+  artifactPath?: string;
+  journalPath?: string;
+  ttlMinutes?: number;
+}
+
+export interface ResumePreflightArtifact {
+  preflightVersion: string;
+  type: 'RESUME_PREFLIGHT';
+  timestamp: string;
+  generatedAt: string;
+  expiresAt: string;
+  ttlMinutes: number;
+  runId: string;
+  executorCommitSha: string;
+  planOriginCommitSha: string;
+  backfillPlanHash: string;
+  journalFingerprint: string;
+  projectedTargetStateHash: string;
+  liveTargetStateHash: string;
+  workspaceIdentityHash: string;
+  actorType: string;
+  verifiedOperationsCount: number;
+  readyForLiveApplyReview: boolean;
+  readyForApply: boolean;
+  reasons: string[];
+}
+
+export class BackfillLiveResumePreflight {
+  private client?: Client;
+  private envVars: Record<string, string | undefined>;
+  private planOriginSha: string;
+  private artifactPath: string;
+  private journalPath: string;
+  private ttlMinutes: number;
+  private runId?: string;
+
+  constructor(options: ResumePreflightOptions = {}) {
+    this.envVars = options.envVars || (process.env as Record<string, string | undefined>);
+    this.planOriginSha = options.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
+    this.artifactPath =
+      options.artifactPath || path.resolve(process.cwd(), '.local', 'backfill-live-resume-preflight.json');
+    this.journalPath = options.journalPath || path.resolve(process.cwd(), '.local', 'backfill-live-journal.db');
+    this.ttlMinutes = options.ttlMinutes ?? 15;
+    this.runId = options.runId;
+
+    const apiKey = this.envVars.NOTION_API_KEY?.trim();
+    this.client =
+      options.client ||
+      (apiKey
+        ? new Client({
+            auth: apiKey,
+            notionVersion: '2026-03-11',
+          })
+        : undefined);
+  }
+
+  private getGitCommitSha(): string {
+    try {
+      return execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+    } catch {
+      return 'unknown-executor-sha';
+    }
+  }
+
+  public async executeResumePreflight(): Promise<ResumePreflightArtifact> {
+    const reasons: string[] = [];
+    const now = new Date();
+    const generatedAt = now.toISOString();
+    const expiresAt = new Date(now.getTime() + this.ttlMinutes * 60 * 1000).toISOString();
+    const executorCommitSha = this.getGitCommitSha();
+
+    if (!fs.existsSync(this.journalPath)) {
+      throw new Error(`FAIL_RESUME_NO_JOURNAL: Journal não encontrado em '${this.journalPath}'.`);
+    }
+
+    const journal = new BackfillJournal(this.journalPath);
+    const run = this.runId ? journal.getRun(this.runId) : journal.getLatestRun();
+
+    if (!run) {
+      throw new Error('FAIL_RESUME_NO_RUN_FOUND: Nenhuma execução encontrada no journal para resume.');
+    }
+
+    if (run.status !== 'IN_PROGRESS' && run.status !== 'PAUSED_AFTER_CANARY') {
+      reasons.push(
+        `FAIL_RESUME_STATUS_INVALID: Status do run '${run.runId}' é '${run.status}', esperado 'PAUSED_AFTER_CANARY' ou 'IN_PROGRESS'.`,
+      );
+    }
+
+    if (run.planHash !== FROZEN_BACKFILL_PLAN_HASH) {
+      reasons.push(`FAIL_RESUME_PLAN_HASH_MISMATCH: planHash no journal (${run.planHash}) diverge de ${FROZEN_BACKFILL_PLAN_HASH}.`);
+    }
+
+    // 1. Workspace Identity
+    let workspaceIdentityHash = 'unknown-workspace';
+    let actorType = 'unknown';
+    if (this.client) {
+      try {
+        const botUser: any = await this.client.users.me({});
+        actorType = botUser?.type || 'unknown';
+        const wsId = botUser?.bot?.workspace_id || botUser?.id || 'unknown';
+        workspaceIdentityHash = crypto.createHash('sha256').update(wsId).digest('hex');
+      } catch (err: any) {
+        reasons.push(`FAIL_LIVE_WORKSPACE_AUTH: Falha na autenticação Notion: ${err.message}`);
+      }
+    }
+
+    // 2. Load frozen bases and reproduce plan
+    const analyzer = new BackfillDryRunAnalyzer({
+      envVars: this.envVars,
+      commitSha: this.planOriginSha,
+    });
+    const targetSession = analyzer.prepareValidatedTargetSnapshot();
+    const frozenBases: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(targetSession.payload.bases));
+    targetSession.cleanup();
+
+    const planReport = await analyzer.runAnalysis();
+    const plan = planReport.planArtifact;
+
+    // 3. Project expected live state based on verified/applied operations in journal
+    const ops = journal.getOperations(run.runId);
+    const verifiedOps = ops.filter(
+      (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
+    );
+    const journalFingerprint = crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify(
+          verifiedOps.map((o) => [o.operationIndex, o.status, o.targetPageId, o.expectedPostFingerprint]),
+        ),
+      )
+      .digest('hex');
+
+    const projectedExpectedState: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(frozenBases));
+    for (const opRec of verifiedOps) {
+      if (opRec.action === 'CREATE' && opRec.targetPageId) {
+        const planOp = plan.operations[opRec.operationIndex];
+        if (!planOp) continue;
+        const serialized = serializePayloadForNotion(planOp.targetDataSource.envKey, planOp.sanitizedPayload, {}, true);
+        const base = projectedExpectedState[planOp.targetDataSource.envKey];
+        if (base) {
+          base.records.push({
+            id: opRec.targetPageId,
+            createdTime: new Date().toISOString(),
+            lastEditedTime: new Date().toISOString(),
+            archived: false,
+            url: `https://notion.so/${opRec.targetPageId.replace(/-/g, '')}`,
+            properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
+          });
+          base.recordCount = base.records.length;
+        }
+      }
+    }
+
+    const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
+
+    // 4. Query live Notion state
+    const liveAdapter = new LiveNotionAdapter(this.client || ({} as any), this.envVars);
+    let liveTargetBases: Record<string, BaseSnapshotData> = {};
+    try {
+      liveTargetBases = await liveAdapter.queryTargetState();
+    } catch (err: any) {
+      throw new Error(`FAIL_LIVE_TARGET_READ: Falha ao ler bases live para resume: ${err.message}`);
+    }
+
+    const liveTargetStateHash = calculateTargetStateHash(liveTargetBases);
+
+    // 5. Compare actual live with projected expected
+    if (liveTargetStateHash !== projectedTargetStateHash) {
+      reasons.push(
+        `TARGET_DRIFT_DETECTED: liveTargetStateHash (${liveTargetStateHash}) diverge do estado esperado projetado pelo journal (${projectedTargetStateHash}).`,
+      );
+    }
+
+    const readyForLiveApplyReview = reasons.length === 0;
+    const readyForApply = false;
+
+    const artifact: ResumePreflightArtifact = {
+      preflightVersion: '1.0.0',
+      type: 'RESUME_PREFLIGHT',
+      timestamp: generatedAt,
+      generatedAt,
+      expiresAt,
+      ttlMinutes: this.ttlMinutes,
+      runId: run.runId,
+      executorCommitSha,
+      planOriginCommitSha: this.planOriginSha,
+      backfillPlanHash: plan.backfillPlanHash,
+      journalFingerprint,
+      projectedTargetStateHash,
+      liveTargetStateHash,
+      workspaceIdentityHash,
+      actorType,
+      verifiedOperationsCount: verifiedOps.length,
+      readyForLiveApplyReview,
+      readyForApply,
+      reasons,
+    };
+
+    const dir = path.dirname(this.artifactPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(this.artifactPath, JSON.stringify(artifact, null, 2), 'utf8');
+
+    return artifact;
+  }
+}
+
+export function isResumePreflightValid(
+  artifact: ResumePreflightArtifact,
+  maxAgeMs: number = 15 * 60 * 1000,
+): { valid: boolean; reason?: string } {
+  if (!artifact.generatedAt || !artifact.expiresAt) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: generatedAt ou expiresAt ausentes no artefato.' };
+  }
+
+  const generatedTime = new Date(artifact.generatedAt).getTime();
+  const expiresTime = new Date(artifact.expiresAt).getTime();
+
+  if (isNaN(generatedTime) || isNaN(expiresTime)) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: Formato de timestamp ISO inválido no artefato.' };
+  }
+
+  const now = Date.now();
+  const CLOCK_TOLERANCE_MS = 60 * 1000;
+
+  if (generatedTime > now + CLOCK_TOLERANCE_MS) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: generatedAt no futuro detectado além da tolerância permitida (60s).' };
+  }
+  if (expiresTime <= now) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_EXPIRED: O preflight expirou (expiresAt <= now). Novo preflight exigido.' };
+  }
+  if (now - generatedTime > maxAgeMs) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_EXPIRED: O preflight expirou (> 15 minutos). Novo preflight exigido.' };
+  }
+
+  const ttlWindow = expiresTime - generatedTime;
+  if (ttlWindow <= 0 || ttlWindow > maxAgeMs + CLOCK_TOLERANCE_MS) {
+    return { valid: false, reason: 'LIVE_PREFLIGHT_INVALID_TIME: Janela de expiração inconsistente ou adulterada.' };
+  }
+
+  return { valid: true };
+}
+
+export function validateResumePreflightBinding(
+  artifact: ResumePreflightArtifact,
+  expected: {
+    runId?: string;
+    executorCommitSha?: string;
+    backfillPlanHash?: string;
+    projectedTargetStateHash?: string;
+    workspaceIdentityHash?: string;
+  } = {},
+): { valid: boolean; reason?: string } {
+  const expPlanHash = expected.backfillPlanHash || FROZEN_BACKFILL_PLAN_HASH;
+
+  if (artifact.backfillPlanHash !== expPlanHash) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: backfillPlanHash diverge (${artifact.backfillPlanHash} vs ${expPlanHash}).` };
+  }
+  if (expected.runId && artifact.runId !== expected.runId) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: runId diverge (${artifact.runId} vs ${expected.runId}).` };
+  }
+  if (expected.executorCommitSha && artifact.executorCommitSha !== expected.executorCommitSha) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: executorCommitSha diverge (${artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
+  }
+  if (expected.projectedTargetStateHash && artifact.projectedTargetStateHash !== expected.projectedTargetStateHash) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: projectedTargetStateHash diverge (${artifact.projectedTargetStateHash} vs ${expected.projectedTargetStateHash}).` };
+  }
+  if (expected.workspaceIdentityHash && artifact.workspaceIdentityHash !== expected.workspaceIdentityHash) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: workspaceIdentityHash diverge (${artifact.workspaceIdentityHash} vs ${expected.workspaceIdentityHash}).` };
   }
 
   return { valid: true };
