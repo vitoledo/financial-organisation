@@ -26,6 +26,7 @@ import {
   FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_STATE_HASH,
+  APPROVED_WORKSPACE_IDENTITY_HASH,
 } from '../src/notion/migration-runner/backfill-constants';
 import {
   isPreflightValid,
@@ -54,7 +55,7 @@ function getGitCommitSha(): string {
   }
 }
 
-function getRemoteBranchHeadSha(): string | null {
+export function getRemoteBranchHeadSha(): string | null {
   try {
     // Try upstream tracking branch first
     return execSync('git rev-parse @{u}', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
@@ -68,6 +69,25 @@ function getRemoteBranchHeadSha(): string | null {
       return null;
     }
   }
+}
+
+export function getActualRemoteHeadSha(env?: Record<string, string | undefined>): string | null {
+  if (env?.MOCK_ACTUAL_REMOTE_HEAD_SHA !== undefined) {
+    return env.MOCK_ACTUAL_REMOTE_HEAD_SHA || null;
+  }
+  try {
+    const out = execSync('git ls-remote --heads origin feat/phase-1-schema-apply-executor', {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    }).trim();
+    if (out) {
+      const match = out.split(/\s+/)[0];
+      if (match && match.length === 40) return match;
+    }
+  } catch {
+    // fallback or offline
+  }
+  return getRemoteBranchHeadSha();
 }
 
 function isWorktreeClean(): boolean {
@@ -181,10 +201,17 @@ export async function runLiveApply(
   const remoteHead = getRemoteBranchHeadSha();
   if (remoteHead && remoteHead !== currentCommitSha) {
     throw new Error(
-      `FAIL_EXECUTOR_COMMIT_MISMATCH: Local HEAD (${currentCommitSha}) diverge do remote branch HEAD (${remoteHead}).`,
+      `FAIL_EXECUTOR_COMMIT_MISMATCH: Local HEAD (${currentCommitSha}) diverge do tracking branch local (${remoteHead}).`,
     );
   }
-  console.log('  ✓ Working tree limpa e sincronizada com o branch remoto.');
+
+  const actualRemoteHead = getActualRemoteHeadSha(env);
+  if (actualRemoteHead && actualRemoteHead !== currentCommitSha) {
+    throw new Error(
+      `FAIL_EXECUTOR_COMMIT_MISMATCH: Local HEAD (${currentCommitSha}) diverge do remote HEAD real no origin (${actualRemoteHead}).`,
+    );
+  }
+  console.log('  ✓ Working tree limpa e sincronizada com o branch remoto (ls-remote verificado).');
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 3. VALIDAÇÃO DO ARTEFATO DE PREFLIGHT (Itens 4, 5, 6, 16)
@@ -221,6 +248,7 @@ export async function runLiveApply(
         runId: resumeRunId,
         executorCommitSha: currentCommitSha,
         backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
       })
     : validatePreflightBinding(artifact, {
         executorCommitSha: currentCommitSha,
@@ -229,6 +257,7 @@ export async function runLiveApply(
         sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
         targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
         targetStateHash: FROZEN_TARGET_STATE_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
       });
 
   if (!binding.valid) {
@@ -262,6 +291,11 @@ export async function runLiveApply(
   const botUser: any = await client.users.me({});
   const liveWsId = botUser?.bot?.workspace_id || botUser?.id || '';
   const liveWsHash = crypto.createHash('sha256').update(liveWsId).digest('hex');
+  if (liveWsHash !== APPROVED_WORKSPACE_IDENTITY_HASH) {
+    throw new Error(
+      `FAIL_PRODUCTION_AUTHORIZATION: Workspace identity (${liveWsHash}) não corresponde ao workspace aprovado (${APPROVED_WORKSPACE_IDENTITY_HASH}).`,
+    );
+  }
   if (liveWsHash !== artifact.workspaceIdentityHash) {
     throw new Error('FAIL_PRODUCTION_AUTHORIZATION: Workspace identity diverge do artefato de preflight.');
   }

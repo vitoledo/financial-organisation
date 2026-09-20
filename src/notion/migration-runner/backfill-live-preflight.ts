@@ -31,7 +31,9 @@ import {
   FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_STATE_HASH,
+  APPROVED_WORKSPACE_IDENTITY_HASH,
 } from './backfill-constants';
+import { projectExpectedBackfillState } from './backfill-executor';
 import { BackfillSchemaConformanceEvidence, BackfillOperation, TypedRelationReference } from './types';
 
 export interface LivePreflightOptions {
@@ -626,6 +628,31 @@ export function validatePreflightBinding(
     workspaceIdentityHash?: string;
   } = {},
 ): { valid: boolean; reason?: string } {
+  // Exigir estritamente que o artefato esteja GREEN antes de qualquer autorização de write
+  if (artifact.readyForLiveApplyReview !== true) {
+    return { valid: false, reason: 'FAIL_PREFLIGHT_NOT_REVIEW_READY: Artefato de preflight não está marcado como readyForLiveApplyReview === true.' };
+  }
+  if (artifact.readyForApply !== false) {
+    return { valid: false, reason: 'FAIL_PREFLIGHT_INVALID_APPLY_FLAG: Artefato de preflight deve ter readyForApply === false.' };
+  }
+  if (artifact.reasons && artifact.reasons.length > 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Preflight contém razões de bloqueio (${artifact.reasons.join(', ')}).` };
+  }
+  if (artifact.liveMutations !== 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_MUTATIONS_NOT_ZERO: Preflight registrou mutações live (${artifact.liveMutations}).` };
+  }
+  if (artifact.schema) {
+    if (artifact.schema.verified !== 13 || artifact.schema.missing !== 0 || artifact.schema.mismatches !== 0) {
+      return { valid: false, reason: `FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN: Schema verification incompleta ou com erros (verified: ${artifact.schema.verified}, missing: ${artifact.schema.missing}, mismatches: ${artifact.schema.mismatches}).` };
+    }
+  }
+  if (artifact.stableIdentityConflicts !== 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_IDENTITY_CONFLICTS: Preflight detectou ${artifact.stableIdentityConflicts} conflitos de stable identity.` };
+  }
+  if (artifact.relationTargetErrors !== 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_RELATION_ERRORS: Preflight detectou ${artifact.relationTargetErrors} erros de relation target.` };
+  }
+
   const expPlanOrigin = expected.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
   const expPlanHash = expected.backfillPlanHash || FROZEN_BACKFILL_PLAN_HASH;
   const expSource = expected.sourceSnapshotHash || FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256;
@@ -794,27 +821,7 @@ export class BackfillLiveResumePreflight {
       )
       .digest('hex');
 
-    const projectedExpectedState: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(frozenBases));
-    for (const opRec of verifiedOps) {
-      if (opRec.action === 'CREATE' && opRec.targetPageId) {
-        const planOp = plan.operations[opRec.operationIndex];
-        if (!planOp) continue;
-        const serialized = serializePayloadForNotion(planOp.targetDataSource.envKey, planOp.sanitizedPayload, {}, true);
-        const base = projectedExpectedState[planOp.targetDataSource.envKey];
-        if (base) {
-          base.records.push({
-            id: opRec.targetPageId,
-            createdTime: new Date().toISOString(),
-            lastEditedTime: new Date().toISOString(),
-            archived: false,
-            url: `https://notion.so/${opRec.targetPageId.replace(/-/g, '')}`,
-            properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
-          });
-          base.recordCount = base.records.length;
-        }
-      }
-    }
-
+    const projectedExpectedState = projectExpectedBackfillState(frozenBases, plan, journal, run.runId);
     const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
 
     // 4. Query live Notion state
@@ -914,6 +921,13 @@ export function validateResumePreflightBinding(
     workspaceIdentityHash?: string;
   } = {},
 ): { valid: boolean; reason?: string } {
+  if (artifact.readyForLiveApplyReview !== true) {
+    return { valid: false, reason: 'FAIL_PREFLIGHT_NOT_REVIEW_READY: Resume preflight não está marcado como readyForLiveApplyReview === true.' };
+  }
+  if (artifact.reasons && artifact.reasons.length > 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Resume preflight contém razões de bloqueio (${artifact.reasons.join(', ')}).` };
+  }
+
   const expPlanHash = expected.backfillPlanHash || FROZEN_BACKFILL_PLAN_HASH;
 
   if (artifact.backfillPlanHash !== expPlanHash) {

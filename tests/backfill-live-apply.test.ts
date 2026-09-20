@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import {
@@ -11,13 +12,19 @@ import {
   FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_STATE_HASH,
+  APPROVED_WORKSPACE_IDENTITY_HASH,
 } from '../src/notion/migration-runner/backfill-constants';
 import {
   ProductionNotionAdapter,
   ProductionAuthorizationContext,
   validateProductionAuthorization,
 } from '../src/notion/migration-runner/production-adapter';
-import { BackfillExecutor, DEFAULT_CONFORMANT_SCHEMA_EVIDENCE } from '../src/notion/migration-runner/backfill-executor';
+import {
+  BackfillExecutor,
+  DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+  projectExpectedBackfillState,
+} from '../src/notion/migration-runner/backfill-executor';
+import { calculateTargetStateHash } from '../src/notion/migration-runner/data-snapshot';
 import { BackfillJournal } from '../src/notion/migration-runner/backfill-journal';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
 import {
@@ -76,7 +83,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
       targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
       targetStateHash: FROZEN_TARGET_STATE_HASH,
-      workspaceIdentityHash: crypto.createHash('sha256').update('test-ws-id').digest('hex'),
+      workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
       preflightGeneratedAt: now.toISOString(),
       preflightExpiresAt: expiresAt.toISOString(),
       journalPath: path.join(testTempDir, 'journal.db'),
@@ -141,7 +148,9 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       },
       users: {
         me: vi.fn().mockResolvedValue({
-          bot: { workspace_id: 'test-ws-id' },
+          type: 'bot',
+          bot: { workspace_id: 'c1b2fa11-8ce9-4328-8311-ebe75fc2dd42' },
+          id: 'c1b2fa11-8ce9-4328-8311-ebe75fc2dd42',
         }),
       },
     } as unknown as Client;
@@ -190,10 +199,10 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       );
     });
 
-    it('throws if workspaceIdentityHash is empty', () => {
-      const ctx = createValidAuthContext({ workspaceIdentityHash: '   ' });
+    it('throws if workspaceIdentityHash does not match approved workspace hash', () => {
+      const ctx = createValidAuthContext({ workspaceIdentityHash: 'bad-ws-hash' });
       expect(() => validateProductionAuthorization(ctx)).toThrow(
-        /FAIL_PRODUCTION_AUTHORIZATION: workspaceIdentityHash ausente ou inválido/,
+        /FAIL_PRODUCTION_AUTHORIZATION: workspaceIdentityHash não corresponde ao workspace aprovado/,
       );
     });
 
@@ -277,7 +286,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         adapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-tx-123', {
           Descrição: { title: [{ text: { content: 'Tx 3' } }] },
         }),
-      ).rejects.toThrow(/FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de 2 criações de página atingido/);
+      ).rejects.toThrow(/FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de 2 criações.*de página atingido/);
     });
 
     it('enforces relation budget: rejects 5th relation patch group with FAIL_MUTATION_BUDGET_EXCEEDED', async () => {
@@ -339,6 +348,83 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       );
       expect(adapter.getMutationCount()).toBe(0);
     });
+
+    it('create uses data_source_id, never database_id', async () => {
+      let capturedPayload: any;
+      const mockClient = createMockNotionClient({
+        createPage: async (params) => {
+          capturedPayload = params;
+          return { id: 'created-tx-1', properties: params.properties };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await adapter.createPage('NOTION_DS_TRANSACTIONS', testEnv.NOTION_DS_TRANSACTIONS, {
+        Descrição: { title: [{ text: { content: 'Tx Parent Test' } }] },
+      });
+
+      expect(capturedPayload).toBeDefined();
+      expect(capturedPayload.parent).toEqual({
+        type: 'data_source_id',
+        data_source_id: testEnv.NOTION_DS_TRANSACTIONS,
+      });
+      expect(capturedPayload.parent.database_id).toBeUndefined();
+    });
+
+    it('missing DS env -> fail closed with FAIL_MISSING_ENV', async () => {
+      const incompleteEnv = { ...testEnv };
+      delete incompleteEnv.NOTION_DS_CATEGORIES;
+      const mockClient = createMockNotionClient();
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, incompleteEnv, { rateLimitDelayMs: 0 });
+
+      await expect(adapter.queryTargetState()).rejects.toThrow(/FAIL_MISSING_ENV: Variável obrigatória 'NOTION_DS_CATEGORIES'/);
+    });
+
+    it('create target DS mismatch -> 0 writes', async () => {
+      let createAttempted = false;
+      const mockClient = createMockNotionClient({
+        createPage: async () => {
+          createAttempted = true;
+          return { id: 'bad-id', properties: {} };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await expect(
+        adapter.createPage('NOTION_DS_TRANSACTIONS', 'wrong-ds-id', {
+          Descrição: { title: [{ text: { content: 'Mismatch' } }] },
+        }),
+      ).rejects.toThrow(/FAIL_MUTATION_TARGET_MISMATCH/);
+
+      expect(createAttempted).toBe(false);
+      expect(adapter.createRequestsSent).toBe(0);
+      expect(adapter.getMutationCount()).toBe(0);
+    });
+
+    it('relation target mismatch -> 0 writes', async () => {
+      let patchAttempted = false;
+      const mockClient = createMockNotionClient({
+        updatePage: async () => {
+          patchAttempted = true;
+          return { id: 'patched-id', properties: {} };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await expect(
+        adapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'bill-1', {
+          'Propriedade Estranha': ['tx-1'],
+        }),
+      ).rejects.toThrow(/FAIL_UNEXPECTED_RELATION_PROPERTY/);
+
+      expect(patchAttempted).toBe(false);
+      expect(adapter.relationPatchRequestsSent).toBe(0);
+      expect(adapter.getMutationCount()).toBe(0);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -393,17 +479,14 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       expect(callCount).toBe(1);
     });
 
-    it('retries on 500/503 server errors and recovers', async () => {
+    it('throws UNCERTAIN_MUTATION on 500 without blind retries for mutations', async () => {
       let callCount = 0;
       const mockClient = createMockNotionClient({
         createPage: async () => {
           callCount++;
-          if (callCount < 2) {
-            const error: any = new Error('Notion internal server error');
-            error.status = 500;
-            throw error;
-          }
-          return { id: 'recovered-page-id', properties: {} };
+          const error: any = new Error('Notion internal server error');
+          error.status = 500;
+          throw error;
         },
       });
       const ctx = createValidAuthContext();
@@ -412,12 +495,85 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         maxRetries: 3,
       });
 
-      const res = await adapter.createPage('NOTION_DS_TRANSACTIONS', 'ds-tx-123', {
-        Descrição: { title: [{ text: { content: 'Tx Recover' } }] },
+      await expect(
+        adapter.createPage('NOTION_DS_TRANSACTIONS', testEnv.NOTION_DS_TRANSACTIONS, {
+          Descrição: { title: [{ text: { content: 'Tx Uncertain' } }] },
+        }),
+      ).rejects.toMatchObject({
+        isUncertain: true,
+        code: 'UNCERTAIN_MUTATION',
       });
 
-      expect(res.id).toBe('recovered-page-id');
+      // Crucial: exactly 1 HTTP call attempt, ZERO blind retries
+      expect(callCount).toBe(1);
+    });
+
+    it('retries on 500/503 server errors for READ requests and recovers', async () => {
+      let callCount = 0;
+      const mockClient = createMockNotionClient({
+        queryDataSource: async () => {
+          callCount++;
+          if (callCount < 2) {
+            const error: any = new Error('Notion internal server error');
+            error.status = 500;
+            throw error;
+          }
+          return { results: [], has_more: false };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, {
+        rateLimitDelayMs: 0,
+        maxRetries: 3,
+      });
+
+      const res = await adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'ID da Fonte', 'tx-123');
+      expect(res).toEqual([]);
       expect(callCount).toBe(2);
+    });
+
+    it('stable identity >100 duplicate fixture -> duplicate detected across pagination', async () => {
+      let queryCount = 0;
+      const mockClient = createMockNotionClient({
+        queryDataSource: async () => {
+          queryCount++;
+          if (queryCount === 1) {
+            return {
+              results: [
+                {
+                  id: 'page-dup-1',
+                  properties: {
+                    'ID da Fonte': { rich_text: [{ plain_text: 'tx-target-duplicate' }] },
+                  },
+                },
+              ],
+              has_more: true,
+              next_cursor: 'cursor-page-2',
+            };
+          } else {
+            return {
+              results: [
+                {
+                  id: 'page-dup-2',
+                  properties: {
+                    'ID da Fonte': { rich_text: [{ plain_text: 'tx-target-duplicate' }] },
+                  },
+                },
+              ],
+              has_more: false,
+              next_cursor: null,
+            };
+          }
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      const records = await adapter.findByStableIdentity('NOTION_DS_TRANSACTIONS', 'ID da Fonte', 'tx-target-duplicate');
+      expect(records.length).toBe(2);
+      expect(records[0].id).toBe('page-dup-1');
+      expect(records[1].id).toBe('page-dup-2');
+      expect(queryCount).toBe(2);
     });
   });
 
@@ -513,7 +669,6 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
         targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
         targetStateHash: FROZEN_TARGET_STATE_HASH,
-        totalOperationsPlanned: 159,
       });
 
       const executor = new BackfillExecutor({
@@ -666,6 +821,280 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       // Execute full live run (not canary) -> should detect drift at checkpoint or preflight
       await expect(executor.execute()).rejects.toThrow(/EXTERNAL_DRIFT_DURING_BACKFILL|CANARY_REQUIRED_FOR_INITIAL_RUN/);
     });
+
+    it('CREATE 500 after remote commit -> executor reconciles -> 1 page only', async () => {
+      const bases = getFrozenTargetBases();
+      const env = createFrozenTargetEnv(bases);
+
+      const analyzer = new BackfillDryRunAnalyzer({ envVars: env, commitSha: PLAN_ORIGIN_COMMIT_SHA });
+      const analysis = await analyzer.runAnalysis();
+      const firstOp = analysis.planArtifact.operations[0];
+
+      let createdRemotely = false;
+      let committedPage: any = null;
+
+      const mockClient = createFrozenMockClient(bases, env, {
+        createPage: async (params) => {
+          createdRemotely = true;
+          committedPage = {
+            id: 'notion-committed-tx-id',
+            created_time: new Date().toISOString(),
+            last_edited_time: new Date().toISOString(),
+            properties: params.properties,
+          };
+          const err: any = new Error('Gateway Timeout / 500 Internal Error');
+          err.status = 500;
+          throw err;
+        },
+        filterMatch: (_dsId, _filter) => {
+          if (createdRemotely && committedPage) {
+            return [committedPage];
+          }
+          return [];
+        },
+      });
+
+      mockClient.pages.retrieve = vi.fn().mockImplementation(async (params: any) => {
+        if (params.page_id === 'notion-committed-tx-id' && committedPage) {
+          return committedPage;
+        }
+        return { id: params.page_id, properties: {} };
+      });
+
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, env, { rateLimitDelayMs: 0 });
+      const db = new Database(':memory:');
+      const journal = new BackfillJournal(db);
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: env,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        isLive: true,
+        canary: 1,
+        skipWorktreeCleanCheck: true,
+      });
+
+      const report = await executor.execute();
+
+      expect(report.status).toBe('PAUSED_AFTER_CANARY');
+      expect(report.semanticCreates).toBe(1);
+      expect(report.recoveredUncertainCreates).toBe(1);
+      expect(report.journalFinal.VERIFIED).toBe(1);
+      expect(adapter.logicalCreates).toBe(1);
+    });
+
+    it('RELATION PATCH 503 after remote commit -> reconcile -> no duplicate mutation', async () => {
+      const bases = getFrozenTargetBases();
+      const env = createFrozenTargetEnv(bases);
+
+      const analyzer = new BackfillDryRunAnalyzer({ envVars: env, commitSha: PLAN_ORIGIN_COMMIT_SHA });
+      const analysis = await analyzer.runAnalysis();
+      const plan = analysis.planArtifact;
+
+      const db = new Database(':memory:');
+      const journal = new BackfillJournal(db);
+      const runId = 'test-run-relation-503';
+      journal.startRun({
+        runId,
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: 'test-sha',
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      for (let i = 0; i < 159; i++) {
+        const op = plan.operations[i];
+        const pageId = `mock-tx-${i}`;
+        journal.registerOperation({
+          runId,
+          operationIndex: i,
+          stableId: op.stableId,
+          stage: 'STAGE_1_CREATE',
+          targetDataSource: op.targetDataSource.envKey,
+          action: 'CREATE',
+        });
+        journal.recordApplied(runId, i, pageId);
+        journal.recordVerified(runId, i, pageId, false);
+      }
+
+      const cardBillOps = plan.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
+      for (let b = 1; b < cardBillOps.length; b++) {
+        const bOp = cardBillOps[b];
+        const opIdx = 159 + b;
+        journal.registerOperation({
+          runId,
+          operationIndex: opIdx,
+          stableId: bOp.stableId,
+          stage: 'STAGE_2_RELATION_PATCHING',
+          targetDataSource: bOp.targetDataSource.envKey,
+          action: 'RELATION_PATCH',
+        });
+        journal.recordApplied(runId, opIdx, `mock-bill-${opIdx}`);
+        journal.recordVerified(runId, opIdx, `mock-bill-${opIdx}`, false);
+      }
+
+      let patchAttempts = 0;
+      const committedPropertiesByPage: Record<string, Record<string, any>> = {};
+
+      const mockClient = createFrozenMockClient(bases, env);
+      mockClient.pages.retrieve = vi.fn().mockImplementation(async (params: any) => {
+        const committed = committedPropertiesByPage[params.page_id] || {};
+        return {
+          id: params.page_id,
+          properties: {
+            'Fatura Vinculada': { relation: [{ id: 'mock-tx-155' }] },
+            ...committed,
+          },
+        };
+      });
+
+      mockClient.pages.update = vi.fn().mockImplementation(async (params: any) => {
+        patchAttempts++;
+        committedPropertiesByPage[params.page_id] = {
+          ...(committedPropertiesByPage[params.page_id] || {}),
+          ...params.properties,
+        };
+        const err: any = new Error('Notion 503 Service Unavailable');
+        err.status = 503;
+        throw err;
+      });
+
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, env, { rateLimitDelayMs: 0 });
+
+      const executor = new BackfillExecutor({
+        adapter,
+        journal,
+        envVars: env,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
+        isLive: true,
+        resumeRunId: runId,
+        skipWorktreeCleanCheck: true,
+        skipInitialDriftCheck: true,
+      });
+
+      const report = await executor.execute();
+
+      expect(report.recoveredUncertainRelationWrites).toBeGreaterThanOrEqual(1);
+      expect(patchAttempts).toBe(1);
+    });
+
+    it('resume preflight after real-style canary -> exact hash', async () => {
+      const bases = getFrozenTargetBases();
+      const env = createFrozenTargetEnv(bases);
+
+      const analyzer = new BackfillDryRunAnalyzer({ envVars: env, commitSha: PLAN_ORIGIN_COMMIT_SHA });
+      const analysis = await analyzer.runAnalysis();
+      const plan = analysis.planArtifact;
+
+      const db = new Database(':memory:');
+      const journal = new BackfillJournal(db);
+      const runId = 'test-run-canary-hash';
+      journal.startRun({
+        runId,
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: 'test-sha',
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      const firstOp = plan.operations[0];
+      const canaryPageId = 'canary-verified-page-id';
+      journal.registerOperation({
+        runId,
+        operationIndex: 0,
+        stableId: firstOp.stableId,
+        stage: 'STAGE_1_CREATE',
+        targetDataSource: firstOp.targetDataSource.envKey,
+        action: 'CREATE',
+      });
+      journal.recordApplied(runId, 0, canaryPageId);
+      journal.recordVerified(runId, 0, canaryPageId, false);
+
+      const projected = projectExpectedBackfillState(bases, plan, journal, runId);
+      const projectedHash = calculateTargetStateHash(projected);
+
+      const liveBases: Record<string, any> = JSON.parse(JSON.stringify(bases));
+      const canaryRecord = projected['NOTION_DS_TRANSACTIONS'].records.find((r) => r.id === canaryPageId);
+      if (canaryRecord) {
+        liveBases['NOTION_DS_TRANSACTIONS'].records.push(JSON.parse(JSON.stringify(canaryRecord)));
+        liveBases['NOTION_DS_TRANSACTIONS'].recordCount = liveBases['NOTION_DS_TRANSACTIONS'].records.length;
+      }
+
+      const liveHash = calculateTargetStateHash(liveBases);
+      expect(liveHash).toBe(projectedHash);
+    });
+
+    it('resume preflight after partial Stage 2 -> exact hash', async () => {
+      const bases = getFrozenTargetBases();
+      const env = createFrozenTargetEnv(bases);
+
+      const analyzer = new BackfillDryRunAnalyzer({ envVars: env, commitSha: PLAN_ORIGIN_COMMIT_SHA });
+      const analysis = await analyzer.runAnalysis();
+      const plan = analysis.planArtifact;
+
+      const db = new Database(':memory:');
+      const journal = new BackfillJournal(db);
+      const runId = 'test-run-partial-stage2';
+      journal.startRun({
+        runId,
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: 'test-sha',
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      for (let i = 0; i < 159; i++) {
+        const op = plan.operations[i];
+        const pageId = `tx-page-${i}`;
+        journal.registerOperation({
+          runId,
+          operationIndex: i,
+          stableId: op.stableId,
+          stage: 'STAGE_1_CREATE',
+          targetDataSource: op.targetDataSource.envKey,
+          action: 'CREATE',
+        });
+        journal.recordApplied(runId, i, pageId);
+        journal.recordVerified(runId, i, pageId, false);
+      }
+
+      const cardBillOps = plan.operations.filter((o) => o.targetDataSource.envKey === 'NOTION_DS_CARD_BILLS');
+      const billOp = cardBillOps[0];
+      const targetBillPage = bases['NOTION_DS_CARD_BILLS'].records[0]?.id || 'bill-mock-1';
+      journal.registerOperation({
+        runId,
+        operationIndex: 159,
+        stableId: billOp.stableId,
+        stage: 'STAGE_2_RELATION_PATCH',
+        targetDataSource: billOp.targetDataSource.envKey,
+        action: 'RELATION_PATCH',
+      });
+      journal.recordApplied(runId, 159, targetBillPage);
+      journal.recordVerified(runId, 159, targetBillPage, false);
+
+      const projected = projectExpectedBackfillState(bases, plan, journal, runId);
+      const projectedHash = calculateTargetStateHash(projected);
+
+      expect(projected['NOTION_DS_TRANSACTIONS'].records.length).toBe(155);
+      expect(projected['NOTION_DS_CARD_BILLS'].records.length).toBe(4);
+      expect(typeof projectedHash).toBe('string');
+      expect(projectedHash.length).toBe(64);
+
+      const liveBases: Record<string, any> = JSON.parse(JSON.stringify(projected));
+      const liveHash = calculateTargetStateHash(liveBases);
+      expect(liveHash).toBe(projectedHash);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -698,9 +1127,12 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
 
     it('validateResumePreflightBinding validates runId, commit, and plan hash', () => {
       const artifact = {
+        readyForLiveApplyReview: true,
+        reasons: [],
         runId: 'run-canary-123',
         executorCommitSha: 'commit-123',
         backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
       } as any;
 
       expect(
@@ -708,6 +1140,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           runId: 'run-canary-123',
           executorCommitSha: 'commit-123',
           backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+          workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
         }),
       ).toEqual({ valid: true });
 
@@ -781,6 +1214,71 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       // Even if gates match, initial run without canary 1 must throw
       await expect(runLiveApply(['--execute-live'], env)).rejects.toThrow(
         /FAIL_PRODUCTION_AUTHORIZATION|CANARY_REQUIRED_FOR_INITIAL_RUN|FAIL_EXECUTOR_COMMIT_MISMATCH/,
+      );
+    });
+
+    it('preflight readyForLiveApplyReview=false -> 0 writes', async () => {
+      const artifact = {
+        readyForLiveApplyReview: false,
+        readyForApply: false,
+        reasons: ['FAIL_PREFLIGHT_NOT_REVIEW_READY'],
+        liveMutations: 0,
+        schema: { verified: 13, missing: 0, mismatches: 0 },
+        stableIdentityConflicts: 0,
+        relationTargetErrors: 0,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        frozenTargetStateHash: FROZEN_TARGET_STATE_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+      } as any;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toMatch(/FAIL_PREFLIGHT_NOT_REVIEW_READY/);
+    });
+
+    it('preflight reasons != [] -> 0 writes', async () => {
+      const artifact = {
+        readyForLiveApplyReview: true,
+        readyForApply: false,
+        reasons: ['BLOCKER_DETECTED'],
+        liveMutations: 0,
+        schema: { verified: 13, missing: 0, mismatches: 0 },
+        stableIdentityConflicts: 0,
+        relationTargetErrors: 0,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        frozenTargetStateHash: FROZEN_TARGET_STATE_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+      } as any;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toMatch(/FAIL_PREFLIGHT_REASONS_NOT_EMPTY/);
+    });
+
+    it('remote tracking local ref matches but ls-remote differs -> 0 writes', async () => {
+      let currentCommit = 'test-sha';
+      try {
+        currentCommit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+      } catch {
+        // ignore
+      }
+      const env = {
+        ...testEnv,
+        FINANCIAL_BACKFILL_ENABLED: 'I_UNDERSTAND_BACKFILL_MUTATIONS',
+        FINANCIAL_BACKFILL_PLAN_HASH: FROZEN_BACKFILL_PLAN_HASH,
+        FINANCIAL_BACKFILL_PLAN_COMMIT_SHA: PLAN_ORIGIN_COMMIT_SHA,
+        FINANCIAL_BACKFILL_EXECUTOR_COMMIT_SHA: currentCommit,
+        MOCK_ACTUAL_REMOTE_HEAD_SHA: 'divergent-sha-0000000000000000000000000000000000000000',
+      };
+
+      await expect(runLiveApply(['--execute-live', '--canary', '1'], env)).rejects.toThrow(
+        /FAIL_EXECUTOR_COMMIT_MISMATCH/,
       );
     });
   });

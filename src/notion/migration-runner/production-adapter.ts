@@ -1,13 +1,19 @@
 /**
- * Production Notion Mutation Adapter (Phase 2D)
+ * Production Notion Mutation Adapter (Phase 2D - Hardened Safety Seal)
  *
  * ARCHITECTURAL SAFETY INVARIANTS:
  * 1. ONLY adapter authorized to perform live Notion writes (pages.create, pages.update).
- * 2. CANNOT be instantiated without a validated ProductionAuthorizationContext.
- * 3. Enforces physical mutation budget: MAX 159 pages, MAX 4 relation patch groups.
- * 4. Rate-limited to max ~3 requests/second with 429 Retry-After and 5xx exponential backoff.
- * 5. Builds filters according to TARGET_CONTRACT and strictly validates property types.
- * 6. DELETE, archive, and schema mutations are NOT IMPLEMENTED and throw fatal errors.
+ * 2. CANNOT be instantiated without a validated ProductionAuthorizationContext matching APPROVED_WORKSPACE_IDENTITY_HASH.
+ * 3. Enforces semantic mutation budgets: MAX 159 logical pages, MAX 4 logical relation patch groups.
+ * 4. Distinct metrics: logicalCreates, createHttpAttempts, logicalRelationPatches, relationPatchHttpAttempts.
+ * 5. SEPARATE retry semantics for READ and MUTATION:
+ *    - READ: 429 Retry-After, 5xx exponential backoff, network bounded retries.
+ *    - MUTATION: 429 Retry-After allowed. 5xx/network/timeout NEVER blind retried; thrown as UNCERTAIN_MUTATION for executor reconciliation.
+ * 6. pages.create uses parent: { type: 'data_source_id', data_source_id } without any 'as any'.
+ * 7. Validates target data source ID and target relations before executing any mutation.
+ * 8. findByStableIdentity paginates (page_size: 100, has_more, start_cursor) to detect >100 duplicates.
+ * 9. queryTargetState strictly fails with FAIL_MISSING_ENV if any of the 13 DS env vars is missing.
+ * 10. DELETE, archive, and schema mutations are NOT IMPLEMENTED and throw fatal errors.
  */
 
 import { Client } from '@notionhq/client';
@@ -22,6 +28,7 @@ import {
   FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_STATE_HASH,
+  APPROVED_WORKSPACE_IDENTITY_HASH,
 } from './backfill-constants';
 
 export interface ProductionAuthorizationContext {
@@ -45,7 +52,8 @@ export interface ProductionNotionAdapterOptions {
 }
 
 /**
- * Validates that the ProductionAuthorizationContext satisfies all frozen baseline requirements.
+ * Validates that the ProductionAuthorizationContext satisfies all frozen baseline requirements
+ * and binds strictly to the approved workspace identity.
  * Throws FAIL_PRODUCTION_AUTHORIZATION if any check fails.
  */
 export function validateProductionAuthorization(
@@ -86,6 +94,11 @@ export function validateProductionAuthorization(
   if (!ctx.workspaceIdentityHash || ctx.workspaceIdentityHash.trim().length === 0) {
     throw new Error('FAIL_PRODUCTION_AUTHORIZATION: workspaceIdentityHash ausente ou inválido.');
   }
+  if (ctx.workspaceIdentityHash !== APPROVED_WORKSPACE_IDENTITY_HASH) {
+    throw new Error(
+      `FAIL_PRODUCTION_AUTHORIZATION: workspaceIdentityHash não corresponde ao workspace aprovado (${ctx.workspaceIdentityHash} vs ${APPROVED_WORKSPACE_IDENTITY_HASH}).`,
+    );
+  }
 
   // Validate temporal validity of preflight
   const validity = isPreflightValid({
@@ -117,10 +130,11 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
   private maxRetries: number;
   private lastRequestTime: number = 0;
 
-  // Request & mutation metrics
-  private createRequestsSentCount: number = 0;
-  private relationPatchRequestsSentCount: number = 0;
-  private totalMutationRequestsCount: number = 0;
+  // Distinct metrics: logical vs HTTP attempts
+  private logicalCreatesCount: number = 0;
+  private createHttpAttemptsCount: number = 0;
+  private logicalRelationPatchesCount: number = 0;
+  private relationPatchHttpAttemptsCount: number = 0;
 
   constructor(
     client: Client,
@@ -139,20 +153,36 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
     this.maxRetries = options?.maxRetries ?? 3;
   }
 
+  public get logicalCreates(): number {
+    return this.logicalCreatesCount;
+  }
+
+  public get createHttpAttempts(): number {
+    return this.createHttpAttemptsCount;
+  }
+
+  public get logicalRelationPatches(): number {
+    return this.logicalRelationPatchesCount;
+  }
+
+  public get relationPatchHttpAttempts(): number {
+    return this.relationPatchHttpAttemptsCount;
+  }
+
   public get createRequestsSent(): number {
-    return this.createRequestsSentCount;
+    return this.createHttpAttemptsCount;
   }
 
   public get relationPatchRequestsSent(): number {
-    return this.relationPatchRequestsSentCount;
+    return this.relationPatchHttpAttemptsCount;
   }
 
   public get totalMutationRequests(): number {
-    return this.totalMutationRequestsCount;
+    return this.createHttpAttemptsCount + this.relationPatchHttpAttemptsCount;
   }
 
   public getMutationCount(): number {
-    return this.totalMutationRequestsCount;
+    return this.createHttpAttemptsCount + this.relationPatchHttpAttemptsCount;
   }
 
   public getAuthorizationContext(): ProductionAuthorizationContext {
@@ -160,23 +190,109 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
   }
 
   /**
-   * Rate-limited request scheduler enforcing ~3 requests/second with 429 Retry-After and 5xx backoff.
+   * Enforces minimum request interval (~3 req/s) with jitter.
    */
-  private async scheduleRequest<T>(fn: () => Promise<T>): Promise<T> {
+  private async enforceRateLimit(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    if (elapsed < this.minRequestIntervalMs) {
+      const jitter = Math.floor(Math.random() * 20); // 0-20ms jitter
+      const waitMs = this.minRequestIntervalMs - elapsed + jitter;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    this.lastRequestTime = Date.now();
+  }
+
+  /**
+   * Read Request Scheduler:
+   * - 429: Retry-After header
+   * - 5xx: exponential backoff with jitter
+   * - network errors: bounded retries
+   * - 400/401/403/404: fails fast
+   */
+  public async scheduleReadRequest<T>(fn: () => Promise<T>): Promise<T> {
+    let attempt = 0;
+
+    while (attempt <= this.maxRetries) {
+      attempt++;
+      await this.enforceRateLimit();
+
+      try {
+        return await fn();
+      } catch (err: any) {
+        // Fatal client errors fail fast
+        if (
+          err?.status === 400 ||
+          err?.status === 401 ||
+          err?.status === 403 ||
+          err?.status === 404 ||
+          err?.code === 'validation_error'
+        ) {
+          throw err;
+        }
+
+        // 429 Rate limit: wait and retry
+        if (err?.status === 429) {
+          const retryAfterSec = err.headers?.get?.('retry-after')
+            ? parseFloat(err.headers.get('retry-after'))
+            : err.retry_after ?? 1;
+          const waitTimeMs = Math.max(1000, retryAfterSec * 1000) + 100;
+          if (attempt <= this.maxRetries) {
+            await new Promise((resolve) => setTimeout(resolve, waitTimeMs));
+            continue;
+          }
+        }
+
+        // 5xx Server Errors & Network errors: bounded backoff
+        const is5xx =
+          err?.status === 500 ||
+          err?.status === 502 ||
+          err?.status === 503 ||
+          err?.status === 504 ||
+          err?.code === 'service_unavailable' ||
+          err?.code === 'internal_server_error';
+        const isNetwork =
+          err?.code === 'ECONNRESET' ||
+          err?.code === 'ETIMEDOUT' ||
+          (err?.message && /timeout|network|econnreset|socket/i.test(err.message));
+
+        if (is5xx || isNetwork) {
+          if (attempt <= this.maxRetries) {
+            const backoffMs = Math.pow(2, attempt) * 200 + Math.floor(Math.random() * 100);
+            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            continue;
+          }
+        }
+
+        throw err;
+      }
+    }
+
+    throw new Error('FAIL_REQUEST_EXHAUSTED: Retries de leitura esgotados sem resposta bem-sucedida.');
+  }
+
+  /**
+   * Mutation Request Executor:
+   * - 429: Rate-limited before mutation execution; retry allowed after Retry-After.
+   * - 5xx / Network / Timeout: NEVER blind retried! Throws UNCERTAIN_MUTATION to return
+   *   control to the executor for state reconciliation before any subsequent POST.
+   */
+  private async executeMutationRequest<T>(
+    mutationType: 'CREATE' | 'RELATION_PATCH',
+    fn: () => Promise<T>,
+  ): Promise<T> {
     let attempt = 0;
 
     while (attempt <= this.maxRetries) {
       attempt++;
 
-      // Enforce rate limiter spacing
-      const now = Date.now();
-      const elapsed = now - this.lastRequestTime;
-      if (elapsed < this.minRequestIntervalMs) {
-        const jitter = Math.floor(Math.random() * 20); // 0-20ms jitter
-        const waitMs = this.minRequestIntervalMs - elapsed + jitter;
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      if (mutationType === 'CREATE') {
+        this.createHttpAttemptsCount++;
+      } else {
+        this.relationPatchHttpAttemptsCount++;
       }
-      this.lastRequestTime = Date.now();
+
+      await this.enforceRateLimit();
 
       try {
         return await fn();
@@ -192,7 +308,7 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
           throw err;
         }
 
-        // 429 Rate Limit: Respect Retry-After header
+        // 429 Rate Limit: Gateway rejected before processing mutation -> retry permitted
         if (err?.status === 429) {
           const retryAfterSec = err.headers?.get?.('retry-after')
             ? parseFloat(err.headers.get('retry-after'))
@@ -204,27 +320,35 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
           }
         }
 
-        // 5xx Server Errors: Exponential backoff with jitter
-        if (
+        // 5xx Server Errors or Network Uncertainty: NEVER blind retry from adapter!
+        const is5xx =
           err?.status === 500 ||
           err?.status === 502 ||
           err?.status === 503 ||
           err?.status === 504 ||
           err?.code === 'service_unavailable' ||
-          err?.code === 'internal_server_error'
-        ) {
-          if (attempt <= this.maxRetries) {
-            const backoffMs = Math.pow(2, attempt) * 200 + Math.floor(Math.random() * 100);
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
-            continue;
-          }
+          err?.code === 'internal_server_error';
+        const isNetwork =
+          err?.code === 'ECONNRESET' ||
+          err?.code === 'ETIMEDOUT' ||
+          (err?.message && /timeout|network|econnreset|socket/i.test(err.message));
+
+        if (is5xx || isNetwork) {
+          const uncertainErr = new Error(
+            `UNCERTAIN_MUTATION: Mutação ${mutationType} incerta (${err?.status || err?.code || 'NETWORK_ERROR'}): ${err?.message || err}`,
+          );
+          (uncertainErr as any).isUncertain = true;
+          (uncertainErr as any).originalError = err;
+          (uncertainErr as any).status = err?.status;
+          (uncertainErr as any).code = 'UNCERTAIN_MUTATION';
+          throw uncertainErr;
         }
 
         throw err;
       }
     }
 
-    throw new Error('FAIL_REQUEST_EXHAUSTED: Retries esgotados sem resposta bem-sucedida.');
+    throw new Error(`FAIL_MUTATION_EXHAUSTED: Retries da mutação ${mutationType} esgotados.`);
   }
 
   private mapPageToRecord(page: any): NotionPageRecord {
@@ -244,7 +368,8 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
 
   /**
    * Queries stable identity building filter strictly according to TARGET_CONTRACT.
-   * Throws FAIL_STABLE_ID_PROPERTY_TYPE if live property type doesn't conform.
+   * Paginates completely with page_size=100, has_more, and start_cursor to guarantee
+   * that >1 duplicate is never masked.
    */
   public async findByStableIdentity(
     targetDataSourceEnvKey: string,
@@ -260,7 +385,6 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
     const resolvedPropName = contract ? contract.notionProperty : stableIdProperty;
     const expectedType = contract?.notionType || 'rich_text';
 
-    // Item 8: Explicitly validate contract type for ID da Fonte and ID Estável da Fatura
     if (stableIdProperty === 'ID da Fonte' || stableIdProperty === 'ID Estável da Fatura') {
       if (expectedType !== 'rich_text') {
         throw new Error(
@@ -291,17 +415,33 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       );
     }
 
-    return this.scheduleRequest(async () => {
-      const response = await (this.client as any).dataSources.query({
-        data_source_id: dsId,
-        filter,
+    const records: NotionPageRecord[] = [];
+    let hasMore = true;
+    let startCursor: string | undefined = undefined;
+
+    while (hasMore) {
+      const response: any = await this.scheduleReadRequest(async () => {
+        return (this.client as any).dataSources.query({
+          data_source_id: dsId,
+          filter,
+          page_size: 100,
+          start_cursor: startCursor,
+        });
       });
-      return (response.results || []).map((page: any) => this.mapPageToRecord(page));
-    });
+
+      for (const page of response.results || []) {
+        records.push(this.mapPageToRecord(page));
+      }
+
+      hasMore = Boolean(response.has_more && response.next_cursor);
+      startCursor = response.next_cursor ?? undefined;
+    }
+
+    return records;
   }
 
   public async fetchPage(pageId: string): Promise<NotionPageRecord | null> {
-    return this.scheduleRequest(async () => {
+    return this.scheduleReadRequest(async () => {
       try {
         const page: any = await this.client.pages.retrieve({ page_id: pageId });
         return this.mapPageToRecord(page);
@@ -315,53 +455,102 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
   }
 
   /**
-   * Real Page Creation with budget enforcement and rate limiting (Item 9 & 19).
+   * Real Page Creation with:
+   * - Target verification: env[targetDataSourceEnvKey] == dataSourceId
+   * - Semantic budget check: logicalCreates <= 159
+   * - Native parent payload: { type: 'data_source_id', data_source_id: dataSourceId }
+   * - No blind mutation retry on 5xx/network
    */
   public async createPage(
-    _targetDataSourceEnvKey: string,
+    targetDataSourceEnvKey: string,
     dataSourceId: string,
     properties: Record<string, any>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
-    // Physical mutation budget check (max 159 pages)
-    if (this.createRequestsSentCount >= this.maxNewPagesBudget) {
+    const expectedDsId = this.envVars[targetDataSourceEnvKey]?.trim();
+    if (!expectedDsId || expectedDsId !== dataSourceId) {
       throw new Error(
-        `FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de ${this.maxNewPagesBudget} criações de página atingido.`,
+        `FAIL_MUTATION_TARGET_MISMATCH: dataSourceId recebido ('${dataSourceId}') diverge da variável de ambiente '${targetDataSourceEnvKey}' ('${expectedDsId}').`,
       );
     }
 
-    this.createRequestsSentCount++;
-    this.totalMutationRequestsCount++;
+    // Semantic mutation budget check (max 159 logical pages)
+    if (this.logicalCreatesCount >= this.maxNewPagesBudget) {
+      throw new Error(
+        `FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de ${this.maxNewPagesBudget} criações lógicas de página atingido.`,
+      );
+    }
 
-    return this.scheduleRequest(async () => {
-      const page: any = await this.client.pages.create({
-        parent: { database_id: dataSourceId } as any,
+    this.logicalCreatesCount++;
+
+    return this.executeMutationRequest('CREATE', async () => {
+      const page = await this.client.pages.create({
+        parent: {
+          type: 'data_source_id',
+          data_source_id: dataSourceId,
+        },
         properties,
       });
 
       return {
         id: page.id,
-        properties: page.properties || {},
+        properties: (page as any).properties || {},
       };
     });
   }
 
   /**
-   * Real Relation Patch with budget enforcement, rate limiting, and canonical single-side writing (Item 10 & 19).
+   * Real Relation Patch with:
+   * - Pre-mutation proof: target page exists, belongs to expected DS, relation target valid
+   * - Restricted strictly to canonical relations ('Lançamentos do Ciclo' for Card Bills)
+   * - Semantic budget check: logicalRelationPatches <= 4
+   * - Canonical single-side writing
+   * - No blind mutation retry on 5xx/network
    */
   public async updatePageRelations(
-    _targetDataSourceEnvKey: string,
+    targetDataSourceEnvKey: string,
     pageId: string,
     relations: Record<string, string[]>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
-    // Physical mutation budget check (max 4 relation patch groups)
-    if (this.relationPatchRequestsSentCount >= this.maxRelationPatchGroups) {
+    if (targetDataSourceEnvKey !== 'NOTION_DS_CARD_BILLS') {
+      throw new Error(
+        `FAIL_MUTATION_TARGET_MISMATCH: updatePageRelations autorizado apenas para NOTION_DS_CARD_BILLS. Recebido: '${targetDataSourceEnvKey}'.`,
+      );
+    }
+
+    const page = await this.fetchPage(pageId);
+    if (!page) {
+      throw new Error(`FAIL_PAGE_NOT_FOUND: Página '${pageId}' não encontrada no Notion.`);
+    }
+
+    const dsContract = TARGET_CONTRACT[targetDataSourceEnvKey];
+    for (const [propName] of Object.entries(relations)) {
+      if (propName !== 'Lançamentos do Ciclo' && propName !== 'Transações de Pagamento') {
+        throw new Error(
+          `FAIL_UNEXPECTED_RELATION_PROPERTY: Propriedade '${propName}' não é uma relação canônica esperada para Card Bills.`,
+        );
+      }
+      const propContract = dsContract?.properties.find((p) => p.notionProperty === propName);
+      if (!propContract) {
+        throw new Error(
+          `FAIL_UNKNOWN_PROPERTY: Propriedade '${propName}' não existe no contrato de '${targetDataSourceEnvKey}'.`,
+        );
+      }
+      if (propContract.notionType !== 'relation') {
+        throw new Error(`FAIL_PROPERTY_TYPE_MISMATCH: Propriedade '${propName}' não é do tipo relation.`);
+      }
+      if (propContract.relationTargetEnvKey !== 'NOTION_DS_TRANSACTIONS') {
+        throw new Error(`FAIL_RELATION_TARGET_TYPE_MISMATCH: relationTargetEnvKey inesperado para '${propName}'.`);
+      }
+    }
+
+    // Semantic mutation budget check (max 4 logical relation patch groups)
+    if (this.logicalRelationPatchesCount >= this.maxRelationPatchGroups) {
       throw new Error(
         `FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de ${this.maxRelationPatchGroups} grupos de patch de relação atingido.`,
       );
     }
 
-    this.relationPatchRequestsSentCount++;
-    this.totalMutationRequestsCount++;
+    this.logicalRelationPatchesCount++;
 
     // Format relation payload strictly as { relation: [{ id: ... }] }
     const formattedProps: Record<string, any> = {};
@@ -371,33 +560,30 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       };
     }
 
-    return this.scheduleRequest(async () => {
-      const page: any = await this.client.pages.update({
+    return this.executeMutationRequest('RELATION_PATCH', async () => {
+      const updatedPage: any = await this.client.pages.update({
         page_id: pageId,
         properties: formattedProps,
       });
 
       return {
-        id: page.id,
-        properties: page.properties || {},
+        id: updatedPage.id,
+        properties: updatedPage.properties || {},
       };
     });
   }
 
+  /**
+   * Queries live target state.
+   * Fail-closed: throws FAIL_MISSING_ENV if ANY of the 13 canonical Data Sources is missing.
+   */
   public async queryTargetState(): Promise<Record<string, BaseSnapshotData>> {
     const result: Record<string, BaseSnapshotData> = {};
 
     for (const [key, contract] of Object.entries(TARGET_CONTRACT)) {
       const dsId = this.envVars[key]?.trim();
       if (!dsId) {
-        result[key] = {
-          envKey: key,
-          defaultTitle: contract.defaultTitle,
-          dataSourceId: key,
-          recordCount: 0,
-          records: [],
-        };
-        continue;
+        throw new Error(`FAIL_MISSING_ENV: Variável obrigatória '${key}' não configurada no ambiente.`);
       }
 
       const records: NotionPageRecord[] = [];
@@ -405,7 +591,7 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       let startCursor: string | undefined = undefined;
 
       while (hasMore) {
-        const resp: any = await this.scheduleRequest(async () => {
+        const resp: any = await this.scheduleReadRequest(async () => {
           return (this.client as any).dataSources.query({
             data_source_id: dsId,
             page_size: 100,

@@ -85,6 +85,10 @@ export interface BackfillExecutorReport {
   readyForLiveApplyReview: boolean;
   readyForApply: false;
   reasons: string[];
+  logicalCreates?: number;
+  createHttpAttempts?: number;
+  logicalRelationPatches?: number;
+  relationPatchHttpAttempts?: number;
 }
 
 function sanitizeErrorMessage(msg: string): string {
@@ -96,7 +100,11 @@ function sanitizeErrorMessage(msg: string): string {
 }
 
 function isUncertainError(err: any): boolean {
+  if (err?.isUncertain) return true;
   const msg = (err?.message || '').toLowerCase();
+  if (msg.includes('uncertain_mutation')) return true;
+  const status = err?.status;
+  if (status === 500 || status === 502 || status === 503 || status === 504) return true;
   return (
     msg.includes('timeout') ||
     msg.includes('etimedout') ||
@@ -104,7 +112,9 @@ function isUncertainError(err: any): boolean {
     msg.includes('network') ||
     msg.includes('socket') ||
     err?.code === 'ETIMEDOUT' ||
-    err?.code === 'ECONNRESET'
+    err?.code === 'ECONNRESET' ||
+    err?.code === 'service_unavailable' ||
+    err?.code === 'internal_server_error'
   );
 }
 
@@ -121,6 +131,117 @@ function parseRetryAfterMs(err: any, fallbackMs: number): number {
     }
   }
   return fallbackMs;
+}
+
+/**
+ * Projects the expected state upon resume from an in-progress run.
+ * Pure shared function incorporating actual verified page creations,
+ * EXISTING_PAGE_ID relations, relation patches, and dual relation effects.
+ */
+export function projectExpectedBackfillState(
+  initialState: Record<string, BaseSnapshotData>,
+  plan: BackfillPlanArtifact,
+  journal: BackfillJournal,
+  runId: string,
+): Record<string, BaseSnapshotData> {
+  const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
+
+  const ops = journal.getOperations(runId);
+  const verifiedOrAppliedOps = ops.filter(
+    (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
+  );
+
+  const mappedPages = new Map<string, string>();
+  for (const op of verifiedOrAppliedOps) {
+    if (op.action === 'CREATE' && op.targetPageId) {
+      mappedPages.set(op.stableId, op.targetPageId);
+    }
+  }
+
+  // Apply creations
+  for (const opRec of verifiedOrAppliedOps) {
+    if (opRec.action !== 'CREATE' || !opRec.targetPageId) continue;
+    const planOp = plan.operations[opRec.operationIndex];
+    if (!planOp) continue;
+
+    const existingRelations: Record<string, string[]> = {};
+    for (const [propName, refList] of Object.entries(planOp.relations)) {
+      const existingIds = refList.filter((r) => r.type === 'EXISTING_PAGE_ID').map((r) => r.target);
+      if (existingIds.length > 0) existingRelations[propName] = existingIds;
+    }
+
+    const serialized = serializePayloadForNotion(
+      planOp.targetDataSource.envKey,
+      planOp.sanitizedPayload,
+      existingRelations,
+      true,
+    );
+
+    let base = projected[planOp.targetDataSource.envKey];
+    if (!base) {
+      base = {
+        envKey: planOp.targetDataSource.envKey,
+        defaultTitle: TARGET_CONTRACT[planOp.targetDataSource.envKey]?.defaultTitle || planOp.targetDataSource.envKey,
+        dataSourceId: planOp.targetDataSource.envKey,
+        recordCount: 0,
+        records: [],
+      };
+      projected[planOp.targetDataSource.envKey] = base;
+    }
+
+    if (!base.records.some((r) => r.id === opRec.targetPageId)) {
+      const nowIso = new Date().toISOString();
+      base.records.push({
+        id: opRec.targetPageId,
+        createdTime: nowIso,
+        lastEditedTime: nowIso,
+        archived: false,
+        url: `https://notion.so/${opRec.targetPageId.replace(/-/g, '')}`,
+        properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
+      });
+      base.recordCount = base.records.length;
+    }
+  }
+
+  // Apply relation patches
+  for (const opRec of verifiedOrAppliedOps) {
+    if (opRec.action !== 'RELATION_PATCH' || !opRec.targetPageId) continue;
+    const planOp =
+      plan.operations.find((o) => o.stableId === opRec.stableId) ||
+      plan.operations[opRec.operationIndex];
+    if (!planOp) continue;
+
+    const billBase = projected['NOTION_DS_CARD_BILLS'];
+    const billRec = billBase?.records.find((r) => r.id === opRec.targetPageId);
+    if (!billRec) continue;
+
+    for (const [relProp, refList] of Object.entries(planOp.relations)) {
+      const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
+      if (plannedRefs.length === 0) continue;
+
+      const resolvedIds: string[] = [];
+      for (const ref of plannedRefs) {
+        const mapped = mappedPages.get(ref.target);
+        if (mapped) resolvedIds.push(mapped);
+      }
+      resolvedIds.sort();
+      billRec.properties[relProp] = { relation: resolvedIds.map((id) => ({ id })) };
+
+      if (relProp === 'Lançamentos do Ciclo') {
+        const txBase = projected['NOTION_DS_TRANSACTIONS'];
+        if (txBase) {
+          for (const txId of resolvedIds) {
+            const txRec = txBase.records.find((r) => r.id === txId);
+            if (txRec) {
+              txRec.properties['Fatura Vinculada'] = { relation: [{ id: opRec.targetPageId! }] };
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return projected;
 }
 
 export class BackfillExecutor {
@@ -419,113 +540,12 @@ export class BackfillExecutor {
     return projected;
   }
 
-  /**
-   * Projects the expected state upon resume from an in-progress run.
-   * Incorporates actual verified page creations and relation patches from the journal.
-   */
   public projectExpectedStateOnResume(
     initialState: Record<string, BaseSnapshotData>,
     plan: BackfillPlanArtifact,
     runId: string,
   ): Record<string, BaseSnapshotData> {
-    const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
-
-    const ops = this.journal.getOperations(runId);
-    const verifiedOrAppliedOps = ops.filter(
-      (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
-    );
-
-    const mappedPages = new Map<string, string>();
-    for (const op of verifiedOrAppliedOps) {
-      if (op.action === 'CREATE' && op.targetPageId) {
-        mappedPages.set(op.stableId, op.targetPageId);
-      }
-    }
-
-    // Apply creations
-    for (const opRec of verifiedOrAppliedOps) {
-      if (opRec.action !== 'CREATE' || !opRec.targetPageId) continue;
-      const planOp = plan.operations[opRec.operationIndex];
-      if (!planOp) continue;
-
-      const existingRelations: Record<string, string[]> = {};
-      for (const [propName, refList] of Object.entries(planOp.relations)) {
-        const existingIds = refList.filter((r) => r.type === 'EXISTING_PAGE_ID').map((r) => r.target);
-        if (existingIds.length > 0) existingRelations[propName] = existingIds;
-      }
-
-      const serialized = serializePayloadForNotion(
-        planOp.targetDataSource.envKey,
-        planOp.sanitizedPayload,
-        existingRelations,
-        true,
-      );
-
-      let base = projected[planOp.targetDataSource.envKey];
-      if (!base) {
-        base = {
-          envKey: planOp.targetDataSource.envKey,
-          defaultTitle: TARGET_CONTRACT[planOp.targetDataSource.envKey]?.defaultTitle || planOp.targetDataSource.envKey,
-          dataSourceId: planOp.targetDataSource.envKey,
-          recordCount: 0,
-          records: [],
-        };
-        projected[planOp.targetDataSource.envKey] = base;
-      }
-
-      if (!base.records.some((r) => r.id === opRec.targetPageId)) {
-        const nowIso = new Date().toISOString();
-        base.records.push({
-          id: opRec.targetPageId,
-          createdTime: nowIso,
-          lastEditedTime: nowIso,
-          archived: false,
-          url: `https://notion.so/${opRec.targetPageId.replace(/-/g, '')}`,
-          properties: JSON.parse(JSON.stringify(serialized.notionProperties)),
-        });
-        base.recordCount = base.records.length;
-      }
-    }
-
-    // Apply relation patches
-    for (const opRec of verifiedOrAppliedOps) {
-      if (opRec.action !== 'RELATION_PATCH' || !opRec.targetPageId) continue;
-      const planOp =
-        plan.operations.find((o) => o.stableId === opRec.stableId) ||
-        plan.operations[opRec.operationIndex];
-      if (!planOp) continue;
-
-      const billBase = projected['NOTION_DS_CARD_BILLS'];
-      const billRec = billBase?.records.find((r) => r.id === opRec.targetPageId);
-      if (!billRec) continue;
-
-      for (const [relProp, refList] of Object.entries(planOp.relations)) {
-        const plannedRefs = refList.filter((r) => r.type === 'PLANNED_STABLE_ID');
-        if (plannedRefs.length === 0) continue;
-
-        const resolvedIds: string[] = [];
-        for (const ref of plannedRefs) {
-          const mapped = mappedPages.get(ref.target);
-          if (mapped) resolvedIds.push(mapped);
-        }
-        resolvedIds.sort();
-        billRec.properties[relProp] = { relation: resolvedIds.map((id) => ({ id })) };
-
-        if (relProp === 'Lançamentos do Ciclo') {
-          const txBase = projected['NOTION_DS_TRANSACTIONS'];
-          if (txBase) {
-            for (const txId of resolvedIds) {
-              const txRec = txBase.records.find((r) => r.id === txId);
-              if (txRec) {
-                txRec.properties['Fatura Vinculada'] = { relation: [{ id: opRec.targetPageId! }] };
-              }
-            }
-          }
-        }
-      }
-    }
-
-    return projected;
+    return projectExpectedBackfillState(initialState, plan, this.journal, runId);
   }
 
   private buildRelationPatchesForBill(
@@ -1230,7 +1250,10 @@ export class BackfillExecutor {
               if (checkPage) {
                 let reconciledAll = true;
                 for (const [pName, tIds] of Object.entries(relationPatches)) {
-                  const pCur = (checkPage.properties[pName]?.relation || []).map((r: any) => r.id || r).sort();
+                  const rawVal = checkPage.properties[pName];
+                  const pCur = Array.isArray(rawVal)
+                    ? rawVal.map((r: any) => r.id || r).sort()
+                    : (rawVal?.relation || []).map((r: any) => r.id || r).sort();
                   if (JSON.stringify(pCur) !== JSON.stringify(tIds)) {
                     reconciledAll = false;
                     break;
@@ -1276,7 +1299,8 @@ export class BackfillExecutor {
       }
 
       for (const [relProp, expectedIds] of Object.entries(relationPatches)) {
-        const liveIds = (verifiedBillPage.properties[relProp]?.relation || []).map((r: any) => r.id || r).sort();
+        const rawLive = verifiedBillPage.properties[relProp];
+        const liveIds = (Array.isArray(rawLive) ? rawLive : (rawLive?.relation || [])).map((r: any) => r.id || r).sort();
         if (JSON.stringify(liveIds) !== JSON.stringify(expectedIds)) {
           this.journal.recordFailed(runId, opIdx, 'FAIL_RELATION_VERIFICATION_MISMATCH');
           throw new Error(
@@ -1293,7 +1317,8 @@ export class BackfillExecutor {
           this.journal.recordFailed(runId, opIdx, 'FAIL_DUAL_RELATION_VERIFICATION');
           throw new Error(`FAIL_DUAL_RELATION_VERIFICATION: Transação de compra '${txId}' não encontrada.`);
         }
-        const linkedBills = (txPage.properties['Fatura Vinculada']?.relation || []).map((r: any) => r.id || r);
+        const rawLinked = txPage.properties['Fatura Vinculada'];
+        const linkedBills = (Array.isArray(rawLinked) ? rawLinked : (rawLinked?.relation || [])).map((r: any) => r.id || r);
         if (!linkedBills.includes(billPageId)) {
           this.journal.recordFailed(runId, opIdx, 'FAIL_DUAL_RELATION_VERIFICATION');
           throw new Error(
