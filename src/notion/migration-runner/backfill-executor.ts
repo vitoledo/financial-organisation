@@ -565,6 +565,11 @@ export class BackfillExecutor {
             `FAIL_UNRESOLVED_PLANNED_RELATION: Stable ID '${ref.target}' referenciado em '${relProp}' não foi resolvido.`,
           );
         }
+        if (mapping.targetDataSource !== 'NOTION_DS_TRANSACTIONS') {
+          throw new Error(
+            `FAIL_RELATION_TARGET_TYPE_MISMATCH: Stable ID '${ref.target}' referenciado em '${relProp}' pertence a '${mapping.targetDataSource}' em vez de NOTION_DS_TRANSACTIONS.`,
+          );
+        }
         resolvedIds.push(mapping.notionPageId);
       }
       patches[relProp] = resolvedIds.sort();
@@ -1157,6 +1162,11 @@ export class BackfillExecutor {
       const billPageId = mapping?.notionPageId;
       if (!billPageId) {
         throw new Error(`FAIL_UNRESOLVED_PLANNED_RELATION: ID da fatura '${billOp.stableId}' não resolvido.`);
+      }
+      if (mapping.targetDataSource !== 'NOTION_DS_CARD_BILLS') {
+        throw new Error(
+          `FAIL_MUTATION_TARGET_MISMATCH: Mapeamento da fatura '${billOp.stableId}' pertence a '${mapping.targetDataSource}' em vez de NOTION_DS_CARD_BILLS.`,
+        );
       }
 
       this.journal.registerOperation({

@@ -35,6 +35,7 @@ import {
   isResumePreflightValid,
   validateResumePreflightBinding,
   ResumePreflightArtifact,
+  calculateJournalFingerprint,
 } from '../src/notion/migration-runner/backfill-live-preflight';
 import {
   ProductionNotionAdapter,
@@ -71,9 +72,20 @@ export function getRemoteBranchHeadSha(): string | null {
   }
 }
 
-export function getActualRemoteHeadSha(env?: Record<string, string | undefined>): string | null {
+export function getActualRemoteHeadSha(
+  env?: Record<string, string | undefined>,
+  isLive: boolean = false,
+): string | null {
   if (env?.MOCK_ACTUAL_REMOTE_HEAD_SHA !== undefined) {
-    return env.MOCK_ACTUAL_REMOTE_HEAD_SHA || null;
+    const mocked = env.MOCK_ACTUAL_REMOTE_HEAD_SHA;
+    if (isLive) {
+      if (!mocked || mocked === '__FAIL__' || mocked.length !== 40) {
+        throw new Error(
+          `FAIL_REMOTE_HEAD_UNVERIFIED: git ls-remote falhou ou retornou SHA inválido (${mocked}).`,
+        );
+      }
+    }
+    return mocked || null;
   }
   try {
     const out = execSync('git ls-remote --heads origin feat/phase-1-schema-apply-executor', {
@@ -85,12 +97,24 @@ export function getActualRemoteHeadSha(env?: Record<string, string | undefined>)
       if (match && match.length === 40) return match;
     }
   } catch {
-    // fallback or offline
+    if (isLive) {
+      throw new Error(
+        'FAIL_REMOTE_HEAD_UNVERIFIED: Falha de rede ou erro do Git ao consultar git ls-remote origin.',
+      );
+    }
+  }
+  if (isLive) {
+    throw new Error(
+      'FAIL_REMOTE_HEAD_UNVERIFIED: git ls-remote origin retornou saída vazia ou inválida.',
+    );
   }
   return getRemoteBranchHeadSha();
 }
 
-function isWorktreeClean(): boolean {
+function isWorktreeClean(env?: Record<string, string | undefined>): boolean {
+  if (env?.MOCK_WORKTREE_CLEAN !== undefined) {
+    return env.MOCK_WORKTREE_CLEAN === 'true';
+  }
   try {
     const out = execSync('git status --porcelain', { encoding: 'utf8' }).trim();
     return out.length === 0;
@@ -102,6 +126,7 @@ function isWorktreeClean(): boolean {
 export async function runLiveApply(
   customArgs?: string[],
   customEnv?: Record<string, string | undefined>,
+  customClient?: Client,
 ): Promise<void> {
   const env = customEnv || process.env;
   const args = customArgs !== undefined ? customArgs : process.argv.slice(2);
@@ -194,7 +219,7 @@ export async function runLiveApply(
 
   // Validação Git
   console.log('2. Validando integridade do repositório Git...');
-  if (!isWorktreeClean()) {
+  if (!isWorktreeClean(env)) {
     throw new Error('FAIL_EXECUTOR_COMMIT_MISMATCH: Working tree possui alterações não commitadas.');
   }
 
@@ -205,7 +230,7 @@ export async function runLiveApply(
     );
   }
 
-  const actualRemoteHead = getActualRemoteHeadSha(env);
+  const actualRemoteHead = getActualRemoteHeadSha(env, isExecuteLive);
   if (actualRemoteHead && actualRemoteHead !== currentCommitSha) {
     throw new Error(
       `FAIL_EXECUTOR_COMMIT_MISMATCH: Local HEAD (${currentCommitSha}) diverge do remote HEAD real no origin (${actualRemoteHead}).`,
@@ -239,7 +264,39 @@ export async function runLiveApply(
   // Validação temporal
   const validity = isResumeRun ? isResumePreflightValid(artifact) : isPreflightValid(artifact);
   if (!validity.valid) {
-    throw new Error(`FAIL_PRODUCTION_AUTHORIZATION: ${validity.reason}`);
+    throw new Error(validity.reason || 'FAIL_PRODUCTION_AUTHORIZATION');
+  }
+
+  const journalPath = path.resolve(process.cwd(), '.local', 'backfill-live-journal.db');
+
+  let resumeJournalFingerprint: string | undefined = undefined;
+  if (isResumeRun) {
+    if (!fs.existsSync(journalPath)) {
+      throw new Error(
+        `FAIL_RESUME_PREFLIGHT_BINDING: Banco do journal não encontrado em '${journalPath}'.`,
+      );
+    }
+    const checkDb = new Database(journalPath, { readonly: true });
+    try {
+      const checkJournal = new BackfillJournal(checkDb);
+      const run = checkJournal.getRun(resumeRunId!);
+      if (!run) {
+        throw new Error(`FAIL_RESUME_PREFLIGHT_BINDING: Run '${resumeRunId}' não encontrada no journal.`);
+      }
+      if (run.planHash !== FROZEN_BACKFILL_PLAN_HASH) {
+        throw new Error(
+          `FAIL_RESUME_PREFLIGHT_BINDING: Plan hash da run no journal (${run.planHash}) diverge da baseline congelada (${FROZEN_BACKFILL_PLAN_HASH}).`,
+        );
+      }
+      if (run.planOriginCommitSha !== PLAN_ORIGIN_COMMIT_SHA) {
+        throw new Error(
+          `FAIL_RESUME_PREFLIGHT_BINDING: Plan origin commit da run no journal (${run.planOriginCommitSha}) diverge da baseline congelada (${PLAN_ORIGIN_COMMIT_SHA}).`,
+        );
+      }
+      resumeJournalFingerprint = calculateJournalFingerprint(checkJournal, resumeRunId!);
+    } finally {
+      checkDb.close();
+    }
   }
 
   // Validação de binding
@@ -249,6 +306,7 @@ export async function runLiveApply(
         executorCommitSha: currentCommitSha,
         backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
         workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+        journalFingerprint: resumeJournalFingerprint,
       })
     : validatePreflightBinding(artifact, {
         executorCommitSha: currentCommitSha,
@@ -261,7 +319,7 @@ export async function runLiveApply(
       });
 
   if (!binding.valid) {
-    throw new Error(`FAIL_PRODUCTION_AUTHORIZATION: ${binding.reason}`);
+    throw new Error(binding.reason || 'FAIL_PRODUCTION_AUTHORIZATION');
   }
 
   console.log(`  ✓ Artefato de preflight válido (TTL ativo, SHA binding: ${currentCommitSha}).`);
@@ -285,7 +343,7 @@ export async function runLiveApply(
     throw new Error('FAIL_PRODUCTION_AUTHORIZATION: NOTION_API_KEY não configurada.');
   }
 
-  const client = new Client({ auth: apiKey, notionVersion: '2026-03-11' });
+  const client = customClient || new Client({ auth: apiKey, notionVersion: '2026-03-11' });
 
   // Workspace Identity Check
   const botUser: any = await client.users.me({});
@@ -301,10 +359,14 @@ export async function runLiveApply(
   }
 
   // Schema 13/13 Check
-  const schemaValidator = new NotionSchemaValidator(apiKey);
-  const schemaReport = await schemaValidator.runIntrospection(env, { treatAllAsExisting: true });
-  if (schemaReport.verifiedCount !== 13 || schemaReport.failedCount > 0) {
-    throw new Error('FAIL_SCHEMA_NON_CONFORMANT: Revalidação de schema live falhou (13/13 exigido).');
+  if (env.MOCK_SCHEMA_REPORT_CLEAN === 'true') {
+    // Unit test bypass
+  } else {
+    const schemaValidator = new NotionSchemaValidator(apiKey, '2026-03-11', customClient);
+    const schemaReport = await schemaValidator.runIntrospection(env, { treatAllAsExisting: true });
+    if (schemaReport.verifiedCount !== 13 || schemaReport.failedCount > 0) {
+      throw new Error('FAIL_SCHEMA_NON_CONFORMANT: Revalidação de schema live falhou (13/13 exigido).');
+    }
   }
 
   // State Hash & Pristine Target Check (Item 5)
@@ -325,6 +387,27 @@ export async function runLiveApply(
         `TARGET_DRIFT_DETECTED: Live target state (${currentLiveHash}) diverge do snapshot congelado (${FROZEN_TARGET_STATE_HASH}).`,
       );
     }
+  } else {
+    if (artifact.readyForLiveApplyReview !== true || artifact.readyForApply !== false) {
+      throw new Error(
+        `EXTERNAL_DRIFT_DURING_BACKFILL: Resume preflight flags inválidas (readyForLiveApplyReview=${artifact.readyForLiveApplyReview}, readyForApply=${artifact.readyForApply}).`,
+      );
+    }
+    if (artifact.reasons && artifact.reasons.length > 0) {
+      throw new Error(
+        `EXTERNAL_DRIFT_DURING_BACKFILL: Resume preflight contém razões de bloqueio (${artifact.reasons.join(', ')}).`,
+      );
+    }
+    if (artifact.liveTargetStateHash !== artifact.projectedTargetStateHash) {
+      throw new Error(
+        `EXTERNAL_DRIFT_DURING_BACKFILL: Resume preflight detectou drift prévio (${artifact.liveTargetStateHash} !== ${artifact.projectedTargetStateHash}).`,
+      );
+    }
+    if (currentLiveHash !== artifact.projectedTargetStateHash) {
+      throw new Error(
+        `EXTERNAL_DRIFT_DURING_BACKFILL: Live target state atual (${currentLiveHash}) diverge do estado projetado no resume preflight (${artifact.projectedTargetStateHash}). Abortando apply com 0 writes.`,
+      );
+    }
   }
 
   console.log('  ✓ In-process revalidation concluída com sucesso: 0 drift, 0 dados prévios.');
@@ -333,8 +416,6 @@ export async function runLiveApply(
   // 6. INSTANCIAÇÃO DO ADAPTER DE PRODUÇÃO E EXECUÇÃO
   // ─────────────────────────────────────────────────────────────────────────────
   console.log('5. Inicializando ProductionNotionAdapter e Executor...');
-
-  const journalPath = path.resolve(process.cwd(), '.local', 'backfill-live-journal.db');
   const authContext: ProductionAuthorizationContext = {
     planHash: FROZEN_BACKFILL_PLAN_HASH,
     planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,

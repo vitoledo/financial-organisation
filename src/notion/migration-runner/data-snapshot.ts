@@ -16,6 +16,12 @@ export interface NotionPageRecord {
   archived: boolean;
   url: string;
   properties: Record<string, any>;
+  parent?: {
+    type: string;
+    data_source_id?: string;
+    database_id?: string;
+    [key: string]: any;
+  };
 }
 
 export interface BaseSnapshotData {

@@ -33,6 +33,8 @@ import {
   isResumePreflightValid,
   validateResumePreflightBinding,
   LivePreflightArtifact,
+  ResumePreflightArtifact,
+  calculateJournalFingerprint,
 } from '../src/notion/migration-runner/backfill-live-preflight';
 import { runLiveApply } from '../scripts/backfill-live-apply';
 import { serializePayloadForNotion } from '../src/notion/migration-runner/backfill-serializer';
@@ -104,13 +106,18 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         create: vi.fn().mockImplementation(async (params: any) => {
           if (handlers?.createPage) {
             const res = await handlers.createPage(params);
-            createdPagesMap.set(res.id, { id: res.id, properties: res.properties || params.properties || {} });
+            createdPagesMap.set(res.id, {
+              id: res.id,
+              properties: res.properties || params.properties || {},
+              parent: params.parent,
+            });
             return res;
           }
           const id = `created-page-${crypto.randomUUID()}`;
           const res = {
             id,
             properties: params.properties || {},
+            parent: params.parent,
           };
           createdPagesMap.set(id, res);
           return res;
@@ -127,12 +134,22 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
             return await handlers.retrievePage(params);
           }
           const existing = createdPagesMap.get(params.page_id);
+          const isBill = params.page_id.includes('bill') || params.page_id === 'mock-tx-155';
+          const defaultParent = {
+            type: 'data_source_id',
+            data_source_id: isBill ? testEnv.NOTION_DS_CARD_BILLS : testEnv.NOTION_DS_TRANSACTIONS,
+          };
           if (existing) {
-            return { id: params.page_id, properties: existing.properties };
+            return {
+              id: params.page_id,
+              properties: existing.properties,
+              parent: existing.parent || defaultParent,
+            };
           }
           return {
             id: params.page_id,
             properties: {},
+            parent: defaultParent,
           };
         }),
       },
@@ -154,6 +171,52 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         }),
       },
     } as unknown as Client;
+  }
+
+  function getFrozenTargetBases() {
+    const analyzer = new BackfillDryRunAnalyzer({ envVars: testEnv });
+    const targetSession = analyzer.prepareValidatedTargetSnapshot();
+    const bases = JSON.parse(JSON.stringify(targetSession.payload.bases));
+    targetSession.cleanup();
+    return bases;
+  }
+
+  function createFrozenTargetEnv(bases: Record<string, any>) {
+    const env = { ...testEnv };
+    for (const [k, v] of Object.entries(bases)) {
+      env[k] = v.dataSourceId;
+    }
+    return env;
+  }
+
+  function createFrozenMockClient(
+    bases: Record<string, any>,
+    env: Record<string, string>,
+    overrides?: {
+      createPage?: (params: any) => Promise<any>;
+      filterMatch?: (dsId: string, filter: any) => any[];
+      retrievePage?: (params: any) => Promise<any>;
+    },
+  ) {
+    return createMockNotionClient({
+      createPage: overrides?.createPage,
+      retrievePage: overrides?.retrievePage,
+      queryDataSource: async (params: any) => {
+        if (params.filter) {
+          if (overrides?.filterMatch) {
+            const matches = overrides.filterMatch(params.data_source_id, params.filter);
+            return { results: matches, has_more: false };
+          }
+          return { results: [], has_more: false };
+        }
+        for (const [k, baseData] of Object.entries(bases)) {
+          if (params.data_source_id === env[k] || params.data_source_id === baseData.dataSourceId) {
+            return { results: baseData.records || [], has_more: false };
+          }
+        }
+        return { results: [], has_more: false };
+      },
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -425,6 +488,112 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       expect(adapter.relationPatchRequestsSent).toBe(0);
       expect(adapter.getMutationCount()).toBe(0);
     });
+
+    it('ownership check: bill parent mismatch throws FAIL_MUTATION_TARGET_MISMATCH and performs 0 writes', async () => {
+      let patchAttempted = false;
+      const mockClient = createMockNotionClient({
+        updatePage: async () => {
+          patchAttempted = true;
+          return { id: 'bill-wrong-parent', properties: {} };
+        },
+        retrievePage: async (params) => {
+          if (params.page_id === 'bill-wrong-parent') {
+            return {
+              id: 'bill-wrong-parent',
+              parent: { type: 'data_source_id', data_source_id: 'wrong-data-source-id' },
+              properties: {},
+            };
+          }
+          return {
+            id: params.page_id,
+            parent: { type: 'data_source_id', data_source_id: testEnv.NOTION_DS_TRANSACTIONS },
+            properties: {},
+          };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await expect(
+        adapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'bill-wrong-parent', {
+          'Lançamentos do Ciclo': ['tx-1'],
+        }),
+      ).rejects.toThrow(/FAIL_MUTATION_TARGET_MISMATCH/);
+
+      expect(patchAttempted).toBe(false);
+      expect(adapter.relationPatchRequestsSent).toBe(0);
+      expect(adapter.getMutationCount()).toBe(0);
+    });
+
+    it('ownership check: relation target missing throws FAIL_RELATION_TARGET_MISSING and performs 0 writes', async () => {
+      let patchAttempted = false;
+      const mockClient = createMockNotionClient({
+        updatePage: async () => {
+          patchAttempted = true;
+          return { id: 'bill-1', properties: {} };
+        },
+        retrievePage: async (params) => {
+          if (params.page_id === 'bill-1') {
+            return {
+              id: 'bill-1',
+              parent: { type: 'data_source_id', data_source_id: testEnv.NOTION_DS_CARD_BILLS },
+              properties: {},
+            };
+          }
+          // Target page does not exist
+          return null;
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await expect(
+        adapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'bill-1', {
+          'Lançamentos do Ciclo': ['missing-tx-id'],
+        }),
+      ).rejects.toThrow(/FAIL_RELATION_TARGET_MISSING/);
+
+      expect(patchAttempted).toBe(false);
+      expect(adapter.relationPatchRequestsSent).toBe(0);
+      expect(adapter.getMutationCount()).toBe(0);
+    });
+
+    it('ownership check: relation target wrong data source throws FAIL_RELATION_TARGET_TYPE_MISMATCH and performs 0 writes', async () => {
+      let patchAttempted = false;
+      const mockClient = createMockNotionClient({
+        updatePage: async () => {
+          patchAttempted = true;
+          return { id: 'bill-1', properties: {} };
+        },
+        retrievePage: async (params) => {
+          if (params.page_id === 'bill-1') {
+            return {
+              id: 'bill-1',
+              parent: { type: 'data_source_id', data_source_id: testEnv.NOTION_DS_CARD_BILLS },
+              properties: {},
+            };
+          }
+          // Target page belongs to CARD_BILLS instead of TRANSACTIONS
+          return {
+            id: params.page_id,
+            parent: { type: 'data_source_id', data_source_id: testEnv.NOTION_DS_CARD_BILLS },
+            properties: {},
+          };
+        },
+      });
+      const ctx = createValidAuthContext();
+      const adapter = new ProductionNotionAdapter(mockClient, ctx, testEnv, { rateLimitDelayMs: 0 });
+
+      await expect(
+        adapter.updatePageRelations('NOTION_DS_CARD_BILLS', 'bill-1', {
+          'Lançamentos do Ciclo': ['wrong-ds-target'],
+        }),
+      ).rejects.toThrow(/FAIL_RELATION_TARGET_TYPE_MISMATCH/);
+
+      expect(patchAttempted).toBe(false);
+      expect(adapter.relationPatchRequestsSent).toBe(0);
+      expect(adapter.getMutationCount()).toBe(0);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -581,53 +750,6 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
   // 4. CANARY EXECUTION & SAFEGUARD CONTROLS (BackfillExecutor)
   // ─────────────────────────────────────────────────────────────────────────────
   describe('4. Canary Execution & Safeguard Controls (BackfillExecutor)', () => {
-    function getFrozenTargetBases() {
-      const analyzer = new BackfillDryRunAnalyzer({ envVars: testEnv });
-      const targetSession = analyzer.prepareValidatedTargetSnapshot();
-      const bases = JSON.parse(JSON.stringify(targetSession.payload.bases));
-      targetSession.cleanup();
-      return bases;
-    }
-
-    function createFrozenTargetEnv(bases: Record<string, any>) {
-      const env = { ...testEnv };
-      for (const [k, v] of Object.entries(bases)) {
-        env[k] = v.dataSourceId;
-      }
-      return env;
-    }
-
-    function createFrozenMockClient(
-      bases: Record<string, any>,
-      env: Record<string, string>,
-      overrides?: {
-        createPage?: (params: any) => Promise<any>;
-        filterMatch?: (dsId: string, filter: any) => any[];
-      },
-    ) {
-      return createMockNotionClient({
-        createPage: overrides?.createPage,
-        queryDataSource: async (params: any) => {
-          // Check if this is a filtered query (findByStableIdentity)
-          if (params.filter) {
-            if (overrides?.filterMatch) {
-              const matches = overrides.filterMatch(params.data_source_id, params.filter);
-              return { results: matches, has_more: false };
-            }
-            return { results: [], has_more: false };
-          }
-
-          // Full base query for queryTargetState
-          for (const [k, baseData] of Object.entries(bases)) {
-            if (params.data_source_id === env[k] || params.data_source_id === baseData.dataSourceId) {
-              return { results: baseData.records || [], has_more: false };
-            }
-          }
-          return { results: [], has_more: false };
-        },
-      });
-    }
-
     it('throws CANARY_REQUIRED_FOR_INITIAL_RUN if live run has no canary flag', async () => {
       const bases = getFrozenTargetBases();
       const env = createFrozenTargetEnv(bases);
@@ -944,8 +1066,13 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       const mockClient = createFrozenMockClient(bases, env);
       mockClient.pages.retrieve = vi.fn().mockImplementation(async (params: any) => {
         const committed = committedPropertiesByPage[params.page_id] || {};
+        const isBill = params.page_id === 'mock-tx-155' || params.page_id.includes('bill');
         return {
           id: params.page_id,
+          parent: {
+            type: 'data_source_id',
+            data_source_id: isBill ? env.NOTION_DS_CARD_BILLS : env.NOTION_DS_TRANSACTIONS,
+          },
           properties: {
             'Fatura Vinculada': { relation: [{ id: 'mock-tx-155' }] },
             ...committed,
@@ -1128,11 +1255,15 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
     it('validateResumePreflightBinding validates runId, commit, and plan hash', () => {
       const artifact = {
         readyForLiveApplyReview: true,
+        readyForApply: false,
         reasons: [],
         runId: 'run-canary-123',
         executorCommitSha: 'commit-123',
         backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
         workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+        journalFingerprint: 'fp-canary-123',
+        projectedTargetStateHash: 'hash-projected',
+        liveTargetStateHash: 'hash-projected',
       } as any;
 
       expect(
@@ -1141,6 +1272,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           executorCommitSha: 'commit-123',
           backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
           workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+          journalFingerprint: 'fp-canary-123',
         }),
       ).toEqual({ valid: true });
 
@@ -1280,6 +1412,233 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       await expect(runLiveApply(['--execute-live', '--canary', '1'], env)).rejects.toThrow(
         /FAIL_EXECUTOR_COMMIT_MISMATCH/,
       );
+    });
+
+    it('tracking ref matches + ls-remote fails => FAIL_REMOTE_HEAD_UNVERIFIED => 0 writes', async () => {
+      let currentCommit = 'test-sha';
+      try {
+        currentCommit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+      } catch {
+        // ignore
+      }
+      const env = {
+        ...testEnv,
+        FINANCIAL_BACKFILL_ENABLED: 'I_UNDERSTAND_BACKFILL_MUTATIONS',
+        FINANCIAL_BACKFILL_PLAN_HASH: FROZEN_BACKFILL_PLAN_HASH,
+        FINANCIAL_BACKFILL_PLAN_COMMIT_SHA: PLAN_ORIGIN_COMMIT_SHA,
+        FINANCIAL_BACKFILL_EXECUTOR_COMMIT_SHA: currentCommit,
+        MOCK_ACTUAL_REMOTE_HEAD_SHA: '__FAIL__',
+        MOCK_WORKTREE_CLEAN: 'true',
+      };
+
+      await expect(runLiveApply(['--execute-live', '--canary', '1'], env)).rejects.toThrow(
+        /FAIL_REMOTE_HEAD_UNVERIFIED/,
+      );
+    });
+
+    it('preflight missing or non-clean schema throws FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN', () => {
+      const artifactMissingSchema = {
+        readyForLiveApplyReview: true,
+        readyForApply: false,
+        reasons: [],
+        liveMutations: 0,
+        stableIdentityConflicts: 0,
+        relationTargetErrors: 0,
+        targets: { transactions: 0, bills: 0 },
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        frozenTargetStateHash: FROZEN_TARGET_STATE_HASH,
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+      } as any;
+
+      const res1 = validatePreflightBinding(artifactMissingSchema);
+      expect(res1.valid).toBe(false);
+      expect(res1.reason).toMatch(/FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN/);
+
+      const artifactBadSchema = {
+        ...artifactMissingSchema,
+        schema: { total: 13, verified: 12, missing: 1, mismatches: 0 },
+      };
+      const res2 = validatePreflightBinding(artifactBadSchema);
+      expect(res2.valid).toBe(false);
+      expect(res2.reason).toMatch(/FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN/);
+    });
+
+    it('resume-preflight green -> journal changes afterwards -> apply resume => FAIL_RESUME_PREFLIGHT_BINDING => 0 writes', async () => {
+      const localDir = path.resolve(process.cwd(), '.local');
+      if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+      const resumePreflightPath = path.resolve(localDir, 'backfill-live-resume-preflight.json');
+      const journalDbPath = path.resolve(localDir, 'backfill-live-journal.db');
+
+      const backupPreflight = fs.existsSync(resumePreflightPath) ? fs.readFileSync(resumePreflightPath) : null;
+      const backupJournal = fs.existsSync(journalDbPath) ? fs.readFileSync(journalDbPath) : null;
+
+      try {
+        const db = new Database(journalDbPath);
+        const journal = new BackfillJournal(db);
+        const runId = 'test-resume-journal-drift-unit';
+        journal.startRun({
+          runId,
+          planHash: FROZEN_BACKFILL_PLAN_HASH,
+          executorCommitSha: 'commit-test',
+          planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+          sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+          targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+          targetStateHash: FROZEN_TARGET_STATE_HASH,
+        });
+        journal.registerOperation({
+          runId,
+          operationIndex: 0,
+          stableId: 'op-0',
+          stage: 'STAGE_1_PAGE_CREATION',
+          targetDataSource: 'NOTION_DS_TRANSACTIONS',
+          action: 'CREATE',
+          expectedPostFingerprint: 'fp-0',
+        });
+        journal.recordApplied(runId, 0, 'page-0');
+        journal.recordVerified(runId, 0, 'page-0', false);
+
+        const originalFingerprint = calculateJournalFingerprint(journal, runId);
+
+        let currentCommit = 'test-sha';
+        try {
+          currentCommit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+        } catch {}
+
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 15 * 60 * 1000);
+        const preflightArtifact: ResumePreflightArtifact = {
+          preflightVersion: '1.0.0',
+          type: 'RESUME_PREFLIGHT',
+          timestamp: now.toISOString(),
+          generatedAt: now.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+          ttlMinutes: 15,
+          runId,
+          executorCommitSha: currentCommit,
+          planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+          backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+          projectedTargetStateHash: 'projected-hash',
+          liveTargetStateHash: 'projected-hash',
+          workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+          actorType: 'bot',
+          verifiedOperationsCount: 1,
+          readyForLiveApplyReview: true,
+          readyForApply: false,
+          journalFingerprint: originalFingerprint,
+          reasons: [],
+        };
+        fs.writeFileSync(resumePreflightPath, JSON.stringify(preflightArtifact));
+
+        // Now modify the journal AFTER preflight was generated!
+        journal.recordApplied(runId, 0, 'page-tampered');
+        db.close();
+
+        const env = {
+          ...testEnv,
+          FINANCIAL_BACKFILL_ENABLED: 'I_UNDERSTAND_BACKFILL_MUTATIONS',
+          FINANCIAL_BACKFILL_PLAN_HASH: FROZEN_BACKFILL_PLAN_HASH,
+          FINANCIAL_BACKFILL_PLAN_COMMIT_SHA: PLAN_ORIGIN_COMMIT_SHA,
+          FINANCIAL_BACKFILL_EXECUTOR_COMMIT_SHA: currentCommit,
+          MOCK_ACTUAL_REMOTE_HEAD_SHA: currentCommit,
+          MOCK_WORKTREE_CLEAN: 'true',
+        };
+
+        await expect(
+          runLiveApply(['--execute-live', '--resume', runId], env),
+        ).rejects.toThrow(/FAIL_RESUME_PREFLIGHT_BINDING/);
+      } finally {
+        if (backupPreflight) fs.writeFileSync(resumePreflightPath, backupPreflight);
+        else if (fs.existsSync(resumePreflightPath)) fs.unlinkSync(resumePreflightPath);
+
+        if (backupJournal) fs.writeFileSync(journalDbPath, backupJournal);
+        else if (fs.existsSync(journalDbPath)) fs.unlinkSync(journalDbPath);
+      }
+    });
+
+    it('resume-preflight green -> Notion live receives external drift -> apply resume => EXTERNAL_DRIFT_DURING_BACKFILL => 0 writes', async () => {
+      const localDir = path.resolve(process.cwd(), '.local');
+      if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+      const resumePreflightPath = path.resolve(localDir, 'backfill-live-resume-preflight.json');
+      const journalDbPath = path.resolve(localDir, 'backfill-live-journal.db');
+
+      const backupPreflight = fs.existsSync(resumePreflightPath) ? fs.readFileSync(resumePreflightPath) : null;
+      const backupJournal = fs.existsSync(journalDbPath) ? fs.readFileSync(journalDbPath) : null;
+
+      try {
+        const db = new Database(journalDbPath);
+        const journal = new BackfillJournal(db);
+        const runId = 'test-resume-toctou-drift-unit';
+        journal.startRun({
+          runId,
+          planHash: FROZEN_BACKFILL_PLAN_HASH,
+          executorCommitSha: 'commit-test',
+          planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+          sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+          targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+          targetStateHash: FROZEN_TARGET_STATE_HASH,
+        });
+        const currentFingerprint = calculateJournalFingerprint(journal, runId);
+        db.close();
+
+        let currentCommit = 'test-sha';
+        try {
+          currentCommit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+        } catch {}
+
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + 15 * 60 * 1000);
+        const preflightArtifact: ResumePreflightArtifact = {
+          preflightVersion: '1.0.0',
+          type: 'RESUME_PREFLIGHT',
+          timestamp: now.toISOString(),
+          generatedAt: now.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+          ttlMinutes: 15,
+          runId,
+          executorCommitSha: currentCommit,
+          planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+          backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+          projectedTargetStateHash: 'hash-expected-projected',
+          liveTargetStateHash: 'hash-expected-projected',
+          workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+          actorType: 'bot',
+          verifiedOperationsCount: 1,
+          readyForLiveApplyReview: true,
+          readyForApply: false,
+          journalFingerprint: currentFingerprint,
+          reasons: [],
+        };
+        fs.writeFileSync(resumePreflightPath, JSON.stringify(preflightArtifact));
+
+        const env = {
+          ...testEnv,
+          FINANCIAL_BACKFILL_ENABLED: 'I_UNDERSTAND_BACKFILL_MUTATIONS',
+          FINANCIAL_BACKFILL_PLAN_HASH: FROZEN_BACKFILL_PLAN_HASH,
+          FINANCIAL_BACKFILL_PLAN_COMMIT_SHA: PLAN_ORIGIN_COMMIT_SHA,
+          FINANCIAL_BACKFILL_EXECUTOR_COMMIT_SHA: currentCommit,
+          MOCK_ACTUAL_REMOTE_HEAD_SHA: currentCommit,
+          MOCK_WORKTREE_CLEAN: 'true',
+        };
+        const bases = getFrozenTargetBases();
+        const mockClient = createFrozenMockClient(bases, env);
+        const envWithMocks = {
+          ...env,
+          MOCK_SCHEMA_REPORT_CLEAN: 'true',
+        };
+
+        await expect(
+          runLiveApply(['--execute-live', '--resume', runId], envWithMocks, mockClient),
+        ).rejects.toThrow(/EXTERNAL_DRIFT_DURING_BACKFILL/);
+      } finally {
+        if (backupPreflight) fs.writeFileSync(resumePreflightPath, backupPreflight);
+        else if (fs.existsSync(resumePreflightPath)) fs.unlinkSync(resumePreflightPath);
+
+        if (backupJournal) fs.writeFileSync(journalDbPath, backupJournal);
+        else if (fs.existsSync(journalDbPath)) fs.unlinkSync(journalDbPath);
+      }
     });
   });
 });

@@ -635,22 +635,32 @@ export function validatePreflightBinding(
   if (artifact.readyForApply !== false) {
     return { valid: false, reason: 'FAIL_PREFLIGHT_INVALID_APPLY_FLAG: Artefato de preflight deve ter readyForApply === false.' };
   }
-  if (artifact.reasons && artifact.reasons.length > 0) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Preflight contém razões de bloqueio (${artifact.reasons.join(', ')}).` };
+  if (!Array.isArray(artifact.reasons) || artifact.reasons.length > 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Preflight contém razões de bloqueio (${(artifact.reasons || []).join(', ')}).` };
   }
-  if (artifact.liveMutations !== 0) {
+  if (artifact.liveMutations === undefined || artifact.liveMutations !== 0) {
     return { valid: false, reason: `FAIL_PREFLIGHT_MUTATIONS_NOT_ZERO: Preflight registrou mutações live (${artifact.liveMutations}).` };
   }
-  if (artifact.schema) {
-    if (artifact.schema.verified !== 13 || artifact.schema.missing !== 0 || artifact.schema.mismatches !== 0) {
-      return { valid: false, reason: `FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN: Schema verification incompleta ou com erros (verified: ${artifact.schema.verified}, missing: ${artifact.schema.missing}, mismatches: ${artifact.schema.mismatches}).` };
-    }
+  if (
+    !artifact.schema ||
+    artifact.schema.total !== 13 ||
+    artifact.schema.verified !== 13 ||
+    artifact.schema.missing !== 0 ||
+    artifact.schema.mismatches !== 0
+  ) {
+    return {
+      valid: false,
+      reason: `FAIL_PREFLIGHT_SCHEMA_NOT_CLEAN: Schema ausente ou verificação incompleta/com erros (total: ${artifact.schema?.total}, verified: ${artifact.schema?.verified}, missing: ${artifact.schema?.missing}, mismatches: ${artifact.schema?.mismatches}).`,
+    };
   }
-  if (artifact.stableIdentityConflicts !== 0) {
+  if (artifact.stableIdentityConflicts === undefined || artifact.stableIdentityConflicts !== 0) {
     return { valid: false, reason: `FAIL_PREFLIGHT_IDENTITY_CONFLICTS: Preflight detectou ${artifact.stableIdentityConflicts} conflitos de stable identity.` };
   }
-  if (artifact.relationTargetErrors !== 0) {
+  if (artifact.relationTargetErrors === undefined || artifact.relationTargetErrors !== 0) {
     return { valid: false, reason: `FAIL_PREFLIGHT_RELATION_ERRORS: Preflight detectou ${artifact.relationTargetErrors} erros de relation target.` };
+  }
+  if (!artifact.targets || artifact.targets.transactions !== 0 || artifact.targets.bills !== 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_TARGETS_NOT_PRISTINE: Targets ausentes ou não pristine (transactions: ${artifact.targets?.transactions}, bills: ${artifact.targets?.bills}).` };
   }
 
   const expPlanOrigin = expected.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
@@ -714,6 +724,21 @@ export interface ResumePreflightArtifact {
   readyForLiveApplyReview: boolean;
   readyForApply: boolean;
   reasons: string[];
+}
+
+export function calculateJournalFingerprint(journal: BackfillJournal, runId: string): string {
+  const ops = journal.getOperations(runId);
+  const verifiedOps = ops.filter(
+    (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
+  );
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify(
+        verifiedOps.map((o) => [o.operationIndex, o.status, o.targetPageId, o.expectedPostFingerprint]),
+      ),
+    )
+    .digest('hex');
 }
 
 export class BackfillLiveResumePreflight {
@@ -812,14 +837,7 @@ export class BackfillLiveResumePreflight {
     const verifiedOps = ops.filter(
       (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
     );
-    const journalFingerprint = crypto
-      .createHash('sha256')
-      .update(
-        JSON.stringify(
-          verifiedOps.map((o) => [o.operationIndex, o.status, o.targetPageId, o.expectedPostFingerprint]),
-        ),
-      )
-      .digest('hex');
+    const journalFingerprint = calculateJournalFingerprint(journal, run.runId);
 
     const projectedExpectedState = projectExpectedBackfillState(frozenBases, plan, journal, run.runId);
     const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
@@ -919,31 +937,50 @@ export function validateResumePreflightBinding(
     backfillPlanHash?: string;
     projectedTargetStateHash?: string;
     workspaceIdentityHash?: string;
+    journalFingerprint?: string;
   } = {},
 ): { valid: boolean; reason?: string } {
   if (artifact.readyForLiveApplyReview !== true) {
     return { valid: false, reason: 'FAIL_PREFLIGHT_NOT_REVIEW_READY: Resume preflight não está marcado como readyForLiveApplyReview === true.' };
   }
-  if (artifact.reasons && artifact.reasons.length > 0) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Resume preflight contém razões de bloqueio (${artifact.reasons.join(', ')}).` };
+  if (artifact.readyForApply !== false) {
+    return { valid: false, reason: 'FAIL_PREFLIGHT_INVALID_APPLY_FLAG: Resume preflight deve ter readyForApply === false.' };
+  }
+  if (!Array.isArray(artifact.reasons) || artifact.reasons.length > 0) {
+    return { valid: false, reason: `FAIL_PREFLIGHT_REASONS_NOT_EMPTY: Resume preflight contém razões de bloqueio (${(artifact.reasons || []).join(', ')}).` };
+  }
+  if (!artifact.journalFingerprint || typeof artifact.journalFingerprint !== 'string') {
+    return { valid: false, reason: 'FAIL_RESUME_PREFLIGHT_BINDING: journalFingerprint ausente ou inválido no artefato.' };
+  }
+  if (!artifact.projectedTargetStateHash || typeof artifact.projectedTargetStateHash !== 'string') {
+    return { valid: false, reason: 'FAIL_RESUME_PREFLIGHT_BINDING: projectedTargetStateHash ausente ou inválido no artefato.' };
+  }
+  if (!artifact.liveTargetStateHash || typeof artifact.liveTargetStateHash !== 'string') {
+    return { valid: false, reason: 'FAIL_RESUME_PREFLIGHT_BINDING: liveTargetStateHash ausente ou inválido no artefato.' };
+  }
+  if (artifact.liveTargetStateHash !== artifact.projectedTargetStateHash) {
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: liveTargetStateHash (${artifact.liveTargetStateHash}) diverge de projectedTargetStateHash (${artifact.projectedTargetStateHash}).` };
   }
 
   const expPlanHash = expected.backfillPlanHash || FROZEN_BACKFILL_PLAN_HASH;
 
   if (artifact.backfillPlanHash !== expPlanHash) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: backfillPlanHash diverge (${artifact.backfillPlanHash} vs ${expPlanHash}).` };
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: backfillPlanHash diverge (${artifact.backfillPlanHash} vs ${expPlanHash}).` };
   }
   if (expected.runId && artifact.runId !== expected.runId) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: runId diverge (${artifact.runId} vs ${expected.runId}).` };
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: runId diverge (${artifact.runId} vs ${expected.runId}).` };
   }
   if (expected.executorCommitSha && artifact.executorCommitSha !== expected.executorCommitSha) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: executorCommitSha diverge (${artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: executorCommitSha diverge (${artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
   }
   if (expected.projectedTargetStateHash && artifact.projectedTargetStateHash !== expected.projectedTargetStateHash) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: projectedTargetStateHash diverge (${artifact.projectedTargetStateHash} vs ${expected.projectedTargetStateHash}).` };
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: projectedTargetStateHash diverge (${artifact.projectedTargetStateHash} vs ${expected.projectedTargetStateHash}).` };
   }
   if (expected.workspaceIdentityHash && artifact.workspaceIdentityHash !== expected.workspaceIdentityHash) {
-    return { valid: false, reason: `FAIL_PREFLIGHT_BINDING_MISMATCH: workspaceIdentityHash diverge (${artifact.workspaceIdentityHash} vs ${expected.workspaceIdentityHash}).` };
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: workspaceIdentityHash diverge (${artifact.workspaceIdentityHash} vs ${expected.workspaceIdentityHash}).` };
+  }
+  if (expected.journalFingerprint && artifact.journalFingerprint !== expected.journalFingerprint) {
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: journalFingerprint diverge (${artifact.journalFingerprint} vs ${expected.journalFingerprint}).` };
   }
 
   return { valid: true };

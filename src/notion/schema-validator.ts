@@ -85,10 +85,12 @@ export class NotionSchemaValidator {
   private client?: Client;
   private notionVersion: string = '2026-03-11';
 
-  constructor(apiKey?: string, notionVersion: string = '2026-03-11') {
+  constructor(apiKey?: string, notionVersion: string = '2026-03-11', client?: Client) {
     this.apiKey = apiKey;
     this.notionVersion = notionVersion;
-    if (this.apiKey) {
+    if (client) {
+      this.client = client;
+    } else if (this.apiKey) {
       this.client = new Client({
         auth: this.apiKey,
         notionVersion: this.notionVersion,

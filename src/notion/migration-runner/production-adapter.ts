@@ -363,6 +363,7 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       url: page.url || `https://notion.so/${(page.id || '').replace(/-/g, '')}`,
       archived: Boolean(page.is_archived || page.in_trash || page.archived),
       properties: sanitizedProperties,
+      parent: page.parent,
     };
   }
 
@@ -378,42 +379,27 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
   ): Promise<NotionPageRecord[]> {
     const dsId = this.envVars[targetDataSourceEnvKey]?.trim();
     if (!dsId) {
-      throw new Error(`FAIL_MISSING_ENV: Variável '${targetDataSourceEnvKey}' não configurada.`);
+      throw new Error(`FAIL_MISSING_ENV: Variável obrigatória '${targetDataSourceEnvKey}' não configurada.`);
     }
 
-    const contract = findPropertyContract(targetDataSourceEnvKey, stableIdProperty);
-    const resolvedPropName = contract ? contract.notionProperty : stableIdProperty;
-    const expectedType = contract?.notionType || 'rich_text';
-
-    if (stableIdProperty === 'ID da Fonte' || stableIdProperty === 'ID Estável da Fatura') {
-      if (expectedType !== 'rich_text') {
-        throw new Error(
-          `FAIL_STABLE_ID_PROPERTY_TYPE: Propriedade '${stableIdProperty}' deve ser do tipo 'rich_text' no TARGET_CONTRACT. Encontrado: '${expectedType}'.`,
-        );
-      }
+    const contract = TARGET_CONTRACT[targetDataSourceEnvKey];
+    if (!contract) {
+      throw new Error(`FAIL_CONTRACT_NOT_FOUND: Contrato não encontrado para '${targetDataSourceEnvKey}'.`);
     }
 
-    let filter: any;
-    if (expectedType === 'rich_text') {
-      filter = {
-        property: resolvedPropName,
-        rich_text: { equals: stableIdValue },
-      };
-    } else if (expectedType === 'title') {
-      filter = {
-        property: resolvedPropName,
-        title: { equals: stableIdValue },
-      };
-    } else if (expectedType === 'number') {
-      filter = {
-        property: resolvedPropName,
-        number: { equals: Number(stableIdValue) },
-      };
-    } else {
+    const propContract = contract.properties.find((p) => p.notionProperty === stableIdProperty);
+    if (!propContract) {
       throw new Error(
-        `FAIL_STABLE_ID_PROPERTY_TYPE: Tipo não suportado para query de identidade estável: '${expectedType}'.`,
+        `FAIL_PROPERTY_CONTRACT_NOT_FOUND: Propriedade '${stableIdProperty}' não encontrada no contrato de '${targetDataSourceEnvKey}'.`,
       );
     }
+
+    const filter = {
+      property: stableIdProperty,
+      rich_text: {
+        equals: stableIdValue,
+      },
+    };
 
     const records: NotionPageRecord[] = [];
     let hasMore = true;
@@ -444,6 +430,9 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
     return this.scheduleReadRequest(async () => {
       try {
         const page: any = await this.client.pages.retrieve({ page_id: pageId });
+        if (!page) {
+          return null;
+        }
         return this.mapPageToRecord(page);
       } catch (err: any) {
         if (err?.status === 404 || err?.code === 'object_not_found') {
@@ -458,7 +447,7 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
    * Real Page Creation with:
    * - Target verification: env[targetDataSourceEnvKey] == dataSourceId
    * - Semantic budget check: logicalCreates <= 159
-   * - Native parent payload: { type: 'data_source_id', data_source_id: dataSourceId }
+   * - Strict parent payload: parent: { type: 'data_source_id', data_source_id: dataSourceId }
    * - No blind mutation retry on 5xx/network
    */
   public async createPage(
@@ -466,14 +455,18 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
     dataSourceId: string,
     properties: Record<string, any>,
   ): Promise<{ id: string; properties: Record<string, any> }> {
-    const expectedDsId = this.envVars[targetDataSourceEnvKey]?.trim();
-    if (!expectedDsId || expectedDsId !== dataSourceId) {
+    const configuredDsId = this.envVars[targetDataSourceEnvKey]?.trim();
+    if (!configuredDsId) {
+      throw new Error(`FAIL_MISSING_ENV: Variável obrigatória '${targetDataSourceEnvKey}' não configurada.`);
+    }
+
+    if (dataSourceId !== configuredDsId) {
       throw new Error(
-        `FAIL_MUTATION_TARGET_MISMATCH: dataSourceId recebido ('${dataSourceId}') diverge da variável de ambiente '${targetDataSourceEnvKey}' ('${expectedDsId}').`,
+        `FAIL_MUTATION_TARGET_MISMATCH: target data source ID (${dataSourceId}) diverge da variável de ambiente ${targetDataSourceEnvKey} (${configuredDsId}).`,
       );
     }
 
-    // Semantic mutation budget check (max 159 logical pages)
+    // Semantic mutation budget check (max 159 logical page creations)
     if (this.logicalCreatesCount >= this.maxNewPagesBudget) {
       throw new Error(
         `FAIL_MUTATION_BUDGET_EXCEEDED: Limite máximo de ${this.maxNewPagesBudget} criações lógicas de página atingido.`,
@@ -483,7 +476,7 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
     this.logicalCreatesCount++;
 
     return this.executeMutationRequest('CREATE', async () => {
-      const page = await this.client.pages.create({
+      const createdPage: any = await this.client.pages.create({
         parent: {
           type: 'data_source_id',
           data_source_id: dataSourceId,
@@ -492,8 +485,8 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       });
 
       return {
-        id: page.id,
-        properties: (page as any).properties || {},
+        id: createdPage.id,
+        properties: createdPage.properties || {},
       };
     });
   }
@@ -517,13 +510,38 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       );
     }
 
+    const expectedBillsDsId = this.envVars[targetDataSourceEnvKey]?.trim();
+    if (!expectedBillsDsId) {
+      throw new Error(`FAIL_MISSING_ENV: Variável obrigatória '${targetDataSourceEnvKey}' não configurada.`);
+    }
+
     const page = await this.fetchPage(pageId);
     if (!page) {
-      throw new Error(`FAIL_PAGE_NOT_FOUND: Página '${pageId}' não encontrada no Notion.`);
+      throw new Error(`FAIL_RELATION_TARGET_MISSING: Fatura '${pageId}' não encontrada no Notion.`);
+    }
+    if (page.archived) {
+      throw new Error(`FAIL_MUTATION_TARGET_MISMATCH: Fatura '${pageId}' está arquivada no Notion.`);
+    }
+
+    // Ownership check: page.parent must match NOTION_DS_CARD_BILLS
+    const billParentDsId = page.parent?.data_source_id || page.parent?.database_id;
+    if (
+      !page.parent ||
+      (page.parent.type !== 'data_source_id' && page.parent.type !== 'database_id') ||
+      billParentDsId !== expectedBillsDsId
+    ) {
+      throw new Error(
+        `FAIL_MUTATION_TARGET_MISMATCH: Fatura '${pageId}' não pertence ao data source esperado '${targetDataSourceEnvKey}' (${expectedBillsDsId}). Parent encontrado: ${JSON.stringify(page.parent)}.`,
+      );
+    }
+
+    const expectedTxDsId = this.envVars['NOTION_DS_TRANSACTIONS']?.trim();
+    if (!expectedTxDsId) {
+      throw new Error("FAIL_MISSING_ENV: Variável obrigatória 'NOTION_DS_TRANSACTIONS' não configurada.");
     }
 
     const dsContract = TARGET_CONTRACT[targetDataSourceEnvKey];
-    for (const [propName] of Object.entries(relations)) {
+    for (const [propName, targetIds] of Object.entries(relations)) {
       if (propName !== 'Lançamentos do Ciclo' && propName !== 'Transações de Pagamento') {
         throw new Error(
           `FAIL_UNEXPECTED_RELATION_PROPERTY: Propriedade '${propName}' não é uma relação canônica esperada para Card Bills.`,
@@ -540,6 +558,31 @@ export class ProductionNotionAdapter implements BackfillNotionAdapter {
       }
       if (propContract.relationTargetEnvKey !== 'NOTION_DS_TRANSACTIONS') {
         throw new Error(`FAIL_RELATION_TARGET_TYPE_MISMATCH: relationTargetEnvKey inesperado para '${propName}'.`);
+      }
+
+      // Verify each relation target ID exists, is not archived, and belongs to NOTION_DS_TRANSACTIONS
+      for (const targetId of targetIds) {
+        const targetPage = await this.fetchPage(targetId);
+        if (!targetPage) {
+          throw new Error(
+            `FAIL_RELATION_TARGET_MISSING: Transação target '${targetId}' referenciada em '${propName}' não encontrada no Notion.`,
+          );
+        }
+        if (targetPage.archived) {
+          throw new Error(
+            `FAIL_RELATION_TARGET_MISSING: Transação target '${targetId}' referenciada em '${propName}' está arquivada no Notion.`,
+          );
+        }
+        const txParentDsId = targetPage.parent?.data_source_id || targetPage.parent?.database_id;
+        if (
+          !targetPage.parent ||
+          (targetPage.parent.type !== 'data_source_id' && targetPage.parent.type !== 'database_id') ||
+          txParentDsId !== expectedTxDsId
+        ) {
+          throw new Error(
+            `FAIL_RELATION_TARGET_TYPE_MISMATCH: Transação target '${targetId}' não pertence ao data source NOTION_DS_TRANSACTIONS (${expectedTxDsId}). Parent: ${JSON.stringify(targetPage.parent)}.`,
+          );
+        }
       }
     }
 
