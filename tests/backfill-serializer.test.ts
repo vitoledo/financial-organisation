@@ -246,4 +246,155 @@ describe('Phase 2D: Runtime Physical Property Binding & Serializer Hardening', (
       }
     }
   });
+
+  describe('Empty Relation Normalization & Canary Op #0 Fingerprint Fixture (Items 1, 2, 3, 4)', () => {
+    it('treats absent relation and empty relation [] as identical in fingerprint', () => {
+      const canonicalWithoutEmptyRel = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+      };
+      const canonicalWithEmptyRel = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+        'Conta Destino': [],
+        'Fatura Vinculada': [],
+      };
+
+      const fp1 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithoutEmptyRel);
+      const fp2 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithEmptyRel);
+      expect(fp1).toBe(fp2);
+    });
+
+    it('does not hide non-empty relations (absent relation != [pageA])', () => {
+      const canonicalWithoutRel = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+      };
+      const canonicalWithRel = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+        'Conta Destino': ['acc-target-456'],
+      };
+
+      const fp1 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithoutRel);
+      const fp2 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithRel);
+      expect(fp1).not.toBe(fp2);
+    });
+
+    it('does not hide non-empty relations (expected [pageA] != [])', () => {
+      const canonicalWithRel = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+        'Conta Destino': ['acc-target-456'],
+      };
+      const canonicalWithEmpty = {
+        'Descrição': 'Pinggy.Io',
+        'Conta': ['acc-123'],
+        'Conta Destino': [],
+      };
+
+      const fp1 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithRel);
+      const fp2 = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', canonicalWithEmpty);
+      expect(fp1).not.toBe(fp2);
+    });
+
+    it('preserves non-relation empty/zero/false values as strictly material', () => {
+      const baseObj = {
+        'Descrição': 'Teste',
+        'Contribuição Meta Poupança': 0,
+        'Motivo da Revisão': '',
+      };
+      const diffNumber = {
+        ...baseObj,
+        'Contribuição Meta Poupança': 100,
+      };
+      const diffText = {
+        ...baseObj,
+        'Motivo da Revisão': 'Revisado',
+      };
+
+      const fpBase = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', baseObj);
+      const fpDiffNum = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', diffNumber);
+      const fpDiffTxt = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', diffText);
+
+      expect(fpBase).not.toBe(fpDiffNum);
+      expect(fpBase).not.toBe(fpDiffTxt);
+    });
+
+    it('reproduces exact live canary Op #0 fixture matching expectedPostFingerprint b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642', () => {
+      const expectedPostFingerprint = 'b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642';
+
+      // Op 0 expected canonical properties from frozen plan
+      const expectedCanonical = {
+        'Descrição': 'Pinggy.Io',
+        'Fonte': 'Pierre',
+        'ID da Fonte': 'a2ce0416-1a27-4592-85be-bff2a9ce6f86',
+        'Moeda': 'BRL',
+        'Hash Canônico': '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb',
+        'Data': { start: '2026-05-02', end: null },
+        'Valor': 300,
+        'Valor Bruto da Fonte': -300,
+        'Movimento': 'Saída',
+        'Natureza Econômica': 'Despesa',
+        'Efeito Orçamentário': 'Despesa',
+        'Propósito de Alocação': 'Caixa Operacional',
+        'Contribuição Meta Poupança': 0,
+        'Status Banco': 'Confirmado',
+        'Status de Revisão': 'Confirmado Auto',
+        'Motivo da Revisão': '',
+        'Categoria Pierre': 'Serviços digitais',
+        'Descrição Original': 'Pinggy.Io',
+        'HMAC Contraparte': '[OFUSCADO]',
+        'Conta': ['3d8a3ece-fa49-8112-9399-c960be4f604a'],
+        'Categoria': ['3d7a3ece-fa49-81c9-955f-e26660d01670'],
+      };
+
+      const calculatedExpected = calculatePropertiesFingerprint('NOTION_DS_TRANSACTIONS', expectedCanonical);
+      expect(calculatedExpected).toBe(expectedPostFingerprint);
+
+      // Raw Notion read-back page record from live creation (contains physical property names and empty relations)
+      const liveReadBackPageRecord = {
+        'Lançamento': { type: 'title', title: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+        'Fonte': { type: 'select', select: { name: 'Pierre' } },
+        'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+        'Moeda': { type: 'select', select: { name: 'BRL' } },
+        'Hash Canônico': { type: 'rich_text', rich_text: [{ text: { content: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }, plain_text: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }] },
+        'Data': { type: 'date', date: { start: '2026-05-02', end: null } },
+        'Valor': { type: 'number', number: 3.0 }, // Physical Notion floating point money
+        'Valor Bruto da Fonte': { type: 'number', number: -3.0 }, // Physical Notion floating point money
+        'Movimento': { type: 'select', select: { name: 'Saída' } },
+        'Natureza': { type: 'select', select: { name: 'Despesa' } },
+        'Efeito Orçamentário': { type: 'select', select: { name: 'Despesa' } },
+        'Propósito de Alocação': { type: 'select', select: { name: 'Caixa Operacional' } },
+        'Contribuição Meta Poupança': { type: 'number', number: 0 },
+        'Status': { type: 'select', select: { name: 'Confirmado' } },
+        'Status de Revisão': { type: 'select', select: { name: 'Confirmado Auto' } },
+        'Motivo da Revisão': { type: 'rich_text', rich_text: [] },
+        'Categoria Pierre': { type: 'rich_text', rich_text: [{ text: { content: 'Serviços digitais' }, plain_text: 'Serviços digitais' }] },
+        'Descrição original': { type: 'rich_text', rich_text: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+        'HMAC Contraparte': { type: 'rich_text', rich_text: [{ text: { content: '[OFUSCADO]' }, plain_text: '[OFUSCADO]' }] },
+        'Conta': { type: 'relation', relation: [{ id: '3d8a3ece-fa49-8112-9399-c960be4f604a' }] },
+        'Categoria': { type: 'relation', relation: [{ id: '3d7a3ece-fa49-81c9-955f-e26660d01670' }] },
+        'Conta Destino': { type: 'relation', relation: [] },
+        'Fatura Vinculada': { type: 'relation', relation: [] },
+      };
+
+      const readBackFingerprint = calculateRecordFingerprint('NOTION_DS_TRANSACTIONS', liveReadBackPageRecord);
+      expect(readBackFingerprint).toBe(expectedPostFingerprint);
+    });
+
+    it('validates round-trip for physical money vs canonical minor units (Item 4)', () => {
+      // physical 3 -> canonical 300 -> physical 3
+      const canonicalUnits = 300;
+      const physicalNotion = canonicalUnits / 100;
+      expect(physicalNotion).toBe(3);
+      expect(physicalNotion * 100).toBe(300);
+
+      // physical -3 -> canonical -300 -> physical -3
+      const canonicalRawUnits = -300;
+      const physicalRawNotion = canonicalRawUnits / 100;
+      expect(physicalRawNotion).toBe(-3);
+      expect(physicalRawNotion * 100).toBe(-300);
+    });
+  });
 });

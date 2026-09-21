@@ -424,16 +424,49 @@ export function serializePayloadForNotion(
 }
 
 /**
+ * Normalizes canonical properties for deterministic fingerprinting:
+ * Rule:
+ * - relation: [] (empty array) -> omitted from fingerprint (matches absent relation)
+ * - relation: [id, ...] (non-empty array) -> ALWAYS material and kept
+ * - number 0, checkbox false, rich_text "", select, date -> NEVER omitted, remain material
+ */
+export function normalizeCanonicalPropertiesForFingerprint(
+  envKey: string,
+  canonicalProperties: Record<string, any>,
+): Record<string, any> {
+  const dsContract = TARGET_CONTRACT[envKey];
+  const normalized: Record<string, any> = {};
+
+  for (const [key, value] of Object.entries(canonicalProperties)) {
+    if (value === null || value === undefined) {
+      continue;
+    }
+    const contract = dsContract?.properties.find(
+      (p) => p.notionProperty === key || (p.aliases && p.aliases.includes(key)) || p.domainField === key,
+    );
+    // If it is a relation and empty array -> omit from fingerprint
+    if (contract && contract.notionType === 'relation' && Array.isArray(value) && value.length === 0) {
+      continue;
+    }
+    normalized[contract ? contract.notionProperty : key] = value;
+  }
+
+  return normalized;
+}
+
+/**
  * Computes a deterministic SHA-256 fingerprint of canonical properties.
+ * Empty relations ([]) are normalized symmetrically to absent relations.
  */
 export function calculatePropertiesFingerprint(
   envKey: string,
   canonicalProperties: Record<string, any>,
 ): string {
-  const sortedKeys = Object.keys(canonicalProperties).sort();
+  const normalized = normalizeCanonicalPropertiesForFingerprint(envKey, canonicalProperties);
+  const sortedKeys = Object.keys(normalized).sort();
   const sortedObj: Record<string, any> = {};
   for (const k of sortedKeys) {
-    const val = canonicalProperties[k];
+    const val = normalized[k];
     if (val !== null && val !== undefined) {
       sortedObj[k] = val;
     }
@@ -443,6 +476,7 @@ export function calculatePropertiesFingerprint(
 
 /**
  * Extracts and canonicalizes properties from an existing Notion page record.
+ * Empty relation properties ([]) are omitted so they do not produce unexpected extra properties.
  */
 export function canonicalizePageRecord(
   envKey: string,
@@ -509,6 +543,10 @@ export function canonicalizePageRecord(
     }
 
     if (parsedVal !== null && parsedVal !== undefined) {
+      // Do not produce empty relation as an unexpected extra property
+      if (contract.notionType === 'relation' && Array.isArray(parsedVal) && parsedVal.length === 0) {
+        continue;
+      }
       canonical[propName] = canonicalizePropertyValue(contract, parsedVal);
     }
   }
@@ -526,3 +564,4 @@ export function calculateRecordFingerprint(
   const canonical = canonicalizePageRecord(envKey, recordProperties);
   return calculatePropertiesFingerprint(envKey, canonical);
 }
+

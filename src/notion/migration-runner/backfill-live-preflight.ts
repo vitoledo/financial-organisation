@@ -19,11 +19,16 @@ import { execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { Client } from '@notionhq/client';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
-import { findPropertyContract, serializePayloadForNotion, resolveStableIdentitySpec } from './backfill-serializer';
-import { BackfillJournal } from './backfill-journal';
+import {
+  findPropertyContract,
+  serializePayloadForNotion,
+  resolveStableIdentitySpec,
+  calculateRecordFingerprint,
+} from './backfill-serializer';
+import { BackfillJournal, BackfillOperationRecord, calculateJournalFingerprint } from './backfill-journal';
 import { NotionSchemaValidator } from '../schema-validator';
 import { LiveNotionAdapter } from './backfill-adapter';
-import { calculateTargetStateHash, BaseSnapshotData } from './data-snapshot';
+import { calculateTargetStateHash, BaseSnapshotData, NotionPageRecord } from './data-snapshot';
 import { BackfillDryRunAnalyzer } from './backfill-dry-run';
 import {
   PLAN_ORIGIN_COMMIT_SHA,
@@ -39,6 +44,16 @@ import { BackfillSchemaConformanceEvidence, BackfillOperation, TypedRelationRefe
 export interface LivePreflightOptions {
   client?: Client;
   envVars?: Record<string, string | undefined>;
+  planOriginCommitSha?: string;
+  artifactPath?: string;
+  journalPath?: string;
+  ttlMinutes?: number;
+}
+
+export interface ResumePreflightOptions {
+  client?: Client;
+  envVars?: Record<string, string | undefined>;
+  runId?: string;
   planOriginCommitSha?: string;
   artifactPath?: string;
   journalPath?: string;
@@ -909,13 +924,18 @@ export function validatePreflightBinding(
     return { valid: false, reason: `FAIL_PREFLIGHT_TARGETS_NOT_PRISTINE: Targets ausentes ou não pristine (transactions: ${artifact.targets?.transactions}, bills: ${artifact.targets?.bills}).` };
   }
 
+  if (!artifact.mutationWriteSurfaceCompatibility) {
+    return {
+      valid: false,
+      reason: 'FAIL_PREFLIGHT_WRITE_SURFACE_INCOMPATIBLE: mutationWriteSurfaceCompatibility é obrigatório no artefato de preflight.',
+    };
+  }
   if (
-    artifact.mutationWriteSurfaceCompatibility &&
-    (artifact.mutationWriteSurfaceCompatibility.incompatibleOperations !== 0 ||
-      artifact.mutationWriteSurfaceCompatibility.missingPhysicalProperties !== 0 ||
-      artifact.mutationWriteSurfaceCompatibility.typeMismatches !== 0 ||
-      artifact.mutationWriteSurfaceCompatibility.invalidSelectOptions !== 0 ||
-      artifact.mutationWriteSurfaceCompatibility.relationTargetMismatches !== 0)
+    artifact.mutationWriteSurfaceCompatibility.incompatibleOperations !== 0 ||
+    artifact.mutationWriteSurfaceCompatibility.missingPhysicalProperties !== 0 ||
+    artifact.mutationWriteSurfaceCompatibility.typeMismatches !== 0 ||
+    artifact.mutationWriteSurfaceCompatibility.invalidSelectOptions !== 0 ||
+    artifact.mutationWriteSurfaceCompatibility.relationTargetMismatches !== 0
   ) {
     return {
       valid: false,
@@ -923,12 +943,17 @@ export function validatePreflightBinding(
     };
   }
 
+  if (!artifact.canaryOperation) {
+    return {
+      valid: false,
+      reason: 'FAIL_PREFLIGHT_CANARY_OP_INVALID: canaryOperation é obrigatório no artefato de preflight.',
+    };
+  }
   if (
-    artifact.canaryOperation &&
-    (!artifact.canaryOperation.everyPhysicalPropertyExists ||
-      !artifact.canaryOperation.stableIdentityQueryValidated ||
-      artifact.canaryOperation.matches !== 0 ||
-      artifact.canaryOperation.validationError !== 0)
+    !artifact.canaryOperation.everyPhysicalPropertyExists ||
+    !artifact.canaryOperation.stableIdentityQueryValidated ||
+    artifact.canaryOperation.matches !== 0 ||
+    artifact.canaryOperation.validationError !== 0
   ) {
     return {
       valid: false,
@@ -967,14 +992,18 @@ export function validatePreflightBinding(
   return { valid: true };
 }
 
-export interface ResumePreflightOptions {
-  client?: Client;
-  envVars?: Record<string, string | undefined>;
-  runId?: string;
-  planOriginCommitSha?: string;
-  artifactPath?: string;
-  journalPath?: string;
-  ttlMinutes?: number;
+export interface ReconciliationPreviewItem {
+  operationIndex: number;
+  action: string;
+  currentJournalStatus: string;
+  attempts: number;
+  targetPageId: string | null;
+  stableIdentityMatches: number;
+  expectedFingerprint: string | null;
+  actualNormalizedFingerprint: string | null;
+  recoverable: boolean;
+  previewStatus: 'RECOVERABLE_VERIFIED_PREVIEW' | 'UNRECOVERABLE';
+  reason?: string;
 }
 
 export interface ResumePreflightArtifact {
@@ -985,6 +1014,8 @@ export interface ResumePreflightArtifact {
   expiresAt: string;
   ttlMinutes: number;
   runId: string;
+  runExecutorCommitSha: string;
+  recoveryExecutorCommitSha: string;
   executorCommitSha: string;
   planOriginCommitSha: string;
   backfillPlanHash: string;
@@ -994,25 +1025,18 @@ export interface ResumePreflightArtifact {
   workspaceIdentityHash: string;
   actorType: string;
   verifiedOperationsCount: number;
+  recoverableOperationsCount: number;
+  reconciliationPreview: ReconciliationPreviewItem[];
+  targets: {
+    transactions: number;
+    bills: number;
+  };
   readyForLiveApplyReview: boolean;
   readyForApply: boolean;
   reasons: string[];
 }
 
-export function calculateJournalFingerprint(journal: BackfillJournal, runId: string): string {
-  const ops = journal.getOperations(runId);
-  const verifiedOps = ops.filter(
-    (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
-  );
-  return crypto
-    .createHash('sha256')
-    .update(
-      JSON.stringify(
-        verifiedOps.map((o) => [o.operationIndex, o.status, o.targetPageId, o.expectedPostFingerprint]),
-      ),
-    )
-    .digest('hex');
-}
+export { calculateJournalFingerprint } from './backfill-journal';
 
 export class BackfillLiveResumePreflight {
   private client?: Client;
@@ -1056,14 +1080,15 @@ export class BackfillLiveResumePreflight {
     const now = new Date();
     const generatedAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + this.ttlMinutes * 60 * 1000).toISOString();
-    const executorCommitSha = this.getGitCommitSha();
+    const recoveryExecutorCommitSha = this.getGitCommitSha();
 
     if (!fs.existsSync(this.journalPath)) {
       throw new Error(`FAIL_RESUME_NO_JOURNAL: Journal não encontrado em '${this.journalPath}'.`);
     }
 
     const journal = new BackfillJournal(this.journalPath);
-    const run = this.runId ? journal.getRun(this.runId) : journal.getLatestRun();
+    try {
+      const run = this.runId ? journal.getRun(this.runId) : journal.getLatestRun();
 
     if (!run) {
       throw new Error('FAIL_RESUME_NO_RUN_FOUND: Nenhuma execução encontrada no journal para resume.');
@@ -1105,18 +1130,93 @@ export class BackfillLiveResumePreflight {
     const planReport = await analyzer.runAnalysis();
     const plan = planReport.planArtifact;
 
-    // 3. Project expected live state based on verified/applied operations in journal
+    // 3. Reconcile uncertain/failed writes read-only (Item 6 & 7)
+    const liveAdapter = new LiveNotionAdapter(this.client || ({} as any), this.envVars);
     const ops = journal.getOperations(run.runId);
     const verifiedOps = ops.filter(
       (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
     );
+
+    const reconciliationPreview: ReconciliationPreviewItem[] = [];
+    const recoverableOps: BackfillOperationRecord[] = [];
+
+    const uncertainOrFailed = ops.filter(
+      (o) => o.status !== 'VERIFIED' && o.status !== 'NO_OP_VERIFIED' && o.attempts > 0,
+    );
+
+    for (const uOp of uncertainOrFailed) {
+      if (uOp.action === 'CREATE') {
+        const planOp = plan.operations[uOp.operationIndex];
+        if (!planOp) continue;
+        const idSpec = resolveStableIdentitySpec(planOp);
+        let matches: NotionPageRecord[] = [];
+        try {
+          matches = await liveAdapter.findByStableIdentity(
+            planOp.targetDataSource.envKey,
+            idSpec.physicalProperty,
+            planOp.stableId,
+          );
+        } catch (err: any) {
+          reasons.push(`FAIL_RECOVERY_QUERY_ERROR: Erro ao consultar stable identity para op ${uOp.operationIndex}: ${err.message}`);
+        }
+
+        let actualNormalizedFingerprint: string | null = null;
+        let isRecoverable = false;
+        let previewReason: string | undefined = undefined;
+
+        if (matches.length === 1) {
+          actualNormalizedFingerprint = calculateRecordFingerprint(
+            planOp.targetDataSource.envKey,
+            matches[0].properties,
+          );
+          if (actualNormalizedFingerprint === uOp.expectedPostFingerprint) {
+            isRecoverable = true;
+            recoverableOps.push({
+              ...uOp,
+              status: 'VERIFIED',
+              targetPageId: matches[0].id,
+            });
+          } else {
+            previewReason = `FAIL_READ_BACK_FINGERPRINT_MISMATCH: Fingerprint live (${actualNormalizedFingerprint}) diverge do esperado (${uOp.expectedPostFingerprint}).`;
+            reasons.push(`FAIL_RECOVERY_FINGERPRINT_MISMATCH: Operação ${uOp.operationIndex} tem fingerprint divergente.`);
+          }
+        } else if (matches.length === 0) {
+          previewReason = 'FAIL_PAGE_NOT_FOUND: Nenhuma página encontrada com stableId no Notion live.';
+          reasons.push(`FAIL_RECOVERY_PAGE_NOT_FOUND: Nenhuma página encontrada para op ${uOp.operationIndex} no Notion.`);
+        } else {
+          previewReason = `FAIL_DUPLICATE_STABLE_ID: ${matches.length} páginas encontradas com mesmo stableId.`;
+          reasons.push(`FAIL_RECOVERY_DUPLICATE: Múltiplas páginas para op ${uOp.operationIndex} no Notion.`);
+        }
+
+        reconciliationPreview.push({
+          operationIndex: uOp.operationIndex,
+          action: uOp.action,
+          currentJournalStatus: uOp.status,
+          attempts: uOp.attempts,
+          targetPageId: uOp.targetPageId || (matches[0] ? matches[0].id : null),
+          stableIdentityMatches: matches.length,
+          expectedFingerprint: uOp.expectedPostFingerprint,
+          actualNormalizedFingerprint,
+          recoverable: isRecoverable,
+          previewStatus: isRecoverable ? 'RECOVERABLE_VERIFIED_PREVIEW' : 'UNRECOVERABLE',
+          reason: previewReason,
+        });
+      }
+    }
+
     const journalFingerprint = calculateJournalFingerprint(journal, run.runId);
 
-    const projectedExpectedState = projectExpectedBackfillState(frozenBases, plan, journal, run.runId);
+    // 4. Project expected state incorporating preview-recoverable operations
+    const projectedExpectedState = projectExpectedBackfillState(
+      frozenBases,
+      plan,
+      journal,
+      run.runId,
+      recoverableOps,
+    );
     const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
 
-    // 4. Query live Notion state
-    const liveAdapter = new LiveNotionAdapter(this.client || ({} as any), this.envVars);
+    // 5. Query live Notion state
     let liveTargetBases: Record<string, BaseSnapshotData> = {};
     try {
       liveTargetBases = await liveAdapter.queryTargetState();
@@ -1126,7 +1226,7 @@ export class BackfillLiveResumePreflight {
 
     const liveTargetStateHash = calculateTargetStateHash(liveTargetBases);
 
-    // 5. Compare actual live with projected expected
+    // 6. Compare actual live with projected expected
     if (liveTargetStateHash !== projectedTargetStateHash) {
       reasons.push(
         `TARGET_DRIFT_DETECTED: liveTargetStateHash (${liveTargetStateHash}) diverge do estado esperado projetado pelo journal (${projectedTargetStateHash}).`,
@@ -1144,7 +1244,9 @@ export class BackfillLiveResumePreflight {
       expiresAt,
       ttlMinutes: this.ttlMinutes,
       runId: run.runId,
-      executorCommitSha,
+      runExecutorCommitSha: run.executorCommitSha,
+      recoveryExecutorCommitSha,
+      executorCommitSha: recoveryExecutorCommitSha,
       planOriginCommitSha: this.planOriginSha,
       backfillPlanHash: plan.backfillPlanHash,
       journalFingerprint,
@@ -1153,16 +1255,25 @@ export class BackfillLiveResumePreflight {
       workspaceIdentityHash,
       actorType,
       verifiedOperationsCount: verifiedOps.length,
+      recoverableOperationsCount: recoverableOps.length,
+      reconciliationPreview,
+      targets: {
+        transactions: liveTargetBases['NOTION_DS_TRANSACTIONS']?.records.length ?? 0,
+        bills: liveTargetBases['NOTION_DS_CARD_BILLS']?.records.length ?? 0,
+      },
       readyForLiveApplyReview,
       readyForApply,
       reasons,
     };
 
-    const dir = path.dirname(this.artifactPath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(this.artifactPath, JSON.stringify(artifact, null, 2), 'utf8');
+      const dir = path.dirname(this.artifactPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this.artifactPath, JSON.stringify(artifact, null, 2), 'utf8');
 
-    return artifact;
+      return artifact;
+    } finally {
+      journal.close();
+    }
   }
 }
 
@@ -1211,6 +1322,7 @@ export function validateResumePreflightBinding(
     projectedTargetStateHash?: string;
     workspaceIdentityHash?: string;
     journalFingerprint?: string;
+    envVars?: Record<string, string | undefined>;
   } = {},
 ): { valid: boolean; reason?: string } {
   if (artifact.readyForLiveApplyReview !== true) {
@@ -1243,8 +1355,8 @@ export function validateResumePreflightBinding(
   if (expected.runId && artifact.runId !== expected.runId) {
     return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: runId diverge (${artifact.runId} vs ${expected.runId}).` };
   }
-  if (expected.executorCommitSha && artifact.executorCommitSha !== expected.executorCommitSha) {
-    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: executorCommitSha diverge (${artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
+  if (expected.executorCommitSha && artifact.executorCommitSha !== expected.executorCommitSha && artifact.recoveryExecutorCommitSha !== expected.executorCommitSha) {
+    return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: executorCommitSha diverge (${artifact.recoveryExecutorCommitSha || artifact.executorCommitSha} vs ${expected.executorCommitSha}).` };
   }
   if (expected.projectedTargetStateHash && artifact.projectedTargetStateHash !== expected.projectedTargetStateHash) {
     return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: projectedTargetStateHash diverge (${artifact.projectedTargetStateHash} vs ${expected.projectedTargetStateHash}).` };
@@ -1254,6 +1366,24 @@ export function validateResumePreflightBinding(
   }
   if (expected.journalFingerprint && artifact.journalFingerprint !== expected.journalFingerprint) {
     return { valid: false, reason: `FAIL_RESUME_PREFLIGHT_BINDING: journalFingerprint diverge (${artifact.journalFingerprint} vs ${expected.journalFingerprint}).` };
+  }
+
+  // Cross-commit recovery gate enforcement (Item 9)
+  if (
+    artifact.runExecutorCommitSha &&
+    artifact.recoveryExecutorCommitSha &&
+    artifact.runExecutorCommitSha !== artifact.recoveryExecutorCommitSha
+  ) {
+    const env = expected.envVars || (process.env as Record<string, string | undefined>);
+    const recoveryFromCommit = env.FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT?.trim();
+    const recoveryRunId = env.FINANCIAL_BACKFILL_RECOVERY_RUN_ID?.trim();
+
+    if (recoveryFromCommit !== artifact.runExecutorCommitSha || recoveryRunId !== artifact.runId) {
+      return {
+        valid: false,
+        reason: `FAIL_CROSS_COMMIT_RECOVERY_AUTHORIZATION: Recovery cross-commit (${artifact.runExecutorCommitSha} -> ${artifact.recoveryExecutorCommitSha}) exige FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT='${artifact.runExecutorCommitSha}' e FINANCIAL_BACKFILL_RECOVERY_RUN_ID='${artifact.runId}'.`,
+      };
+    }
   }
 
   return { valid: true };

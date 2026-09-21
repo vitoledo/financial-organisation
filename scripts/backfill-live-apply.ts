@@ -135,6 +135,7 @@ export async function runLiveApply(
   const canary = canaryIdx !== -1 ? parseInt(args[canaryIdx + 1], 10) : undefined;
   const resumeIdx = args.indexOf('--resume');
   const resumeRunId = resumeIdx !== -1 ? args[resumeIdx + 1] : undefined;
+  const isRecoverCanaryOnly = args.includes('--recover-canary-only');
 
   const currentCommitSha = getGitCommitSha();
 
@@ -307,6 +308,7 @@ export async function runLiveApply(
         backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
         workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
         journalFingerprint: resumeJournalFingerprint,
+        envVars: env,
       })
     : validatePreflightBinding(artifact, {
         executorCommitSha: currentCommitSha,
@@ -449,6 +451,29 @@ export async function runLiveApply(
       structuralMismatchesCount: 0,
     },
   });
+
+  if (isRecoverCanaryOnly) {
+    if (!resumeRunId) {
+      throw new Error('FAIL_RECOVER_CANARY_ONLY: Flag --recover-canary-only exige --resume <run_id>.');
+    }
+    const report = await executor.executeRecoverCanaryOnly(resumeRunId, artifact);
+
+    console.log();
+    console.log('═'.repeat(79));
+    console.log(`  RECOVERY CANARY CONCLUÍDO: Status = ${report.status}`);
+    console.log('═'.repeat(79));
+    console.log(`  • Run ID:                    ${report.simulationRunId}`);
+    console.log(`  • Status:                    ${report.status}`);
+    console.log(`  • Semantic Creates:          ${report.semanticCreates}`);
+    console.log(`  • Existing No-Ops:           ${report.existingPageCreateNoOps}`);
+    console.log(`  • Create HTTP Attempts:      0 (ZERO)`);
+    console.log(`  • Relation HTTP Attempts:    0 (ZERO)`);
+    console.log(`  • Live Mutation Count:       0 (ZERO)`);
+    console.log(`  • Pages Created in Recovery: 0 (ZERO)`);
+    console.log(`  • Status Final no Journal:   ${JSON.stringify(report.journalFinal)}`);
+    console.log();
+    return;
+  }
 
   const report = await executor.execute();
 

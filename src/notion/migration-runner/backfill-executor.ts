@@ -8,7 +8,12 @@ import {
   FROZEN_TARGET_STATE_HASH,
   MAX_NEW_PAGES_BUDGET,
 } from './backfill-constants';
-import { BackfillJournal, BackfillOperationStatus } from './backfill-journal';
+import {
+  BackfillJournal,
+  BackfillOperationStatus,
+  BackfillOperationRecord,
+  calculateJournalFingerprint,
+} from './backfill-journal';
 import {
   BackfillNotionAdapter,
   SimulatedNotionAdapter,
@@ -31,6 +36,7 @@ import {
 } from './types';
 import { calculateTargetStateHash, BaseSnapshotData, NotionPageRecord } from './data-snapshot';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
+import type { ResumePreflightArtifact } from './backfill-live-preflight';
 
 export const DEFAULT_CONFORMANT_SCHEMA_EVIDENCE: BackfillSchemaConformanceEvidence = {
   totalDataSources: 13,
@@ -90,6 +96,7 @@ export interface BackfillExecutorReport {
   createHttpAttempts?: number;
   logicalRelationPatches?: number;
   relationPatchHttpAttempts?: number;
+  pagesCreatedDuringRecovery?: number;
 }
 
 function sanitizeErrorMessage(msg: string): string {
@@ -144,13 +151,26 @@ export function projectExpectedBackfillState(
   plan: BackfillPlanArtifact,
   journal: BackfillJournal,
   runId: string,
+  extraRecoverableOps: BackfillOperationRecord[] = [],
 ): Record<string, BaseSnapshotData> {
   const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
 
   const ops = journal.getOperations(runId);
-  const verifiedOrAppliedOps = ops.filter(
-    (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
-  );
+  const combined = [
+    ...ops.filter(
+      (o) => o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED',
+    ),
+    ...extraRecoverableOps,
+  ];
+
+  const seenIndices = new Set<number>();
+  const verifiedOrAppliedOps: BackfillOperationRecord[] = [];
+  for (const op of combined) {
+    if (!seenIndices.has(op.operationIndex)) {
+      seenIndices.add(op.operationIndex);
+      verifiedOrAppliedOps.push(op);
+    }
+  }
 
   const mappedPages = new Map<string, string>();
   for (const op of verifiedOrAppliedOps) {
@@ -1379,6 +1399,152 @@ export class BackfillExecutor {
       readyForLiveApplyReview,
       readyForApply: false,
       reasons: [],
+    };
+  }
+
+  /**
+   * Mode: --recover-canary-only (Item 10)
+   * Strictly read-only on Notion API (0 HTTP mutations permitted).
+   * Reconciles Canary Op #0 from FAILED -> VERIFIED using the existing live page,
+   * records the event in backfill_operation_events, confirms page mapping,
+   * sets run status to PAUSED_AFTER_CANARY and stops without proceeding to operation #1.
+   */
+  public async executeRecoverCanaryOnly(
+    resumeRunId: string,
+    preflightArtifact: ResumePreflightArtifact,
+  ): Promise<BackfillExecutorReport> {
+    // 1. Validate run in journal
+    const run = this.journal.getRun(resumeRunId);
+    if (!run) {
+      throw new Error(`FAIL_RESUME_NO_RUN_FOUND: Run '${resumeRunId}' não encontrado no journal.`);
+    }
+
+    const executorCommitSha = this.getGitCommitSha();
+    const planOriginSha = this.options.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
+
+    // 2. Validate cross-commit gates if cross-commit (Item 9)
+    if (run.executorCommitSha !== executorCommitSha) {
+      const gateFromCommit = this.envVars.FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT?.trim();
+      const gateRunId = this.envVars.FINANCIAL_BACKFILL_RECOVERY_RUN_ID?.trim();
+      if (gateFromCommit !== run.executorCommitSha || gateRunId !== resumeRunId) {
+        throw new Error(
+          `FAIL_CROSS_COMMIT_RECOVERY_AUTHORIZATION: Recovery cross-commit (${run.executorCommitSha} -> ${executorCommitSha}) exige FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT='${run.executorCommitSha}' e FINANCIAL_BACKFILL_RECOVERY_RUN_ID='${resumeRunId}'.`,
+        );
+      }
+    }
+
+    // 3. Reproduce plan
+    const analyzer = new BackfillDryRunAnalyzer({
+      envVars: this.envVars,
+      commitSha: planOriginSha,
+    });
+    const planReport = await analyzer.runAnalysis();
+    const plan = planReport.planArtifact;
+
+    // 4. Validate journal fingerprint against resume preflight
+    const currentJournalFp = calculateJournalFingerprint(this.journal, resumeRunId);
+    if (preflightArtifact.journalFingerprint !== currentJournalFp) {
+      throw new Error(
+        `FAIL_RESUME_PREFLIGHT_BINDING: journalFingerprint do artefato (${preflightArtifact.journalFingerprint}) diverge do journal atual (${currentJournalFp}).`,
+      );
+    }
+
+    // 5. Query live stable identity for Op #0
+    const op0 = plan.operations[0];
+    const idSpec = resolveStableIdentitySpec(op0);
+    const existingMatches = await this.adapter.findByStableIdentity(
+      op0.targetDataSource.envKey,
+      idSpec.physicalProperty,
+      op0.stableId,
+    );
+
+    if (existingMatches.length === 0) {
+      throw new Error(
+        `FAIL_CANARY_RECOVERY_PAGE_NOT_FOUND: Nenhuma página encontrada no Notion para stableId '${op0.stableId}'.`,
+      );
+    }
+    if (existingMatches.length > 1) {
+      throw new Error(
+        `FAIL_DUPLICATE_STABLE_ID: Múltiplas páginas (${existingMatches.length}) encontradas com stableId '${op0.stableId}'.`,
+      );
+    }
+
+    const liveRecord = existingMatches[0];
+    const normalizedFingerprint = calculateRecordFingerprint(
+      op0.targetDataSource.envKey,
+      liveRecord.properties,
+    );
+
+    const journalOp0 = this.journal.getOperation(resumeRunId, 0);
+    if (!journalOp0) {
+      throw new Error(`FAIL_OPERATION_NOT_FOUND: Operação 0 não registrada no journal para run '${resumeRunId}'.`);
+    }
+
+    if (normalizedFingerprint !== journalOp0.expectedPostFingerprint) {
+      throw new Error(
+        `FAIL_READ_BACK_FINGERPRINT_MISMATCH: Fingerprint normalizado (${normalizedFingerprint}) diverge do esperado (${journalOp0.expectedPostFingerprint}).`,
+      );
+    }
+
+    // Strict invariant: verify 0 mutations occurred during recovery
+    const mutationCount = this.adapter.getMutationCount();
+    if (mutationCount !== 0) {
+      throw new Error(`FAIL_MUTATION_DURING_RECOVERY: Recovery executou ${mutationCount} mutações no Notion. Permitido: 0.`);
+    }
+
+    // 6. Transition FAILED -> VERIFIED with audit event (Item 11)
+    this.journal.recordRecoveredVerified(
+      resumeRunId,
+      0,
+      liveRecord.id,
+      executorCommitSha,
+      'RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX',
+    );
+
+    // Save page mapping
+    this.journal.savePageMapping(
+      plan.backfillPlanHash,
+      op0.stableId,
+      liveRecord.id,
+      op0.targetDataSource.envKey,
+    );
+
+    // Pause run after canary
+    this.journal.pauseAfterCanary(resumeRunId);
+
+    const finalCounts = this.journal.countByStatus(resumeRunId);
+
+    return {
+      executorHeadCommitSha: executorCommitSha,
+      executorParentCommitSha: this.getGitCommitSha(),
+      planOriginCommitSha: planOriginSha,
+      frozenBackfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+      reproducedBackfillPlanHash: plan.backfillPlanHash,
+      sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+      targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+      targetStateHash: FROZEN_TARGET_STATE_HASH,
+      simulationRunId: resumeRunId,
+      status: 'PAUSED_AFTER_CANARY',
+      semanticCreates: 1,
+      actualSimulatedCreateWrites: 0,
+      existingPageCreateNoOps: 1,
+      logicalRelationReferences: 320,
+      canonicalRelationPatchGroups: 0,
+      actualSimulatedRelationWrites: 0,
+      writeRequestsSent: 0,
+      retries: 0,
+      recoveredUncertainCreates: 1,
+      recoveredUncertainRelationWrites: 0,
+      logicalCreates: 0,
+      createHttpAttempts: 0,
+      logicalRelationPatches: 0,
+      relationPatchHttpAttempts: 0,
+      pagesCreatedDuringRecovery: 0,
+      journalFinal: finalCounts,
+      liveNotionMutations: this.adapter.getMutationCount(),
+      readyForLiveApplyReview: true,
+      readyForApply: false,
+      reasons: ['PAUSED_AFTER_CANARY: Canary recuperado com sucesso e journal atualizado para PAUSED_AFTER_CANARY.'],
     };
   }
 

@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -9,6 +9,9 @@ import {
   isPreflightValid,
   validatePreflightBinding,
   LivePreflightArtifact,
+  BackfillLiveResumePreflight,
+  ResumePreflightArtifact,
+  validateResumePreflightBinding,
 } from '../src/notion/migration-runner/backfill-live-preflight';
 import {
   PLAN_ORIGIN_COMMIT_SHA,
@@ -16,10 +19,11 @@ import {
   FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
   FROZEN_TARGET_STATE_HASH,
+  APPROVED_WORKSPACE_IDENTITY_HASH,
 } from '../src/notion/migration-runner/backfill-constants';
 import { LiveNotionAdapter, SimulatedNotionAdapter } from '../src/notion/migration-runner/backfill-adapter';
 import { BackfillDryRunAnalyzer } from '../src/notion/migration-runner/backfill-dry-run';
-import { BackfillExecutor } from '../src/notion/migration-runner/backfill-executor';
+import { BackfillExecutor, projectExpectedBackfillState } from '../src/notion/migration-runner/backfill-executor';
 import { BackfillJournal } from '../src/notion/migration-runner/backfill-journal';
 
 describe('Phase 2C: Real Read-Only Live Preflight and Production Wiring', { timeout: 30000 }, () => {
@@ -275,6 +279,24 @@ describe('Phase 2C: Real Read-Only Live Preflight and Production Wiring', { time
           exists: false,
           writable: true,
         },
+        mutationWriteSurfaceCompatibility: {
+          executableOperationsChecked: 159,
+          incompatibleOperations: 0,
+          missingPhysicalProperties: 0,
+          typeMismatches: 0,
+          invalidSelectOptions: 0,
+          relationTargetMismatches: 0,
+        },
+        canaryOperation: {
+          operationIndex: 0,
+          targetDataSource: 'NOTION_DS_TRANSACTIONS',
+          physicalPropertyKeys: ['Conta', 'Data', 'HMAC Contraparte', 'Hash Canônico', 'ID da fonte', 'Lançamento', 'Moeda', 'Movimento', 'Natureza', 'Status', 'Valor', 'Valor Bruto da Fonte'],
+          everyPhysicalPropertyExists: true,
+          stableIdentityPhysicalProperty: 'ID da fonte',
+          stableIdentityQueryValidated: true,
+          matches: 0,
+          validationError: 0,
+        },
       };
 
       const check1 = validatePreflightBinding(validArtifact, {
@@ -458,10 +480,360 @@ describe('Phase 2C: Real Read-Only Live Preflight and Production Wiring', { time
       expect(res.reason).toContain('FAIL_PREFLIGHT_CANARY_OP_INVALID');
     });
 
+    it('validatePreflightBinding rejects artifact when mutationWriteSurfaceCompatibility is missing', () => {
+      const artifact = buildBaseArtifact();
+      delete (artifact as any).mutationWriteSurfaceCompatibility;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_WRITE_SURFACE_INCOMPATIBLE');
+    });
+
+    it('validatePreflightBinding rejects artifact when canaryOperation is missing', () => {
+      const artifact = buildBaseArtifact();
+      delete (artifact as any).canaryOperation;
+
+      const res = validatePreflightBinding(artifact);
+      expect(res.valid).toBe(false);
+      expect(res.reason).toContain('FAIL_PREFLIGHT_CANARY_OP_INVALID');
+    });
+
     it('validatePreflightBinding accepts clean artifact with 159 valid operations and 0 canary matches', () => {
       const artifact = buildBaseArtifact();
       const res = validatePreflightBinding(artifact);
       expect(res.valid).toBe(true);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 7. RESUME PREFLIGHT RECONCILIATION PREVIEW & CROSS-COMMIT GATES
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('7. Resume Preflight Reconciliation Preview & Cross-Commit Gates (Items 6, 7, 9, 14)', () => {
+    const testTempDir = path.resolve(process.cwd(), '.local', 'test-resume-preflight');
+
+    beforeEach(() => {
+      if (!fs.existsSync(testTempDir)) fs.mkdirSync(testTempDir, { recursive: true });
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      if (fs.existsSync(testTempDir)) {
+        try {
+          fs.rmSync(testTempDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    function setupTestJournal(status: string = 'FAILED', attempts: number = 1) {
+      const dbPath = path.join(testTempDir, `journal-${Date.now()}-${Math.random().toString(36).substring(2, 7)}.db`);
+      const journal = new BackfillJournal(dbPath);
+      const runId = `test-run-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      journal.startRun({
+        runId,
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: 'commit-orig-123',
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      journal.registerOperation({
+        runId,
+        operationIndex: 0,
+        stableId: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86',
+        stage: 'STAGE_1_PAGE_CREATION',
+        targetDataSource: 'NOTION_DS_TRANSACTIONS',
+        action: 'CREATE',
+        expectedPostFingerprint: 'b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642',
+      });
+
+      if (attempts > 0) {
+        journal.recordAttempt(runId, 0);
+      }
+      if (status === 'FAILED') {
+        journal.recordFailed(runId, 0, 'FAIL_READ_BACK_FINGERPRINT_MISMATCH');
+      }
+
+      journal.close();
+
+      return { dbPath, runId };
+    }
+
+    it('generates RECOVERABLE_VERIFIED_PREVIEW when live page exactly matches Op #0 expected fingerprint', async () => {
+      const { dbPath, runId } = setupTestJournal('FAILED', 1);
+
+      vi.spyOn(LiveNotionAdapter.prototype, 'queryTargetState').mockImplementation(async () => {
+        const analyzer = new BackfillDryRunAnalyzer({ envVars: testEnv });
+        const targetSession = analyzer.prepareValidatedTargetSnapshot();
+        const bases = JSON.parse(JSON.stringify(targetSession.payload.bases));
+        targetSession.cleanup();
+        const planReport = await analyzer.runAnalysis();
+        const plan = planReport.planArtifact;
+        const testJournal = new BackfillJournal(dbPath);
+        const projected = projectExpectedBackfillState(bases, plan, testJournal, runId, [
+          {
+            runId,
+            operationIndex: 0,
+            stableId: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86',
+            stage: 'STAGE_1_PAGE_CREATION',
+            targetDataSource: 'NOTION_DS_TRANSACTIONS',
+            action: 'CREATE',
+            status: 'VERIFIED',
+            attempts: 1,
+            targetPageId: 'page-recovered-123',
+            expectedPreFingerprint: null,
+            expectedPostFingerprint: 'b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642',
+            lastAttemptAt: null,
+            errorSanitized: null,
+          },
+        ]);
+        testJournal.close();
+        return projected;
+      });
+
+      // Mock live adapter with page matching Op 0
+      const mockClient: any = {
+        users: { me: vi.fn().mockResolvedValue({ type: 'bot', bot: { workspace_id: 'ws-123' } }) },
+        dataSources: {
+          query: vi.fn().mockImplementation((params: any) => {
+            if (params.data_source_id === testEnv.NOTION_DS_TRANSACTIONS) {
+              return Promise.resolve({
+                results: [
+                  {
+                    id: 'page-recovered-123',
+                    created_time: '2026-09-21T00:00:00.000Z',
+                    lastEditedTime: '2026-09-21T00:00:00.000Z',
+                    archived: false,
+                    url: 'https://notion.so/page-recovered-123',
+                    properties: {
+                      'Lançamento': { type: 'title', title: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+                      'Fonte': { type: 'select', select: { name: 'Pierre' } },
+                      'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+                      'Moeda': { type: 'select', select: { name: 'BRL' } },
+                      'Hash Canônico': { type: 'rich_text', rich_text: [{ text: { content: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }, plain_text: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }] },
+                      'Data': { type: 'date', date: { start: '2026-05-02', end: null } },
+                      'Valor': { type: 'number', number: 3.0 },
+                      'Valor Bruto da Fonte': { type: 'number', number: -3.0 },
+                      'Movimento': { type: 'select', select: { name: 'Saída' } },
+                      'Natureza': { type: 'select', select: { name: 'Despesa' } },
+                      'Efeito Orçamentário': { type: 'select', select: { name: 'Despesa' } },
+                      'Propósito de Alocação': { type: 'select', select: { name: 'Caixa Operacional' } },
+                      'Contribuição Meta Poupança': { type: 'number', number: 0 },
+                      'Status': { type: 'select', select: { name: 'Confirmado' } },
+                      'Status de Revisão': { type: 'select', select: { name: 'Confirmado Auto' } },
+                      'Motivo da Revisão': { type: 'rich_text', rich_text: [] },
+                      'Categoria Pierre': { type: 'rich_text', rich_text: [{ text: { content: 'Serviços digitais' }, plain_text: 'Serviços digitais' }] },
+                      'Descrição original': { type: 'rich_text', rich_text: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+                      'HMAC Contraparte': { type: 'rich_text', rich_text: [{ text: { content: '[OFUSCADO]' }, plain_text: '[OFUSCADO]' }] },
+                      'Conta': { type: 'relation', relation: [{ id: '3d8a3ece-fa49-8112-9399-c960be4f604a' }] },
+                      'Categoria': { type: 'relation', relation: [{ id: '3d7a3ece-fa49-81c9-955f-e26660d01670' }] },
+                      'Conta Destino': { type: 'relation', relation: [] },
+                      'Fatura Vinculada': { type: 'relation', relation: [] },
+                    },
+                  },
+                ],
+                has_more: false,
+                next_cursor: null,
+              });
+            }
+            return Promise.resolve({ results: [], has_more: false, next_cursor: null });
+          }),
+        },
+      };
+
+      const preflight = new BackfillLiveResumePreflight({
+        client: mockClient,
+        envVars: testEnv,
+        journalPath: dbPath,
+        runId,
+      });
+
+      const artifact = await preflight.executeResumePreflight();
+      expect(artifact.recoverableOperationsCount).toBe(1);
+      expect(artifact.reconciliationPreview.length).toBe(1);
+
+      const preview = artifact.reconciliationPreview[0];
+      expect(preview.operationIndex).toBe(0);
+      expect(preview.recoverable).toBe(true);
+      expect(preview.previewStatus).toBe('RECOVERABLE_VERIFIED_PREVIEW');
+      expect(preview.targetPageId).toBe('page-recovered-123');
+      expect(preview.actualNormalizedFingerprint).toBe('b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642');
+      expect(preview.expectedFingerprint).toBe('b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642');
+
+      // Projected target state hash must equal live target state hash
+      expect(artifact.liveTargetStateHash).toBe(artifact.projectedTargetStateHash);
+      expect(artifact.readyForLiveApplyReview).toBe(true);
+    });
+
+    it('blocks recovery preview when live page has conflicting fingerprint', async () => {
+      const { dbPath, runId } = setupTestJournal('FAILED', 1);
+
+      const mockClient: any = {
+        users: { me: vi.fn().mockResolvedValue({ type: 'bot', bot: { workspace_id: 'ws-123' } }) },
+        dataSources: {
+          query: vi.fn().mockImplementation((params: any) => {
+            if (params.data_source_id === testEnv.NOTION_DS_TRANSACTIONS) {
+              return Promise.resolve({
+                results: [
+                  {
+                    id: 'page-conflicting-123',
+                    properties: {
+                      'Lançamento': { type: 'title', title: [{ text: { content: 'Valor Conflitante' }, plain_text: 'Valor Conflitante' }] },
+                      'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+                    },
+                  },
+                ],
+                has_more: false,
+                next_cursor: null,
+              });
+            }
+            return Promise.resolve({ results: [], has_more: false, next_cursor: null });
+          }),
+        },
+      };
+
+      const preflight = new BackfillLiveResumePreflight({
+        client: mockClient,
+        envVars: testEnv,
+        journalPath: dbPath,
+        runId,
+      });
+
+      const artifact = await preflight.executeResumePreflight();
+      expect(artifact.recoverableOperationsCount).toBe(0);
+      expect(artifact.reconciliationPreview[0].recoverable).toBe(false);
+      expect(artifact.readyForLiveApplyReview).toBe(false);
+      expect(artifact.reasons).toEqual(
+        expect.arrayContaining([expect.stringContaining('FAIL_RECOVERY_FINGERPRINT_MISMATCH')]),
+      );
+    });
+
+    it('blocks recovery preview when 0 stable identity matches found', async () => {
+      const { dbPath, runId } = setupTestJournal('FAILED', 1);
+
+      const mockClient: any = {
+        users: { me: vi.fn().mockResolvedValue({ type: 'bot', bot: { workspace_id: 'ws-123' } }) },
+        dataSources: {
+          query: vi.fn().mockResolvedValue({ results: [], has_more: false, next_cursor: null }),
+        },
+      };
+
+      const preflight = new BackfillLiveResumePreflight({
+        client: mockClient,
+        envVars: testEnv,
+        journalPath: dbPath,
+        runId,
+      });
+
+      const artifact = await preflight.executeResumePreflight();
+      expect(artifact.recoverableOperationsCount).toBe(0);
+      expect(artifact.reconciliationPreview[0].recoverable).toBe(false);
+      expect(artifact.readyForLiveApplyReview).toBe(false);
+      expect(artifact.reasons).toEqual(
+        expect.arrayContaining([expect.stringContaining('FAIL_RECOVERY_PAGE_NOT_FOUND')]),
+      );
+    });
+
+    it('blocks recovery preview when >1 stable identity matches found (duplicate)', async () => {
+      const { dbPath, runId } = setupTestJournal('FAILED', 1);
+
+      const mockClient: any = {
+        users: { me: vi.fn().mockResolvedValue({ type: 'bot', bot: { workspace_id: 'ws-123' } }) },
+        dataSources: {
+          query: vi.fn().mockImplementation((params: any) => {
+            if (params.data_source_id === testEnv.NOTION_DS_TRANSACTIONS) {
+              return Promise.resolve({
+                results: [
+                  {
+                    id: 'page-dup-1',
+                    properties: {
+                      'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+                    },
+                  },
+                  {
+                    id: 'page-dup-2',
+                    properties: {
+                      'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+                    },
+                  },
+                ],
+                has_more: false,
+                next_cursor: null,
+              });
+            }
+            return Promise.resolve({ results: [], has_more: false, next_cursor: null });
+          }),
+        },
+      };
+
+      const preflight = new BackfillLiveResumePreflight({
+        client: mockClient,
+        envVars: testEnv,
+        journalPath: dbPath,
+        runId,
+      });
+
+      const artifact = await preflight.executeResumePreflight();
+      expect(artifact.recoverableOperationsCount).toBe(0);
+      expect(artifact.reconciliationPreview[0].recoverable).toBe(false);
+      expect(artifact.readyForLiveApplyReview).toBe(false);
+      expect(artifact.reasons).toEqual(
+        expect.arrayContaining([expect.stringContaining('FAIL_RECOVERY_DUPLICATE')]),
+      );
+    });
+
+    it('validateResumePreflightBinding enforces cross-commit gates when run commit != recovery commit (Item 9)', () => {
+      const artifact: ResumePreflightArtifact = {
+        preflightVersion: '1.0.0',
+        type: 'RESUME_PREFLIGHT',
+        timestamp: new Date().toISOString(),
+        generatedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        ttlMinutes: 15,
+        runId: 'run-original-123',
+        runExecutorCommitSha: '5c973aaec44fd56428125c1cca24b770fa6f3ec9',
+        recoveryExecutorCommitSha: 'new-recovery-commit-456',
+        executorCommitSha: 'new-recovery-commit-456',
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
+        journalFingerprint: 'fp-123',
+        projectedTargetStateHash: 'hash-state',
+        liveTargetStateHash: 'hash-state',
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+        actorType: 'bot',
+        verifiedOperationsCount: 0,
+        recoverableOperationsCount: 1,
+        reconciliationPreview: [],
+        targets: { transactions: 1, bills: 0 },
+        readyForLiveApplyReview: true,
+        readyForApply: false,
+        reasons: [],
+      };
+
+      // Case 1: without cross-commit recovery gates -> fail
+      const resWithoutGate = validateResumePreflightBinding(artifact, {
+        runId: 'run-original-123',
+        journalFingerprint: 'fp-123',
+        projectedTargetStateHash: 'hash-state',
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+        envVars: {},
+      });
+      expect(resWithoutGate.valid).toBe(false);
+      expect(resWithoutGate.reason).toContain('FAIL_CROSS_COMMIT_RECOVERY_AUTHORIZATION');
+
+      // Case 2: with correct cross-commit recovery gates -> pass
+      const resWithGate = validateResumePreflightBinding(artifact, {
+        runId: 'run-original-123',
+        journalFingerprint: 'fp-123',
+        projectedTargetStateHash: 'hash-state',
+        workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
+        envVars: {
+          FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT: '5c973aaec44fd56428125c1cca24b770fa6f3ec9',
+          FINANCIAL_BACKFILL_RECOVERY_RUN_ID: 'run-original-123',
+        },
+      });
+      expect(resWithGate.valid).toBe(true);
     });
   });
 });

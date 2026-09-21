@@ -71,7 +71,9 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
 
   afterEach(() => {
     if (fs.existsSync(testTempDir)) {
-      fs.rmSync(testTempDir, { recursive: true, force: true });
+      try {
+        fs.rmSync(testTempDir, { recursive: true, force: true });
+      } catch {}
     }
   });
 
@@ -1517,6 +1519,8 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           expiresAt: expiresAt.toISOString(),
           ttlMinutes: 15,
           runId,
+          runExecutorCommitSha: currentCommit,
+          recoveryExecutorCommitSha: currentCommit,
           executorCommitSha: currentCommit,
           planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
           backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
@@ -1525,6 +1529,12 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
           actorType: 'bot',
           verifiedOperationsCount: 1,
+          recoverableOperationsCount: 0,
+          reconciliationPreview: [],
+          targets: {
+            transactions: 1,
+            bills: 0,
+          },
           readyForLiveApplyReview: true,
           readyForApply: false,
           journalFingerprint: originalFingerprint,
@@ -1598,6 +1608,8 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           expiresAt: expiresAt.toISOString(),
           ttlMinutes: 15,
           runId,
+          runExecutorCommitSha: currentCommit,
+          recoveryExecutorCommitSha: currentCommit,
           executorCommitSha: currentCommit,
           planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
           backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
@@ -1606,6 +1618,12 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
           workspaceIdentityHash: APPROVED_WORKSPACE_IDENTITY_HASH,
           actorType: 'bot',
           verifiedOperationsCount: 1,
+          recoverableOperationsCount: 0,
+          reconciliationPreview: [],
+          targets: {
+            transactions: 1,
+            bills: 0,
+          },
           readyForLiveApplyReview: true,
           readyForApply: false,
           journalFingerprint: currentFingerprint,
@@ -1638,6 +1656,167 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
 
         if (backupJournal) fs.writeFileSync(journalDbPath, backupJournal);
         else if (fs.existsSync(journalDbPath)) fs.unlinkSync(journalDbPath);
+      }
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 11. RECOVER-CANARY-ONLY MODE & AUDIT EVENT TRAIL (Items 10, 11, 14)
+  // ─────────────────────────────────────────────────────────────────────────────
+  describe('11. Recover-Canary-Only Mode & Audit Event Trail (Items 10, 11, 14)', () => {
+    function setupRecoveryEnvironment() {
+      const dbPath = path.join(testTempDir, 'recovery-journal.db');
+      const journal = new BackfillJournal(dbPath);
+      const runId = `run-recovery-test-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const origCommit = '5c973aaec44fd56428125c1cca24b770fa6f3ec9';
+
+      journal.startRun({
+        runId,
+        planHash: FROZEN_BACKFILL_PLAN_HASH,
+        planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        executorCommitSha: origCommit,
+        sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
+        targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
+        targetStateHash: FROZEN_TARGET_STATE_HASH,
+      });
+
+      journal.registerOperation({
+        runId,
+        operationIndex: 0,
+        stableId: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86',
+        stage: 'STAGE_1_PAGE_CREATION',
+        targetDataSource: 'NOTION_DS_TRANSACTIONS',
+        action: 'CREATE',
+        expectedPostFingerprint: 'b174467a107e377b81a27bee976f5a7a365a22d4ee3bf03b561cce4f4caab642',
+      });
+
+      journal.recordAttempt(runId, 0);
+      journal.recordFailed(runId, 0, 'FAIL_READ_BACK_FINGERPRINT_MISMATCH');
+
+      const mockAdapter: any = {
+        getMutationCount: vi.fn().mockReturnValue(0),
+        findByStableIdentity: vi.fn().mockResolvedValue([
+          {
+            id: 'page-live-recovery-3e2a',
+            properties: {
+              'Lançamento': { type: 'title', title: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+              'Fonte': { type: 'select', select: { name: 'Pierre' } },
+              'ID da fonte': { type: 'rich_text', rich_text: [{ text: { content: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }, plain_text: 'a2ce0416-1a27-4592-85be-bff2a9ce6f86' }] },
+              'Moeda': { type: 'select', select: { name: 'BRL' } },
+              'Hash Canônico': { type: 'rich_text', rich_text: [{ text: { content: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }, plain_text: '90a933ea5c9422db887d78c0d51f6c821822024b03e28c7b1e734d77df0f7ecb' }] },
+              'Data': { type: 'date', date: { start: '2026-05-02', end: null } },
+              'Valor': { type: 'number', number: 3.0 },
+              'Valor Bruto da Fonte': { type: 'number', number: -3.0 },
+              'Movimento': { type: 'select', select: { name: 'Saída' } },
+              'Natureza': { type: 'select', select: { name: 'Despesa' } },
+              'Efeito Orçamentário': { type: 'select', select: { name: 'Despesa' } },
+              'Propósito de Alocação': { type: 'select', select: { name: 'Caixa Operacional' } },
+              'Contribuição Meta Poupança': { type: 'number', number: 0 },
+              'Status': { type: 'select', select: { name: 'Confirmado' } },
+              'Status de Revisão': { type: 'select', select: { name: 'Confirmado Auto' } },
+              'Motivo da Revisão': { type: 'rich_text', rich_text: [] },
+              'Categoria Pierre': { type: 'rich_text', rich_text: [{ text: { content: 'Serviços digitais' }, plain_text: 'Serviços digitais' }] },
+              'Descrição original': { type: 'rich_text', rich_text: [{ text: { content: 'Pinggy.Io' }, plain_text: 'Pinggy.Io' }] },
+              'HMAC Contraparte': { type: 'rich_text', rich_text: [{ text: { content: '[OFUSCADO]' }, plain_text: '[OFUSCADO]' }] },
+              'Conta': { type: 'relation', relation: [{ id: '3d8a3ece-fa49-8112-9399-c960be4f604a' }] },
+              'Categoria': { type: 'relation', relation: [{ id: '3d7a3ece-fa49-81c9-955f-e26660d01670' }] },
+              'Conta Destino': { type: 'relation', relation: [] },
+              'Fatura Vinculada': { type: 'relation', relation: [] },
+            },
+          },
+        ]),
+      };
+
+      const currentJournalFp = calculateJournalFingerprint(journal, runId);
+      const preflightArtifact: any = {
+        journalFingerprint: currentJournalFp,
+      };
+
+      return { journal, dbPath, runId, origCommit, mockAdapter, preflightArtifact };
+    }
+
+    it('rejects cross-commit recovery without gates with 0 journal mutations (Item 9 & 14)', async () => {
+      const { journal, dbPath, runId, origCommit, mockAdapter, preflightArtifact } = setupRecoveryEnvironment();
+
+      try {
+        const newCommit = 'new-commit-head-789';
+        const executor = new BackfillExecutor({
+          adapter: mockAdapter,
+          journal,
+          commitSha: newCommit,
+          envVars: {
+            ...testEnv,
+            // Missing FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT and FINANCIAL_BACKFILL_RECOVERY_RUN_ID
+          },
+        });
+
+        await expect(
+          executor.executeRecoverCanaryOnly(runId, preflightArtifact),
+        ).rejects.toThrow(/FAIL_CROSS_COMMIT_RECOVERY_AUTHORIZATION/);
+
+        // Verify journal operation 0 is still FAILED (0 journal mutations)
+        const op0 = journal.getOperation(runId, 0);
+        expect(op0?.status).toBe('FAILED');
+        expect(mockAdapter.getMutationCount()).toBe(0);
+      } finally {
+        journal.close();
+      }
+    });
+
+    it('successfully executes recover-canary-only: 0 Notion writes, operation VERIFIED, run PAUSED_AFTER_CANARY, does not continue op #1, preserves event audit trail', async () => {
+      const { journal, dbPath, runId, origCommit, mockAdapter, preflightArtifact } = setupRecoveryEnvironment();
+
+      try {
+        const newCommit = 'new-commit-head-789';
+        const executor = new BackfillExecutor({
+          adapter: mockAdapter,
+          journal,
+          commitSha: newCommit,
+          envVars: {
+            ...testEnv,
+            FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT: origCommit,
+            FINANCIAL_BACKFILL_RECOVERY_RUN_ID: runId,
+          },
+        });
+
+        const report = await executor.executeRecoverCanaryOnly(runId, preflightArtifact);
+
+        // 1. Mandatory execution metrics
+        expect(report.status).toBe('PAUSED_AFTER_CANARY');
+        expect(report.createHttpAttempts).toBe(0);
+        expect(report.relationPatchHttpAttempts).toBe(0);
+        expect(report.liveNotionMutations).toBe(0);
+        expect(report.pagesCreatedDuringRecovery).toBe(0);
+        expect(mockAdapter.getMutationCount()).toBe(0);
+
+        // 2. Journal status updated for Op 0
+        const op0 = journal.getOperation(runId, 0);
+        expect(op0?.status).toBe('VERIFIED');
+        expect(op0?.targetPageId).toBe('page-live-recovery-3e2a');
+        expect(op0?.errorSanitized).toBeNull();
+
+        // 3. Run status updated to PAUSED_AFTER_CANARY
+        const run = journal.getRun(runId);
+        expect(run?.status).toBe('PAUSED_AFTER_CANARY');
+
+        // 4. Operation #1 not started
+        const op1 = journal.getOperation(runId, 1);
+        expect(op1).toBeNull();
+
+        // 5. Page mapping saved
+        const mapping = journal.getPageMapping(FROZEN_BACKFILL_PLAN_HASH, 'a2ce0416-1a27-4592-85be-bff2a9ce6f86');
+        expect(mapping?.notionPageId).toBe('page-live-recovery-3e2a');
+
+        // 6. Audit event trail in backfill_operation_events table
+        const events = journal.getOperationEvents(runId);
+        expect(events.length).toBe(1);
+        expect(events[0].operationIndex).toBe(0);
+        expect(events[0].previousStatus).toBe('FAILED');
+        expect(events[0].newStatus).toBe('VERIFIED');
+        expect(events[0].reasonCode).toBe('RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX');
+        expect(events[0].executorCommitSha).toBe(newCommit);
+      } finally {
+        journal.close();
       }
     });
   });

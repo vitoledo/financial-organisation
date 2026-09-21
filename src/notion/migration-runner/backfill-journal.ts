@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 
 export type BackfillRunStatus = 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'PAUSED_AFTER_CANARY';
@@ -47,6 +48,17 @@ export interface BackfillPageMapRecord {
   notionPageId: string;
   targetDataSource: string;
   createdAt: string;
+}
+
+export interface BackfillOperationEventRecord {
+  id?: number;
+  runId: string;
+  operationIndex: number;
+  timestamp: string;
+  previousStatus: string;
+  newStatus: string;
+  reasonCode: string;
+  executorCommitSha: string;
 }
 
 export class BackfillJournal {
@@ -124,6 +136,21 @@ export class BackfillJournal {
         created_at TEXT NOT NULL,
         PRIMARY KEY (plan_hash, stable_id)
       );
+
+      CREATE TABLE IF NOT EXISTS backfill_operation_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        operation_index INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        previous_status TEXT NOT NULL,
+        new_status TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        executor_commit_sha TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES backfill_runs(run_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_backfill_events_run_op
+        ON backfill_operation_events (run_id, operation_index);
     `);
   }
 
@@ -311,6 +338,78 @@ export class BackfillJournal {
     stmt.run(errorSanitized, runId, operationIndex);
   }
 
+  public recordOperationEvent(event: {
+    runId: string;
+    operationIndex: number;
+    previousStatus: string;
+    newStatus: string;
+    reasonCode: string;
+    executorCommitSha: string;
+    timestamp?: string;
+  }): void {
+    const timestamp = event.timestamp || new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO backfill_operation_events (
+          run_id, operation_index, timestamp, previous_status, new_status, reason_code, executor_commit_sha
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.runId,
+        event.operationIndex,
+        timestamp,
+        event.previousStatus,
+        event.newStatus,
+        event.reasonCode,
+        event.executorCommitSha,
+      );
+  }
+
+  public getOperationEvents(runId: string): BackfillOperationEventRecord[] {
+    return this.db
+      .prepare(
+        `SELECT id, run_id as runId, operation_index as operationIndex, timestamp,
+                previous_status as previousStatus, new_status as newStatus,
+                reason_code as reasonCode, executor_commit_sha as executorCommitSha
+         FROM backfill_operation_events
+         WHERE run_id = ?
+         ORDER BY id ASC`,
+      )
+      .all(runId) as BackfillOperationEventRecord[];
+  }
+
+  public recordRecoveredVerified(
+    runId: string,
+    operationIndex: number,
+    targetPageId: string,
+    executorCommitSha: string,
+    reasonCode: string = 'RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX',
+  ): void {
+    const currentOp = this.getOperation(runId, operationIndex);
+    const previousStatus = currentOp?.status || 'FAILED';
+
+    this.recordOperationEvent({
+      runId,
+      operationIndex,
+      previousStatus,
+      newStatus: 'VERIFIED',
+      reasonCode,
+      executorCommitSha,
+    });
+
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE backfill_operations
+         SET status = 'VERIFIED',
+             target_page_id = ?,
+             last_attempt_at = ?,
+             error_sanitized = NULL
+         WHERE run_id = ? AND operation_index = ?`,
+      )
+      .run(targetPageId, nowIso, runId, operationIndex);
+  }
+
   public getOperation(runId: string, operationIndex: number): BackfillOperationRecord | null {
     const row = this.db
       .prepare('SELECT * FROM backfill_operations WHERE run_id = ? AND operation_index = ?')
@@ -494,4 +593,30 @@ export class BackfillJournal {
       // ignore
     }
   }
+}
+
+/**
+ * Computes a deterministic SHA-256 fingerprint representing the journal's operations state.
+ * Strengthened to include all operations (action, status, attempts, targetPageId, expectedPostFingerprint, errorSanitized).
+ * Sensitive financial stable IDs are strictly excluded.
+ */
+export function calculateJournalFingerprint(journal: BackfillJournal, runId: string): string {
+  const ops = journal.getOperations(runId);
+  const sorted = [...ops].sort((a, b) => a.operationIndex - b.operationIndex);
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify(
+        sorted.map((o) => [
+          o.operationIndex,
+          o.action,
+          o.status,
+          o.attempts,
+          o.targetPageId,
+          o.expectedPostFingerprint,
+          o.errorSanitized || null,
+        ]),
+      ),
+    )
+    .digest('hex');
 }
