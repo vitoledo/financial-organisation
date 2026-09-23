@@ -1206,17 +1206,7 @@ export class BackfillLiveResumePreflight {
 
     const journalFingerprint = calculateJournalFingerprint(journal, run.runId);
 
-    // 4. Project expected state incorporating preview-recoverable operations
-    const projectedExpectedState = projectExpectedBackfillState(
-      frozenBases,
-      plan,
-      journal,
-      run.runId,
-      recoverableOps,
-    );
-    const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
-
-    // 5. Query live Notion state
+    // 4. Query live Notion state
     let liveTargetBases: Record<string, BaseSnapshotData> = {};
     try {
       liveTargetBases = await liveAdapter.queryTargetState();
@@ -1224,6 +1214,51 @@ export class BackfillLiveResumePreflight {
       throw new Error(`FAIL_LIVE_TARGET_READ: Falha ao ler bases live para resume: ${err.message}`);
     }
 
+    // 5. Project expected state incorporating verified operations and preview-recoverable operations
+    const projectedExpectedState: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(frozenBases));
+    const allExpectedOps = [...verifiedOps, ...recoverableOps];
+
+    for (const opRec of allExpectedOps) {
+      if (opRec.action === 'CREATE' && opRec.targetPageId) {
+        const planOp = plan.operations[opRec.operationIndex];
+        if (!planOp) continue;
+        const targetEnvKey = planOp.targetDataSource.envKey;
+        const targetBase = projectedExpectedState[targetEnvKey];
+
+        const liveRecord = liveTargetBases[targetEnvKey]?.records.find((r) => r.id === opRec.targetPageId);
+        if (liveRecord && targetBase) {
+          if (!targetBase.records.some((r) => r.id === liveRecord.id)) {
+            targetBase.records.push(JSON.parse(JSON.stringify(liveRecord)));
+            targetBase.recordCount = targetBase.records.length;
+          }
+        }
+
+        // Update dual relations on target database records (e.g. Categoria."Transações")
+        for (const [relProp, refList] of Object.entries(planOp.relations)) {
+          const contractProp = findPropertyContract(targetEnvKey, relProp);
+          const targetDs = contractProp?.relationTargetEnvKey;
+          if (targetDs && projectedExpectedState[targetDs]) {
+            for (const ref of refList) {
+              if (ref.type === 'EXISTING_PAGE_ID') {
+                const targetRec = projectedExpectedState[targetDs].records.find((r) => r.id === ref.target);
+                if (targetRec) {
+                  for (const [propName, propVal] of Object.entries(targetRec.properties)) {
+                    if (propName === 'Transações' || propName === 'Lançamentos' || propName === 'Itens') {
+                      const curVal = Array.isArray(propVal) ? propVal : [];
+                      if (!curVal.includes(opRec.targetPageId)) {
+                        targetRec.properties[propName] = [...curVal, opRec.targetPageId].sort();
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const projectedTargetStateHash = calculateTargetStateHash(projectedExpectedState);
     const liveTargetStateHash = calculateTargetStateHash(liveTargetBases);
 
     // 6. Compare actual live with projected expected

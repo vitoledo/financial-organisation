@@ -589,6 +589,8 @@ describe('Phase 2C: Real Read-Only Live Preflight and Production Wiring', { time
           },
         ]);
         testJournal.close();
+        const cat = projected['NOTION_DS_CATEGORIES'].records.find((r) => r.id === '3d7a3ece-fa49-81c9-955f-e26660d01670');
+        if (cat) cat.properties['Transações'] = ['page-recovered-123'];
         return projected;
       });
 
