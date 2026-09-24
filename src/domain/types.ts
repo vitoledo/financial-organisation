@@ -604,6 +604,7 @@ export interface TransactionDomainEntity {
   allocationPurpose?: AllocationPurpose;
   savingsGoalContribution?: Money;
   accountRelationId?: string;
+  destinationAccountRelationId?: string;
   categoryRelationId?: string;
   billRelationId?: string;
   bankStatus: TransactionBankStatus;
@@ -618,14 +619,28 @@ export interface TransactionDomainEntity {
 // CREDIT CARD BILL DOMAIN MODEL (MULTIPLE PAYMENTS & ADDITIONAL COMPONENTS)
 // =============================================================================
 
+export type BillSource = 'PIERRE' | 'MANUAL' | 'MIGRATION' | 'OTHER';
+export type BillIdentityQuality = 'SOURCE_ID' | 'PERIOD_FALLBACK';
+export type BillValueQuality = 'UPSTREAM_OFFICIAL' | 'UPSTREAM_APPROXIMATE' | 'DERIVED' | 'MANUAL';
+
 export interface CardBill {
   id?: string;
   accountId: string;
+  source?: BillSource;
+  sourceBillId?: string;
+  stableBillId?: string;
+  identityQuality?: BillIdentityQuality;
+  currency?: string;
+  periodStart?: string;
+  periodEnd?: string;
   cycleType: CycleType;
+  valueQuality?: BillValueQuality;
   status: BillStatus;
   closingDate?: string;
   dueDate: string;
-  rawBillAmount: Money;
+  officialClosedBillAmount?: Money | null;
+  estimatedOpenBillAmount?: Money;
+  rawBillAmount?: Money;
   purchasesTotal: Money;
   /**
    * Sum of identified additional components on the statement (e.g. previous purchase installments,

@@ -1,0 +1,965 @@
+{
+  "NOTION_DS_ACCOUNTS": {
+    "Limite contratado": {
+      "name": "Limite contratado",
+      "type": "number"
+    },
+    "Ativa": {
+      "name": "Ativa",
+      "type": "checkbox"
+    },
+    "Atualizado em": {
+      "name": "Atualizado em",
+      "type": "date"
+    },
+    "Moeda": {
+      "name": "Moeda",
+      "type": "select",
+      "selectOptions": [
+        "BRL",
+        "USD",
+        "Outra"
+      ]
+    },
+    "Saldo": {
+      "name": "Saldo",
+      "type": "number"
+    },
+    "Inclui no caixa": {
+      "name": "Inclui no caixa",
+      "type": "checkbox"
+    },
+    "Tipo": {
+      "name": "Tipo",
+      "type": "select",
+      "selectOptions": [
+        "Conta corrente",
+        "Cartão de crédito",
+        "Carteira",
+        "Corretora",
+        "Dinheiro",
+        "Outro"
+      ]
+    },
+    "Limite personalizado": {
+      "name": "Limite personalizado",
+      "type": "number"
+    },
+    "Fonte": {
+      "name": "Fonte",
+      "type": "select",
+      "selectOptions": [
+        "Pierre",
+        "Manual",
+        "Outra"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Limite disponível": {
+      "name": "Limite disponível",
+      "type": "number"
+    },
+    "Instituição": {
+      "name": "Instituição",
+      "type": "rich_text"
+    },
+    "ID da fonte": {
+      "name": "ID da fonte",
+      "type": "rich_text"
+    },
+    "Inclui no patrimônio": {
+      "name": "Inclui no patrimônio",
+      "type": "checkbox"
+    },
+    "Conta": {
+      "name": "Conta",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_TRANSACTIONS": {
+    "Categoria Pierre": {
+      "name": "Categoria Pierre",
+      "type": "rich_text"
+    },
+    "Descrição original": {
+      "name": "Descrição original",
+      "type": "rich_text"
+    },
+    "Valor": {
+      "name": "Valor",
+      "type": "number"
+    },
+    "Fonte": {
+      "name": "Fonte",
+      "type": "select",
+      "selectOptions": [
+        "Pierre",
+        "Manual",
+        "Migração",
+        "Outra"
+      ]
+    },
+    "Conta no orçamento": {
+      "name": "Conta no orçamento",
+      "type": "checkbox"
+    },
+    "ID da fonte": {
+      "name": "ID da fonte",
+      "type": "rich_text"
+    },
+    "Conta": {
+      "name": "Conta",
+      "type": "relation",
+      "relationDataSourceId": "a17455aa-4793-4001-9570-21b7f84ff4a2",
+      "relationDatabaseId": "ff3a0886-5d00-427a-aad2-7d22d831de2b",
+      "relationType": "single_property"
+    },
+    "Conta como aporte": {
+      "name": "Conta como aporte",
+      "type": "checkbox"
+    },
+    "Revisado": {
+      "name": "Revisado",
+      "type": "checkbox"
+    },
+    "Natureza": {
+      "name": "Natureza",
+      "type": "select",
+      "selectOptions": [
+        "Receita",
+        "Despesa",
+        "Transferência interna",
+        "Aporte",
+        "Resgate",
+        "Reembolso",
+        "Pagamento de fatura",
+        "Ajuste"
+      ]
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Pendente",
+        "Confirmado",
+        "Cancelado"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Movimento": {
+      "name": "Movimento",
+      "type": "select",
+      "selectOptions": [
+        "Entrada",
+        "Saída"
+      ]
+    },
+    "Data": {
+      "name": "Data",
+      "type": "date"
+    },
+    "Moeda": {
+      "name": "Moeda",
+      "type": "select",
+      "selectOptions": [
+        "BRL",
+        "USD",
+        "Outra"
+      ]
+    },
+    "Categoria": {
+      "name": "Categoria",
+      "type": "relation",
+      "relationDataSourceId": "eb8ef2e3-cfd3-437e-b3f5-6a47dec913b4",
+      "relationDatabaseId": "8dd6c1dc-edf8-4759-bee2-4ed6e142e5de",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Transações"
+    },
+    "Lançamento": {
+      "name": "Lançamento",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_CATEGORIES": {
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Natureza padrão": {
+      "name": "Natureza padrão",
+      "type": "select",
+      "selectOptions": [
+        "Receita",
+        "Despesa",
+        "Patrimonial",
+        "Mista"
+      ]
+    },
+    "Contas fixas": {
+      "name": "Contas fixas",
+      "type": "relation",
+      "relationDataSourceId": "49e909f9-7a08-4114-bc85-0bb500e3dfb9",
+      "relationDatabaseId": "238d111d-f9fd-43a0-876e-72f900b4ba98",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Categoria"
+    },
+    "Variabilidade": {
+      "name": "Variabilidade",
+      "type": "select",
+      "selectOptions": [
+        "Fixa",
+        "Variável",
+        "N/A"
+      ]
+    },
+    "Ativa": {
+      "name": "Ativa",
+      "type": "checkbox"
+    },
+    "Conta no orçamento": {
+      "name": "Conta no orçamento",
+      "type": "checkbox"
+    },
+    "Transações": {
+      "name": "Transações",
+      "type": "relation",
+      "relationDataSourceId": "1fc274bd-b73a-45b1-a902-09aba993f199",
+      "relationDatabaseId": "64256754-5681-41c0-a902-85f6092a2729",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Categoria"
+    },
+    "Grupo": {
+      "name": "Grupo",
+      "type": "select",
+      "selectOptions": [
+        "Necessidade",
+        "Desejo",
+        "Poupança/Investimento",
+        "Fora do orçamento"
+      ]
+    },
+    "Categoria": {
+      "name": "Categoria",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_RULES": {
+    "Válida de": {
+      "name": "Válida de",
+      "type": "date"
+    },
+    "Tolerância": {
+      "name": "Tolerância",
+      "type": "number"
+    },
+    "Válida até": {
+      "name": "Válida até",
+      "type": "date"
+    },
+    "Prioridade": {
+      "name": "Prioridade",
+      "type": "number"
+    },
+    "Descrição contém": {
+      "name": "Descrição contém",
+      "type": "rich_text"
+    },
+    "Conta como aporte": {
+      "name": "Conta como aporte",
+      "type": "checkbox"
+    },
+    "Valor máximo": {
+      "name": "Valor máximo",
+      "type": "number"
+    },
+    "Contraparte contém": {
+      "name": "Contraparte contém",
+      "type": "rich_text"
+    },
+    "Conta no orçamento": {
+      "name": "Conta no orçamento",
+      "type": "checkbox"
+    },
+    "Destino / contexto": {
+      "name": "Destino / contexto",
+      "type": "rich_text"
+    },
+    "Auto aplicar": {
+      "name": "Auto aplicar",
+      "type": "checkbox"
+    },
+    "Conta origem": {
+      "name": "Conta origem",
+      "type": "relation",
+      "relationDataSourceId": "a17455aa-4793-4001-9570-21b7f84ff4a2",
+      "relationDatabaseId": "ff3a0886-5d00-427a-aad2-7d22d831de2b",
+      "relationType": "single_property"
+    },
+    "Valor exato": {
+      "name": "Valor exato",
+      "type": "number"
+    },
+    "Movimento esperado": {
+      "name": "Movimento esperado",
+      "type": "select",
+      "selectOptions": [
+        "Entrada",
+        "Saída",
+        "Qualquer"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Categoria Pierre": {
+      "name": "Categoria Pierre",
+      "type": "rich_text"
+    },
+    "Dia mínimo": {
+      "name": "Dia mínimo",
+      "type": "number"
+    },
+    "Exigir revisão": {
+      "name": "Exigir revisão",
+      "type": "checkbox"
+    },
+    "Categoria resultante": {
+      "name": "Categoria resultante",
+      "type": "relation",
+      "relationDataSourceId": "eb8ef2e3-cfd3-437e-b3f5-6a47dec913b4",
+      "relationDatabaseId": "8dd6c1dc-edf8-4759-bee2-4ed6e142e5de",
+      "relationType": "single_property"
+    },
+    "Ativa": {
+      "name": "Ativa",
+      "type": "checkbox"
+    },
+    "Tipo": {
+      "name": "Tipo",
+      "type": "select",
+      "selectOptions": [
+        "Contraparte + valor",
+        "Contraparte",
+        "Descrição",
+        "Categoria Pierre",
+        "Conta",
+        "Personalizada"
+      ]
+    },
+    "Dia máximo": {
+      "name": "Dia máximo",
+      "type": "number"
+    },
+    "Natureza resultante": {
+      "name": "Natureza resultante",
+      "type": "select",
+      "selectOptions": [
+        "Receita",
+        "Despesa",
+        "Transferência interna",
+        "Aporte",
+        "Resgate",
+        "Reembolso",
+        "Pagamento de fatura",
+        "Ajuste"
+      ]
+    },
+    "Valor mínimo": {
+      "name": "Valor mínimo",
+      "type": "number"
+    },
+    "Regra": {
+      "name": "Regra",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_FIXED_BILLS": {
+    "Ativa": {
+      "name": "Ativa",
+      "type": "checkbox"
+    },
+    "Valor esperado": {
+      "name": "Valor esperado",
+      "type": "number"
+    },
+    "Dia do vencimento": {
+      "name": "Dia do vencimento",
+      "type": "number"
+    },
+    "Gerar obrigação": {
+      "name": "Gerar obrigação",
+      "type": "checkbox"
+    },
+    "Categoria": {
+      "name": "Categoria",
+      "type": "relation",
+      "relationDataSourceId": "eb8ef2e3-cfd3-437e-b3f5-6a47dec913b4",
+      "relationDatabaseId": "8dd6c1dc-edf8-4759-bee2-4ed6e142e5de",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Contas fixas"
+    },
+    "Conta padrão": {
+      "name": "Conta padrão",
+      "type": "relation",
+      "relationDataSourceId": "a17455aa-4793-4001-9570-21b7f84ff4a2",
+      "relationDatabaseId": "ff3a0886-5d00-427a-aad2-7d22d831de2b",
+      "relationType": "single_property"
+    },
+    "Tolerância de valor": {
+      "name": "Tolerância de valor",
+      "type": "number"
+    },
+    "Forma de pagamento": {
+      "name": "Forma de pagamento",
+      "type": "select",
+      "selectOptions": [
+        "Cartão",
+        "Débito",
+        "Pix",
+        "Boleto",
+        "Débito automático",
+        "Outro"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Periodicidade": {
+      "name": "Periodicidade",
+      "type": "select",
+      "selectOptions": [
+        "Mensal",
+        "Bimestral",
+        "Trimestral",
+        "Semestral",
+        "Anual"
+      ]
+    },
+    "Regra de identificação": {
+      "name": "Regra de identificação",
+      "type": "rich_text"
+    },
+    "Conta fixa": {
+      "name": "Conta fixa",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_MONTHLY_OBLIGATIONS": {
+    "Valor pago": {
+      "name": "Valor pago",
+      "type": "number"
+    },
+    "Valor previsto": {
+      "name": "Valor previsto",
+      "type": "number"
+    },
+    "Conta fixa": {
+      "name": "Conta fixa",
+      "type": "relation",
+      "relationDataSourceId": "49e909f9-7a08-4114-bc85-0bb500e3dfb9",
+      "relationDatabaseId": "238d111d-f9fd-43a0-876e-72f900b4ba98",
+      "relationType": "single_property"
+    },
+    "Validado automaticamente": {
+      "name": "Validado automaticamente",
+      "type": "checkbox"
+    },
+    "Referência": {
+      "name": "Referência",
+      "type": "date"
+    },
+    "Conta": {
+      "name": "Conta",
+      "type": "relation",
+      "relationDataSourceId": "a17455aa-4793-4001-9570-21b7f84ff4a2",
+      "relationDatabaseId": "ff3a0886-5d00-427a-aad2-7d22d831de2b",
+      "relationType": "single_property"
+    },
+    "Transação conciliada": {
+      "name": "Transação conciliada",
+      "type": "relation",
+      "relationDataSourceId": "1fc274bd-b73a-45b1-a902-09aba993f199",
+      "relationDatabaseId": "64256754-5681-41c0-a902-85f6092a2729",
+      "relationType": "single_property"
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Prevista",
+        "Pendente",
+        "Paga",
+        "Atrasada",
+        "Dispensada"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Vencimento": {
+      "name": "Vencimento",
+      "type": "date"
+    },
+    "Pago em": {
+      "name": "Pago em",
+      "type": "date"
+    },
+    "Origem": {
+      "name": "Origem",
+      "type": "select",
+      "selectOptions": [
+        "Rotina",
+        "Manual",
+        "Pierre"
+      ]
+    },
+    "Obrigação": {
+      "name": "Obrigação",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_INVESTMENTS": {
+    "Liquidez": {
+      "name": "Liquidez",
+      "type": "rich_text"
+    },
+    "Custo acumulado": {
+      "name": "Custo acumulado",
+      "type": "number"
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Quantidade": {
+      "name": "Quantidade",
+      "type": "number"
+    },
+    "Valor atual": {
+      "name": "Valor atual",
+      "type": "number"
+    },
+    "Moeda": {
+      "name": "Moeda",
+      "type": "select",
+      "selectOptions": [
+        "BRL",
+        "USD",
+        "Outra"
+      ]
+    },
+    "Data da avaliação": {
+      "name": "Data da avaliação",
+      "type": "date"
+    },
+    "Movimentações": {
+      "name": "Movimentações",
+      "type": "relation",
+      "relationDataSourceId": "b19f56a4-e34f-42ec-9437-c5165b8725af",
+      "relationDatabaseId": "1478fff3-d2f7-4547-95d6-c1f8b0029d91",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Ativo"
+    },
+    "Inclui no patrimônio": {
+      "name": "Inclui no patrimônio",
+      "type": "checkbox"
+    },
+    "ID da fonte": {
+      "name": "ID da fonte",
+      "type": "rich_text"
+    },
+    "Instituição": {
+      "name": "Instituição",
+      "type": "rich_text"
+    },
+    "Classe": {
+      "name": "Classe",
+      "type": "select",
+      "selectOptions": [
+        "Cripto",
+        "Renda fixa",
+        "Ações",
+        "FIIs",
+        "ETFs",
+        "Fundos",
+        "Caixa",
+        "Outro"
+      ]
+    },
+    "Fonte do preço": {
+      "name": "Fonte do preço",
+      "type": "select",
+      "selectOptions": [
+        "Pierre",
+        "Mercado",
+        "Manual",
+        "Outra"
+      ]
+    },
+    "Ativo": {
+      "name": "Ativo",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_INVESTMENT_MOVEMENTS": {
+    "Moeda": {
+      "name": "Moeda",
+      "type": "select",
+      "selectOptions": [
+        "BRL",
+        "USD",
+        "Outra"
+      ]
+    },
+    "Valor": {
+      "name": "Valor",
+      "type": "number"
+    },
+    "Tipo": {
+      "name": "Tipo",
+      "type": "select",
+      "selectOptions": [
+        "Aporte",
+        "Compra",
+        "Venda",
+        "Rendimento",
+        "Resgate",
+        "Taxa",
+        "Transferência",
+        "Ajuste"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "ID da fonte": {
+      "name": "ID da fonte",
+      "type": "rich_text"
+    },
+    "Fonte": {
+      "name": "Fonte",
+      "type": "select",
+      "selectOptions": [
+        "Pierre",
+        "Manual",
+        "Migração",
+        "Outra"
+      ]
+    },
+    "Data": {
+      "name": "Data",
+      "type": "date"
+    },
+    "Custos e taxas": {
+      "name": "Custos e taxas",
+      "type": "number"
+    },
+    "Ativo": {
+      "name": "Ativo",
+      "type": "relation",
+      "relationDataSourceId": "db609202-8cb8-4ce9-8dd7-c01d9de6b6cb",
+      "relationDatabaseId": "3da3400f-4016-4268-ad94-b3fdddc320ac",
+      "relationType": "dual_property",
+      "syncedPropertyName": "Movimentações"
+    },
+    "Quantidade": {
+      "name": "Quantidade",
+      "type": "number"
+    },
+    "Transação origem": {
+      "name": "Transação origem",
+      "type": "relation",
+      "relationDataSourceId": "1fc274bd-b73a-45b1-a902-09aba993f199",
+      "relationDatabaseId": "64256754-5681-41c0-a902-85f6092a2729",
+      "relationType": "single_property"
+    },
+    "Conta origem": {
+      "name": "Conta origem",
+      "type": "relation",
+      "relationDataSourceId": "a17455aa-4793-4001-9570-21b7f84ff4a2",
+      "relationDatabaseId": "ff3a0886-5d00-427a-aad2-7d22d831de2b",
+      "relationType": "single_property"
+    },
+    "Preço unitário": {
+      "name": "Preço unitário",
+      "type": "number"
+    },
+    "Movimentação": {
+      "name": "Movimentação",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_MONTHLY_BUDGET": {
+    "Teto pessoal de crédito": {
+      "name": "Teto pessoal de crédito",
+      "type": "number"
+    },
+    "Necessidades planejadas": {
+      "name": "Necessidades planejadas",
+      "type": "number"
+    },
+    "Renda planejada": {
+      "name": "Renda planejada",
+      "type": "number"
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Planejando",
+        "Ativo",
+        "Fechado"
+      ]
+    },
+    "Referência": {
+      "name": "Referência",
+      "type": "date"
+    },
+    "Aporte planejado": {
+      "name": "Aporte planejado",
+      "type": "number"
+    },
+    "Meta de poupança %": {
+      "name": "Meta de poupança %",
+      "type": "number"
+    },
+    "Reserva operacional": {
+      "name": "Reserva operacional",
+      "type": "number"
+    },
+    "Desejos planejados": {
+      "name": "Desejos planejados",
+      "type": "number"
+    },
+    "Mês": {
+      "name": "Mês",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_FINANCIAL_GOALS": {
+    "Aporte mensal planejado": {
+      "name": "Aporte mensal planejado",
+      "type": "number"
+    },
+    "Tipo": {
+      "name": "Tipo",
+      "type": "select",
+      "selectOptions": [
+        "Reserva de emergência",
+        "Compra",
+        "Viagem",
+        "Investimento",
+        "Quitação",
+        "Outro"
+      ]
+    },
+    "Prazo": {
+      "name": "Prazo",
+      "type": "date"
+    },
+    "Liquidez necessária": {
+      "name": "Liquidez necessária",
+      "type": "select",
+      "selectOptions": [
+        "Imediata",
+        "Curta",
+        "Média",
+        "Longa"
+      ]
+    },
+    "Valor alvo": {
+      "name": "Valor alvo",
+      "type": "number"
+    },
+    "Valor atual": {
+      "name": "Valor atual",
+      "type": "number"
+    },
+    "Prioridade": {
+      "name": "Prioridade",
+      "type": "select",
+      "selectOptions": [
+        "Alta",
+        "Média",
+        "Baixa"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Planejada",
+        "Em andamento",
+        "Concluída",
+        "Pausada"
+      ]
+    },
+    "Meta": {
+      "name": "Meta",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_MONTHLY_CLOSINGS": {
+    "Reconciliação OK": {
+      "name": "Reconciliação OK",
+      "type": "checkbox"
+    },
+    "Receitas": {
+      "name": "Receitas",
+      "type": "number"
+    },
+    "Fechado em": {
+      "name": "Fechado em",
+      "type": "date"
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Aberto",
+        "Em revisão",
+        "Fechado"
+      ]
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Aportes": {
+      "name": "Aportes",
+      "type": "number"
+    },
+    "Saldo livre final": {
+      "name": "Saldo livre final",
+      "type": "number"
+    },
+    "Itens para revisão": {
+      "name": "Itens para revisão",
+      "type": "number"
+    },
+    "Patrimônio final": {
+      "name": "Patrimônio final",
+      "type": "number"
+    },
+    "Qualidade dos dados": {
+      "name": "Qualidade dos dados",
+      "type": "select",
+      "selectOptions": [
+        "Alta",
+        "Média",
+        "Baixa"
+      ]
+    },
+    "Referência": {
+      "name": "Referência",
+      "type": "date"
+    },
+    "Fatura em aberto": {
+      "name": "Fatura em aberto",
+      "type": "number"
+    },
+    "Contas fixas pendentes": {
+      "name": "Contas fixas pendentes",
+      "type": "number"
+    },
+    "Contas fixas pagas": {
+      "name": "Contas fixas pagas",
+      "type": "number"
+    },
+    "Despesas": {
+      "name": "Despesas",
+      "type": "number"
+    },
+    "Fechamento": {
+      "name": "Fechamento",
+      "type": "title"
+    }
+  },
+  "NOTION_DS_SYNC_LOG": {
+    "Freshness da fonte": {
+      "name": "Freshness da fonte",
+      "type": "date"
+    },
+    "Status": {
+      "name": "Status",
+      "type": "select",
+      "selectOptions": [
+        "Executando",
+        "Sucesso",
+        "Parcial",
+        "Erro"
+      ]
+    },
+    "Fonte": {
+      "name": "Fonte",
+      "type": "select",
+      "selectOptions": [
+        "Pierre",
+        "Migração",
+        "Manual"
+      ]
+    },
+    "Transações novas": {
+      "name": "Transações novas",
+      "type": "number"
+    },
+    "Parcelas recebidas": {
+      "name": "Parcelas recebidas",
+      "type": "number"
+    },
+    "Transações atualizadas": {
+      "name": "Transações atualizadas",
+      "type": "number"
+    },
+    "Pendências de revisão": {
+      "name": "Pendências de revisão",
+      "type": "number"
+    },
+    "Observações": {
+      "name": "Observações",
+      "type": "rich_text"
+    },
+    "Erro / alerta": {
+      "name": "Erro / alerta",
+      "type": "rich_text"
+    },
+    "Concluída em": {
+      "name": "Concluída em",
+      "type": "date"
+    },
+    "Contas recebidas": {
+      "name": "Contas recebidas",
+      "type": "number"
+    },
+    "Transações recebidas": {
+      "name": "Transações recebidas",
+      "type": "number"
+    },
+    "Iniciada em": {
+      "name": "Iniciada em",
+      "type": "date"
+    },
+    "Execução": {
+      "name": "Execução",
+      "type": "title"
+    }
+  }
+}
