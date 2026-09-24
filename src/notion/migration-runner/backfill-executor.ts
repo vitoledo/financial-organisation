@@ -64,6 +64,8 @@ export interface BackfillExecutorOptions {
   canary?: number;
   resumeRunId?: string;
   isLive?: boolean;
+  // Reproduces the frozen backfill plan for canary recovery (defaults to BackfillDryRunAnalyzer).
+  planProvider?: () => Promise<BackfillPlanArtifact>;
 }
 
 export interface BackfillExecutorReport {
@@ -97,7 +99,11 @@ export interface BackfillExecutorReport {
   logicalRelationPatches?: number;
   relationPatchHttpAttempts?: number;
   pagesCreatedDuringRecovery?: number;
+  recoveryOutcome?: 'RECOVERY_APPLIED' | 'RECOVERY_ALREADY_APPLIED';
 }
+
+export const CANARY_OPERATION_INDEX = 0;
+export const CANARY_RECOVERY_REASON_CODE = 'RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX';
 
 function sanitizeErrorMessage(msg: string): string {
   if (!msg) return 'UNKNOWN_ERROR';
@@ -1405,9 +1411,15 @@ export class BackfillExecutor {
   /**
    * Mode: --recover-canary-only (Item 10)
    * Strictly read-only on Notion API (0 HTTP mutations permitted).
-   * Reconciles Canary Op #0 from FAILED -> VERIFIED using the existing live page,
-   * records the event in backfill_operation_events, confirms page mapping,
-   * sets run status to PAUSED_AFTER_CANARY and stops without proceeding to operation #1.
+   * Reconciles Canary Op #0 from FAILED -> VERIFIED using the existing live page and, in a single
+   * atomic journal transaction, records the audit event, confirms the page mapping and sets the run
+   * to PAUSED_AFTER_CANARY. Never proceeds to operation #1.
+   *
+   * Fail-closed preconditions (all validated before any Notion read or journal write):
+   *  - plan.backfillPlanHash == FROZEN_BACKFILL_PLAN_HASH == run.planHash == preflight.backfillPlanHash;
+   *  - run IN_PROGRESS; op0 exists, CREATE, NOTION_DS_TRANSACTIONS, FAILED, attempts == 1, targetPageId != null;
+   *  - live stable-identity match is unique and liveRecord.id == op0.targetPageId.
+   * A second invocation after a successful recovery is a no-op (RECOVERY_ALREADY_APPLIED).
    */
   public async executeRecoverCanaryOnly(
     resumeRunId: string,
@@ -1433,15 +1445,84 @@ export class BackfillExecutor {
       }
     }
 
-    // 3. Reproduce plan
-    const analyzer = new BackfillDryRunAnalyzer({
-      envVars: this.envVars,
-      commitSha: planOriginSha,
-    });
-    const planReport = await analyzer.runAnalysis();
-    const plan = planReport.planArtifact;
+    // 3. Reproduce plan and bind all four plan hashes
+    const plan = this.options.planProvider
+      ? await this.options.planProvider()
+      : (await new BackfillDryRunAnalyzer({ envVars: this.envVars, commitSha: planOriginSha }).runAnalysis())
+          .planArtifact;
 
-    // 4. Validate journal fingerprint against resume preflight
+    if (
+      plan.backfillPlanHash !== FROZEN_BACKFILL_PLAN_HASH ||
+      run.planHash !== FROZEN_BACKFILL_PLAN_HASH ||
+      preflightArtifact.backfillPlanHash !== FROZEN_BACKFILL_PLAN_HASH
+    ) {
+      throw new Error(
+        `FAIL_RECOVERY_PLAN_HASH_MISMATCH: plan=${plan.backfillPlanHash}, frozen=${FROZEN_BACKFILL_PLAN_HASH}, run=${run.planHash}, preflight=${preflightArtifact.backfillPlanHash}.`,
+      );
+    }
+
+    const op0 = plan.operations[CANARY_OPERATION_INDEX];
+    if (!op0) {
+      throw new Error('FAIL_RECOVERY_OP_STATE_INVALID: Plano reproduzido não contém a operação 0.');
+    }
+    const journalOp0 = this.journal.getOperation(resumeRunId, CANARY_OPERATION_INDEX);
+
+    // 4. Idempotency: a completed recovery is a safe no-op (no event, no journal write, no Notion call)
+    if (
+      run.status === 'PAUSED_AFTER_CANARY' &&
+      journalOp0 &&
+      journalOp0.status === 'VERIFIED' &&
+      journalOp0.targetPageId &&
+      journalOp0.stableId === op0.stableId &&
+      this.journal.getPageMapping(plan.backfillPlanHash, op0.stableId)?.notionPageId === journalOp0.targetPageId &&
+      this.journal
+        .getOperationEvents(resumeRunId)
+        .some(
+          (e) =>
+            e.operationIndex === CANARY_OPERATION_INDEX &&
+            e.previousStatus === 'FAILED' &&
+            e.newStatus === 'VERIFIED' &&
+            e.reasonCode === CANARY_RECOVERY_REASON_CODE,
+        )
+    ) {
+      return this.buildRecoveryReport({
+        runId: resumeRunId,
+        executorCommitSha,
+        planOriginSha,
+        reproducedPlanHash: plan.backfillPlanHash,
+        outcome: 'RECOVERY_ALREADY_APPLIED',
+      });
+    }
+
+    // 5. Exact journal state required for recovery (ops 1..158 may not exist yet)
+    if (run.status !== 'IN_PROGRESS') {
+      throw new Error(
+        `FAIL_RECOVERY_RUN_STATE_INVALID: Run '${resumeRunId}' deve estar IN_PROGRESS para recovery (atual: ${run.status}).`,
+      );
+    }
+    if (!journalOp0) {
+      throw new Error(`FAIL_OPERATION_NOT_FOUND: Operação 0 não registrada no journal para run '${resumeRunId}'.`);
+    }
+    const stateViolations: string[] = [];
+    if (journalOp0.action !== 'CREATE') stateViolations.push(`action=${journalOp0.action}`);
+    if (journalOp0.targetDataSource !== 'NOTION_DS_TRANSACTIONS') {
+      stateViolations.push(`targetDataSource=${journalOp0.targetDataSource}`);
+    }
+    if (journalOp0.status !== 'FAILED') stateViolations.push(`status=${journalOp0.status}`);
+    if (journalOp0.attempts !== 1) stateViolations.push(`attempts=${journalOp0.attempts}`);
+    if (!journalOp0.targetPageId) stateViolations.push('targetPageId=null');
+    if (journalOp0.stableId !== op0.stableId) stateViolations.push('stableId diverge do plano');
+    if (op0.operationType !== 'CREATE' || op0.targetDataSource.envKey !== journalOp0.targetDataSource) {
+      stateViolations.push('operação 0 do plano diverge do journal');
+    }
+    if (!journalOp0.expectedPostFingerprint) stateViolations.push('expectedPostFingerprint=null');
+    if (stateViolations.length > 0) {
+      throw new Error(
+        `FAIL_RECOVERY_OP_STATE_INVALID: Operação 0 fora do estado exato exigido para recovery: ${stateViolations.join(', ')}.`,
+      );
+    }
+
+    // 6. Validate journal fingerprint against resume preflight
     const currentJournalFp = calculateJournalFingerprint(this.journal, resumeRunId);
     if (preflightArtifact.journalFingerprint !== currentJournalFp) {
       throw new Error(
@@ -1449,8 +1530,7 @@ export class BackfillExecutor {
       );
     }
 
-    // 5. Query live stable identity for Op #0
-    const op0 = plan.operations[0];
+    // 7. Query live stable identity for Op #0 (read-only)
     const idSpec = resolveStableIdentitySpec(op0);
     const existingMatches = await this.adapter.findByStableIdentity(
       op0.targetDataSource.envKey,
@@ -1470,16 +1550,16 @@ export class BackfillExecutor {
     }
 
     const liveRecord = existingMatches[0];
+    if (liveRecord.id !== journalOp0.targetPageId) {
+      throw new Error(
+        `FAIL_CANARY_RECOVERY_PAGE_ID_MISMATCH: Página live (${liveRecord.id}) diverge do targetPageId do journal (${journalOp0.targetPageId}).`,
+      );
+    }
+
     const normalizedFingerprint = calculateRecordFingerprint(
       op0.targetDataSource.envKey,
       liveRecord.properties,
     );
-
-    const journalOp0 = this.journal.getOperation(resumeRunId, 0);
-    if (!journalOp0) {
-      throw new Error(`FAIL_OPERATION_NOT_FOUND: Operação 0 não registrada no journal para run '${resumeRunId}'.`);
-    }
-
     if (normalizedFingerprint !== journalOp0.expectedPostFingerprint) {
       throw new Error(
         `FAIL_READ_BACK_FINGERPRINT_MISMATCH: Fingerprint normalizado (${normalizedFingerprint}) diverge do esperado (${journalOp0.expectedPostFingerprint}).`,
@@ -1492,59 +1572,71 @@ export class BackfillExecutor {
       throw new Error(`FAIL_MUTATION_DURING_RECOVERY: Recovery executou ${mutationCount} mutações no Notion. Permitido: 0.`);
     }
 
-    // 6. Transition FAILED -> VERIFIED with audit event (Item 11)
-    this.journal.recordRecoveredVerified(
-      resumeRunId,
-      0,
-      liveRecord.id,
+    // 8. Atomic FAILED -> VERIFIED + audit event + page mapping + PAUSED_AFTER_CANARY (Item 11)
+    this.journal.applyCanaryRecoveryAtomically({
+      runId: resumeRunId,
+      operationIndex: CANARY_OPERATION_INDEX,
+      targetPageId: liveRecord.id,
+      planHash: plan.backfillPlanHash,
+      stableId: op0.stableId,
+      targetDataSource: op0.targetDataSource.envKey,
       executorCommitSha,
-      'RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX',
-    );
+      reasonCode: CANARY_RECOVERY_REASON_CODE,
+    });
 
-    // Save page mapping
-    this.journal.savePageMapping(
-      plan.backfillPlanHash,
-      op0.stableId,
-      liveRecord.id,
-      op0.targetDataSource.envKey,
-    );
+    return this.buildRecoveryReport({
+      runId: resumeRunId,
+      executorCommitSha,
+      planOriginSha,
+      reproducedPlanHash: plan.backfillPlanHash,
+      outcome: 'RECOVERY_APPLIED',
+    });
+  }
 
-    // Pause run after canary
-    this.journal.pauseAfterCanary(resumeRunId);
-
-    const finalCounts = this.journal.countByStatus(resumeRunId);
-
+  private buildRecoveryReport(params: {
+    runId: string;
+    executorCommitSha: string;
+    planOriginSha: string;
+    reproducedPlanHash: string;
+    outcome: 'RECOVERY_APPLIED' | 'RECOVERY_ALREADY_APPLIED';
+  }): BackfillExecutorReport {
+    const applied = params.outcome === 'RECOVERY_APPLIED';
     return {
-      executorHeadCommitSha: executorCommitSha,
-      executorParentCommitSha: this.getGitCommitSha(),
-      planOriginCommitSha: planOriginSha,
+      executorHeadCommitSha: params.executorCommitSha,
+      executorParentCommitSha: this.getGitParentSha(),
+      planOriginCommitSha: params.planOriginSha,
       frozenBackfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
-      reproducedBackfillPlanHash: plan.backfillPlanHash,
+      reproducedBackfillPlanHash: params.reproducedPlanHash,
       sourceSnapshotHash: FROZEN_SOURCE_SNAPSHOT_PLAINTEXT_SHA256,
       targetSnapshotHash: FROZEN_TARGET_SNAPSHOT_PLAINTEXT_SHA256,
       targetStateHash: FROZEN_TARGET_STATE_HASH,
-      simulationRunId: resumeRunId,
+      simulationRunId: params.runId,
       status: 'PAUSED_AFTER_CANARY',
       semanticCreates: 1,
       actualSimulatedCreateWrites: 0,
-      existingPageCreateNoOps: 1,
+      existingPageCreateNoOps: applied ? 1 : 0,
       logicalRelationReferences: 320,
       canonicalRelationPatchGroups: 0,
       actualSimulatedRelationWrites: 0,
       writeRequestsSent: 0,
       retries: 0,
-      recoveredUncertainCreates: 1,
+      recoveredUncertainCreates: applied ? 1 : 0,
       recoveredUncertainRelationWrites: 0,
       logicalCreates: 0,
       createHttpAttempts: 0,
       logicalRelationPatches: 0,
       relationPatchHttpAttempts: 0,
       pagesCreatedDuringRecovery: 0,
-      journalFinal: finalCounts,
+      journalFinal: this.journal.countByStatus(params.runId),
       liveNotionMutations: this.adapter.getMutationCount(),
       readyForLiveApplyReview: true,
       readyForApply: false,
-      reasons: ['PAUSED_AFTER_CANARY: Canary recuperado com sucesso e journal atualizado para PAUSED_AFTER_CANARY.'],
+      recoveryOutcome: params.outcome,
+      reasons: [
+        applied
+          ? 'PAUSED_AFTER_CANARY: Canary recuperado com sucesso e journal atualizado para PAUSED_AFTER_CANARY.'
+          : 'RECOVERY_ALREADY_APPLIED: Recovery do canary já aplicado; nenhuma escrita realizada.',
+      ],
     };
   }
 

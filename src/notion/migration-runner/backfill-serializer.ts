@@ -282,6 +282,16 @@ export function serializePayloadForNotion(
 
   const notionProperties: Record<string, any> = {};
   const canonicalProperties: Record<string, any> = {};
+  const sourceKeyByCanonical = new Map<string, string>();
+  const claimCanonical = (canonicalKey: string, key: string) => {
+    const previousKey = sourceKeyByCanonical.get(canonicalKey);
+    if (previousKey !== undefined) {
+      throw new Error(
+        `FAIL_AMBIGUOUS_CANONICAL_PROPERTY: Chaves '${previousKey}' e '${key}' resolvem para a mesma propriedade canônica '${canonicalKey}' em '${envKey}'.`,
+      );
+    }
+    sourceKeyByCanonical.set(canonicalKey, key);
+  };
 
   // 1. Process scalar properties in payload
   for (const [key, value] of Object.entries(payload)) {
@@ -291,6 +301,7 @@ export function serializePayloadForNotion(
         `FAIL_UNKNOWN_PROPERTY: Propriedade '${key}' não existe no TARGET_CONTRACT para '${envKey}'.`,
       );
     }
+    claimCanonical(contract.notionProperty, key);
 
     const isCanonical = key === contract.notionProperty;
     const isExplicitAlias = Boolean(contract.aliases && contract.aliases.includes(key));
@@ -376,6 +387,7 @@ export function serializePayloadForNotion(
         `FAIL_UNKNOWN_PROPERTY: Propriedade relacional '${relKey}' não existe no TARGET_CONTRACT para '${envKey}'.`,
       );
     }
+    claimCanonical(contract.notionProperty, relKey);
     const isCanonical = relKey === contract.notionProperty;
     const isExplicitAlias = Boolean(contract.aliases && contract.aliases.includes(relKey));
     if (!isCanonical && !isExplicitAlias) {
@@ -429,6 +441,8 @@ export function serializePayloadForNotion(
  * - relation: [] (empty array) -> omitted from fingerprint (matches absent relation)
  * - relation: [id, ...] (non-empty array) -> ALWAYS material and kept
  * - number 0, checkbox false, rich_text "", select, date -> NEVER omitted, remain material
+ * - two keys (canonical, alias or domain field) resolving to the same canonical property
+ *   -> FAIL_AMBIGUOUS_CANONICAL_PROPERTY (fail closed, never last-write-wins)
  */
 export function normalizeCanonicalPropertiesForFingerprint(
   envKey: string,
@@ -436,19 +450,33 @@ export function normalizeCanonicalPropertiesForFingerprint(
 ): Record<string, any> {
   const dsContract = TARGET_CONTRACT[envKey];
   const normalized: Record<string, any> = {};
+  const sourceKeyByCanonical = new Map<string, string>();
 
   for (const [key, value] of Object.entries(canonicalProperties)) {
-    if (value === null || value === undefined) {
+    if (value === undefined) {
       continue;
     }
     const contract = dsContract?.properties.find(
       (p) => p.notionProperty === key || (p.aliases && p.aliases.includes(key)) || p.domainField === key,
     );
+    const canonicalKey = contract ? contract.notionProperty : key;
+    // Two input keys resolving to the same canonical property must never overwrite each other silently
+    const previousKey = sourceKeyByCanonical.get(canonicalKey);
+    if (previousKey !== undefined) {
+      throw new Error(
+        `FAIL_AMBIGUOUS_CANONICAL_PROPERTY: Chaves '${previousKey}' e '${key}' resolvem para a mesma propriedade canônica '${canonicalKey}' em '${envKey}'.`,
+      );
+    }
+    sourceKeyByCanonical.set(canonicalKey, key);
+
+    if (value === null) {
+      continue;
+    }
     // If it is a relation and empty array -> omit from fingerprint
     if (contract && contract.notionType === 'relation' && Array.isArray(value) && value.length === 0) {
       continue;
     }
-    normalized[contract ? contract.notionProperty : key] = value;
+    normalized[canonicalKey] = value;
   }
 
   return normalized;

@@ -378,36 +378,92 @@ export class BackfillJournal {
       .all(runId) as BackfillOperationEventRecord[];
   }
 
-  public recordRecoveredVerified(
+  /**
+   * Compare-and-set transition of the run status. Throws (and therefore rolls back an
+   * enclosing transaction) unless the run is currently in `expectedStatus`.
+   */
+  public transitionRunStatus(
     runId: string,
-    operationIndex: number,
-    targetPageId: string,
-    executorCommitSha: string,
-    reasonCode: string = 'RECOVERED_AFTER_CANONICAL_FINGERPRINT_FIX',
+    expectedStatus: BackfillRunStatus,
+    newStatus: BackfillRunStatus,
   ): void {
-    const currentOp = this.getOperation(runId, operationIndex);
-    const previousStatus = currentOp?.status || 'FAILED';
+    const res = this.db
+      .prepare('UPDATE backfill_runs SET status = ? WHERE run_id = ? AND status = ?')
+      .run(newStatus, runId, expectedStatus);
+    if (res.changes !== 1) {
+      throw new Error(
+        `FAIL_RECOVERY_RUN_STATE_INVALID: Transição de status do run '${runId}' ${expectedStatus} -> ${newStatus} não aplicável ao estado atual.`,
+      );
+    }
+  }
 
-    this.recordOperationEvent({
-      runId,
-      operationIndex,
-      previousStatus,
-      newStatus: 'VERIFIED',
-      reasonCode,
-      executorCommitSha,
+  /**
+   * Atomic canary recovery (FAILED -> VERIFIED) in a single IMMEDIATE SQLite transaction:
+   *  1. append audit event FAILED -> VERIFIED;
+   *  2. op VERIFIED (compare-and-set on FAILED, attempts == 1, same targetPageId);
+   *  3. save/confirm page mapping;
+   *  4. run IN_PROGRESS -> PAUSED_AFTER_CANARY.
+   * Any failure (including a crash before COMMIT) leaves the journal untouched.
+   */
+  public applyCanaryRecoveryAtomically(params: {
+    runId: string;
+    operationIndex: number;
+    targetPageId: string;
+    planHash: string;
+    stableId: string;
+    targetDataSource: string;
+    executorCommitSha: string;
+    reasonCode: string;
+  }): void {
+    const tx = this.db.transaction(() => {
+      const run = this.getRun(params.runId);
+      if (!run || run.status !== 'IN_PROGRESS') {
+        throw new Error(
+          `FAIL_RECOVERY_RUN_STATE_INVALID: Run '${params.runId}' deve estar IN_PROGRESS (atual: ${run?.status ?? 'AUSENTE'}).`,
+        );
+      }
+      const op = this.getOperation(params.runId, params.operationIndex);
+      if (
+        !op ||
+        op.status !== 'FAILED' ||
+        op.attempts !== 1 ||
+        op.targetPageId !== params.targetPageId ||
+        op.stableId !== params.stableId ||
+        op.targetDataSource !== params.targetDataSource
+      ) {
+        throw new Error(
+          `FAIL_RECOVERY_OP_STATE_INVALID: Operação ${params.operationIndex} não está no estado exato esperado para recovery.`,
+        );
+      }
+
+      this.recordOperationEvent({
+        runId: params.runId,
+        operationIndex: params.operationIndex,
+        previousStatus: 'FAILED',
+        newStatus: 'VERIFIED',
+        reasonCode: params.reasonCode,
+        executorCommitSha: params.executorCommitSha,
+      });
+
+      const res = this.db
+        .prepare(
+          `UPDATE backfill_operations
+           SET status = 'VERIFIED', error_sanitized = NULL
+           WHERE run_id = ? AND operation_index = ?
+             AND status = 'FAILED' AND attempts = 1 AND target_page_id = ?`,
+        )
+        .run(params.runId, params.operationIndex, params.targetPageId);
+      if (res.changes !== 1) {
+        throw new Error(
+          `FAIL_RECOVERY_OP_STATE_INVALID: Transição FAILED -> VERIFIED da operação ${params.operationIndex} não aplicada.`,
+        );
+      }
+
+      this.savePageMapping(params.planHash, params.stableId, params.targetPageId, params.targetDataSource);
+
+      this.transitionRunStatus(params.runId, 'IN_PROGRESS', 'PAUSED_AFTER_CANARY');
     });
-
-    const nowIso = new Date().toISOString();
-    this.db
-      .prepare(
-        `UPDATE backfill_operations
-         SET status = 'VERIFIED',
-             target_page_id = ?,
-             last_attempt_at = ?,
-             error_sanitized = NULL
-         WHERE run_id = ? AND operation_index = ?`,
-      )
-      .run(targetPageId, nowIso, runId, operationIndex);
+    tx.immediate();
   }
 
   public getOperation(runId: string, operationIndex: number): BackfillOperationRecord | null {

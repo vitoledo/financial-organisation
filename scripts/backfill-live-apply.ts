@@ -464,6 +464,7 @@ export async function runLiveApply(
     console.log('═'.repeat(79));
     console.log(`  • Run ID:                    ${report.simulationRunId}`);
     console.log(`  • Status:                    ${report.status}`);
+    console.log(`  • Recovery Outcome:          ${report.recoveryOutcome}`);
     console.log(`  • Semantic Creates:          ${report.semanticCreates}`);
     console.log(`  • Existing No-Ops:           ${report.existingPageCreateNoOps}`);
     console.log(`  • Create HTTP Attempts:      0 (ZERO)`);

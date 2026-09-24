@@ -1691,6 +1691,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       });
 
       journal.recordAttempt(runId, 0);
+      journal.recordApplied(runId, 0, 'page-live-recovery-3e2a');
       journal.recordFailed(runId, 0, 'FAIL_READ_BACK_FINGERPRINT_MISMATCH');
 
       const mockAdapter: any = {
@@ -1729,6 +1730,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
 
       const currentJournalFp = calculateJournalFingerprint(journal, runId);
       const preflightArtifact: any = {
+        backfillPlanHash: FROZEN_BACKFILL_PLAN_HASH,
         journalFingerprint: currentJournalFp,
       };
 
