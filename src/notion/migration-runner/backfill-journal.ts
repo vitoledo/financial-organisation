@@ -642,6 +642,38 @@ export class BackfillJournal {
     return result;
   }
 
+  /**
+   * Consistent full-database image (includes committed WAL frames), suitable for durable checkpoints.
+   * Header bytes 18/19 are normalized to rollback-journal mode so the image opens standalone (in memory
+   * or as a file without -wal); the journal switches back to WAL when reopened.
+   */
+  public serializeSnapshot(): Buffer {
+    const image = Buffer.from(this.db.serialize());
+    if (image.length >= 20) {
+      image[18] = 1;
+      image[19] = 1;
+    }
+    return image;
+  }
+
+  /**
+   * Deterministic digest of the journal's logical content (all four tables, canonical order).
+   * Independent of SQLite page layout/header counters, so equal content => equal digest.
+   */
+  public stateDigest(): string {
+    const dump = {
+      runs: this.db.prepare('SELECT * FROM backfill_runs ORDER BY run_id').all(),
+      operations: this.db
+        .prepare('SELECT * FROM backfill_operations ORDER BY run_id, operation_index')
+        .all(),
+      pageMap: this.db
+        .prepare('SELECT * FROM backfill_page_map ORDER BY plan_hash, stable_id')
+        .all(),
+      events: this.db.prepare('SELECT * FROM backfill_operation_events ORDER BY id').all(),
+    };
+    return crypto.createHash('sha256').update(JSON.stringify(dump)).digest('hex');
+  }
+
   public close(): void {
     try {
       this.db.close();

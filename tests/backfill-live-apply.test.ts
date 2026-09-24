@@ -38,6 +38,22 @@ import {
 } from '../src/notion/migration-runner/backfill-live-preflight';
 import { runLiveApply } from '../scripts/backfill-live-apply';
 import { serializePayloadForNotion } from '../src/notion/migration-runner/backfill-serializer';
+import {
+  DurableJournalCheckpointer,
+  InMemoryCheckpointSink,
+  decryptCheckpoint,
+} from '../src/notion/migration-runner/journal-durability';
+
+// Live executions require durable journal checkpoints; tests use an in-memory sink.
+async function bootstrapTestDurability(journal: BackfillJournal): Promise<DurableJournalCheckpointer> {
+  return DurableJournalCheckpointer.open({
+    journal,
+    sink: new InMemoryCheckpointSink(),
+    key: crypto.randomBytes(32),
+    namespace: `test-${crypto.randomUUID()}`,
+    bootstrap: true,
+  });
+}
 
 describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification', { timeout: 35000 }, () => {
   const testEnv: Record<string, string> = {
@@ -767,6 +783,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         canary: undefined,
         skipWorktreeCleanCheck: true,
       });
@@ -802,6 +819,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         canary: 1,
         skipWorktreeCleanCheck: true,
       });
@@ -834,6 +852,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         canary: 1,
         skipWorktreeCleanCheck: true,
       });
@@ -851,6 +870,67 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       // Verify journal state
       const run = journal.getRun(report.simulationRunId);
       expect(run?.status).toBe('PAUSED_AFTER_CANARY');
+    });
+
+    it('durability invariant: acked checkpoint with attempt BEFORE createPage, acked VERIFIED state AFTER read-back; no ack -> no mutation', async () => {
+      const bases = getFrozenTargetBases();
+      const env = createFrozenTargetEnv(bases);
+      const key = crypto.randomBytes(32);
+      const events: string[] = [];
+      let journalRef: BackfillJournal;
+      const sink = new InMemoryCheckpointSink();
+      const realPut = sink.put.bind(sink);
+      vi.spyOn(sink, 'put').mockImplementation(async (ns: string, seq: number, blob: Buffer, header: any) => {
+        const ack = await realPut(ns, seq, blob);
+        const { plaintext } = decryptCheckpoint(blob, key);
+        const snapDb = new Database(plaintext);
+        const snap = new BackfillJournal(snapDb);
+        const runs = snapDb.prepare('SELECT run_id FROM backfill_runs').all() as any[];
+        const op0 = runs.length ? snap.getOperation(runs[0].run_id, 0) : null;
+        events.push(`ACK:${header.reason}:${op0 ? `${op0.status}/${op0.attempts}` : 'none'}`);
+        snapDb.close();
+        return ack;
+      });
+      const mockClient = createFrozenMockClient(bases, env, {
+        createPage: async (params) => {
+          events.push('NOTION_CREATE');
+          return { id: `canary-page-${crypto.randomUUID()}`, properties: params.properties };
+        },
+      });
+      const adapter = new ProductionNotionAdapter(mockClient, createValidAuthContext(), env, { rateLimitDelayMs: 0 });
+      journalRef = new BackfillJournal(new Database(':memory:'));
+      const durability = await DurableJournalCheckpointer.open({ journal: journalRef, sink, key, namespace: 'ns', bootstrap: true });
+      const executor = new BackfillExecutor({
+        adapter, journal: journalRef, envVars: env, planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE, isLive: true, canary: 1, skipWorktreeCleanCheck: true, durability,
+      });
+      const report = await executor.execute();
+      expect(report.status).toBe('PAUSED_AFTER_CANARY');
+
+      const createIdx = events.indexOf('NOTION_CREATE');
+      expect(createIdx).toBeGreaterThan(0);
+      expect(events[createIdx - 1]).toBe('ACK:PRE_MUTATION_CREATE:PENDING/1');
+      expect(events[createIdx + 1]).toBe('ACK:POST_MUTATION_CREATE_VERIFIED:VERIFIED/1');
+      expect(durability.isCurrentStateAcked()).toBe(true);
+
+      // Same scenario, sink down at PRE_MUTATION: the mutation is never sent
+      const events2Before = events.length;
+      const sink2 = new InMemoryCheckpointSink();
+      const j2 = new BackfillJournal(new Database(':memory:'));
+      const d2 = await DurableJournalCheckpointer.open({ journal: j2, sink: sink2, key, namespace: 'ns2', bootstrap: true });
+      const origPut2 = sink2.put.bind(sink2);
+      vi.spyOn(sink2, 'put').mockImplementation(async (ns: string, seq: number, blob: Buffer, header: any) => {
+        if (header.reason === 'PRE_MUTATION_CREATE') throw new Error('drive unavailable');
+        return origPut2(ns, seq, blob);
+      });
+      const adapter2 = new ProductionNotionAdapter(mockClient, createValidAuthContext(), env, { rateLimitDelayMs: 0 });
+      const ex2 = new BackfillExecutor({
+        adapter: adapter2, journal: j2, envVars: env, planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+        schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE, isLive: true, canary: 1, skipWorktreeCleanCheck: true, durability: d2,
+      });
+      await expect(ex2.execute()).rejects.toThrow(/FAIL_DURABLE_CHECKPOINT_NOT_ACKNOWLEDGED/);
+      expect(events.slice(events2Before)).not.toContain('NOTION_CREATE');
+      expect(adapter2.createRequestsSent).toBe(0);
     });
 
     it('reconciles uncertain write timeout on canary: recognizes existing page and avoids duplication', async () => {
@@ -903,6 +983,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         canary: 1,
         skipWorktreeCleanCheck: true,
       });
@@ -939,6 +1020,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         skipWorktreeCleanCheck: true,
       });
 
@@ -997,6 +1079,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         canary: 1,
         skipWorktreeCleanCheck: true,
       });
@@ -1103,6 +1186,7 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
         planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
         schemaEvidence: DEFAULT_CONFORMANT_SCHEMA_EVIDENCE,
         isLive: true,
+        durability: await bootstrapTestDurability(journal),
         resumeRunId: runId,
         skipWorktreeCleanCheck: true,
         skipInitialDriftCheck: true,

@@ -14,6 +14,8 @@
  */
 
 import 'dotenv/config';
+import { DurableJournalCheckpointer } from '../src/notion/migration-runner/journal-durability';
+import { durabilityConfigFromEnv, DurabilityEnvConfig } from '../src/notion/migration-runner/drive-checkpoint-sink';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -127,6 +129,7 @@ export async function runLiveApply(
   customArgs?: string[],
   customEnv?: Record<string, string | undefined>,
   customClient?: Client,
+  deps: { durability?: DurabilityEnvConfig } = {},
 ): Promise<void> {
   const env = customEnv || process.env;
   const args = customArgs !== undefined ? customArgs : process.argv.slice(2);
@@ -435,6 +438,12 @@ export async function runLiveApply(
   const journalDb = new Database(journalPath);
   const journal = new BackfillJournal(journalDb);
 
+  // Durable encrypted checkpoints: the local journal must be exactly the durable head (authoritative);
+  // every mutation is then preceded and followed by an acknowledged checkpoint.
+  const durabilityCfg = deps.durability || durabilityConfigFromEnv(env);
+  const durability = await DurableJournalCheckpointer.open({ ...durabilityCfg, journal });
+  console.log(`  ✓ Journal local == head durável #${durability.getLastSeq()} (namespace ${durabilityCfg.namespace}).`);
+
   const executor = new BackfillExecutor({
     adapter: productionAdapter,
     journal,
@@ -444,6 +453,7 @@ export async function runLiveApply(
     canary,
     resumeRunId,
     isLive: true,
+    durability,
     schemaEvidence: {
       totalDataSources: 13,
       verifiedDataSources: 13,

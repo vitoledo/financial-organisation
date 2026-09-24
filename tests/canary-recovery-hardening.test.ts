@@ -3,6 +3,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import crypto from 'crypto';
+import {
+  DurableJournalCheckpointer,
+  InMemoryCheckpointSink,
+  decryptCheckpoint,
+  restoreJournalFromDurableHead,
+} from '../src/notion/migration-runner/journal-durability';
 import {
   PLAN_ORIGIN_COMMIT_SHA,
   FROZEN_BACKFILL_PLAN_HASH,
@@ -481,6 +488,66 @@ describe('Canary recovery hardening (synthetic, fail-closed)', () => {
         reopened.close();
       }
     }, 90000);
+  });
+
+  describe('4b. durable checkpoint after recovery', () => {
+    async function durableExecutor(s: Scenario, sink: InMemoryCheckpointSink, key: Buffer) {
+      const durability = await DurableJournalCheckpointer.open({
+        journal: s.journal, sink, key, namespace: s.runId, bootstrap: true,
+      });
+      const exec = new BackfillExecutor({
+        adapter: s.adapter,
+        journal: s.journal,
+        commitSha: RECOVERY_COMMIT,
+        planProvider: async () => syntheticPlan(),
+        isLive: true,
+        durability,
+        envVars: {
+          FINANCIAL_BACKFILL_RECOVERY_FROM_COMMIT: RUN_COMMIT,
+          FINANCIAL_BACKFILL_RECOVERY_RUN_ID: 'run-1789950411040-gsznfr',
+        },
+      });
+      return { exec, durability };
+    }
+
+    it('success -> recovered state is the acknowledged durable head (RECOVERY_APPLIED)', async () => {
+      const s = setup();
+      const sink = new InMemoryCheckpointSink();
+      const key = crypto.randomBytes(32);
+      try {
+        const { exec, durability } = await durableExecutor(s, sink, key);
+        await exec.executeRecoverCanaryOnly(s.runId, s.preflight);
+        expect(durability.isCurrentStateAcked()).toBe(true);
+        const head = (await sink.head(s.runId))!;
+        const { header } = decryptCheckpoint(await sink.get(head), key);
+        expect(header.reason).toBe('RECOVERY_APPLIED');
+        expect(header.stateDigest).toBe(s.journal.stateDigest());
+      } finally {
+        s.journal.close();
+      }
+    });
+
+    it('checkpoint not acknowledged -> recovery fails closed; durable head still holds pre-recovery FAILED state', async () => {
+      const s = setup();
+      const sink = new InMemoryCheckpointSink();
+      const key = crypto.randomBytes(32);
+      try {
+        const { exec } = await durableExecutor(s, sink, key);
+        sink.failNextPut = new Error('drive unavailable');
+        await expect(exec.executeRecoverCanaryOnly(s.runId, s.preflight)).rejects.toThrow(/FAIL_DURABLE_CHECKPOINT_NOT_ACKNOWLEDGED/);
+        const restored = path.join(tmpDir, 'restored.db');
+        await restoreJournalFromDurableHead({ sink, key, namespace: s.runId, targetPath: restored });
+        const r = new BackfillJournal(restored);
+        try {
+          expect(r.getOperation(s.runId, 0)?.status).toBe('FAILED');
+          expect(r.getRun(s.runId)?.status).toBe('IN_PROGRESS');
+        } finally {
+          r.close();
+        }
+      } finally {
+        s.journal.close();
+      }
+    });
   });
 
   describe('5. idempotency', () => {

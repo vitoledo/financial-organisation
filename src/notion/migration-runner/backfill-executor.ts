@@ -37,6 +37,7 @@ import {
 import { calculateTargetStateHash, BaseSnapshotData, NotionPageRecord } from './data-snapshot';
 import { TARGET_CONTRACT } from '../../domain/schema-contract';
 import type { ResumePreflightArtifact } from './backfill-live-preflight';
+import { DurableJournalCheckpointer, DurabilityGuardedAdapter } from './journal-durability';
 
 export const DEFAULT_CONFORMANT_SCHEMA_EVIDENCE: BackfillSchemaConformanceEvidence = {
   totalDataSources: 13,
@@ -66,6 +67,9 @@ export interface BackfillExecutorOptions {
   isLive?: boolean;
   // Reproduces the frozen backfill plan for canary recovery (defaults to BackfillDryRunAnalyzer).
   planProvider?: () => Promise<BackfillPlanArtifact>;
+  // Durable encrypted journal checkpoints. Mandatory when isLive: every Notion mutation is preceded
+  // and followed by an acknowledged checkpoint (see journal-durability.ts).
+  durability?: DurableJournalCheckpointer;
 }
 
 export interface BackfillExecutorReport {
@@ -280,7 +284,9 @@ export class BackfillExecutor {
 
   constructor(options: BackfillExecutorOptions) {
     this.options = options;
-    this.adapter = options.adapter;
+    this.adapter = options.durability
+      ? new DurabilityGuardedAdapter(options.adapter, options.durability)
+      : options.adapter;
     this.envVars = options.envVars || (process.env as Record<string, string | undefined>);
 
     if (options.journal) {
@@ -293,6 +299,21 @@ export class BackfillExecutor {
 
   public getJournal(): BackfillJournal {
     return this.journal;
+  }
+
+  private assertDurabilityForLive(): void {
+    if (this.options.isLive && !this.options.durability) {
+      throw new Error(
+        'FAIL_DURABILITY_NOT_CONFIGURED: Execução live exige checkpoint durável do journal antes e depois de cada mutação.',
+      );
+    }
+  }
+
+  /** Persists the current journal state durably and waits for the acknowledgment (no-op without durability). */
+  private async durableBarrier(reason: string): Promise<void> {
+    if (this.options.durability) {
+      await this.options.durability.checkpoint(reason);
+    }
   }
 
   private getGitCommitSha(): string {
@@ -606,8 +627,27 @@ export class BackfillExecutor {
 
   /**
    * Executes the full idempotent simulation with persistent journal.
+   * With durability: the final journal state is checkpointed before returning; on error a best-effort
+   * checkpoint is attempted (the durable head is always a safe restore point either way).
    */
   public async execute(): Promise<BackfillExecutorReport> {
+    this.assertDurabilityForLive();
+    let report: BackfillExecutorReport;
+    try {
+      report = await this.executeInner();
+    } catch (err) {
+      try {
+        await this.durableBarrier('RUN_ERROR');
+      } catch {
+        // The durable head predates this state; restoring it is safe (uncertain writes reconcile).
+      }
+      throw err;
+    }
+    await this.durableBarrier('RUN_EXIT');
+    return report;
+  }
+
+  private async executeInner(): Promise<BackfillExecutorReport> {
     const planOriginSha = this.options.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA;
     const executorCommitSha = this.getGitCommitSha();
     const executorParentCommitSha = this.getGitParentSha();
@@ -1024,6 +1064,7 @@ export class BackfillExecutor {
       while (attemptCount < maxRetries) {
         attemptCount++;
         this.journal.recordAttempt(runId, i);
+        await this.durableBarrier('PRE_MUTATION_CREATE');
         writeRequestsSent++;
 
         try {
@@ -1043,6 +1084,7 @@ export class BackfillExecutor {
             err?.status === 403 ||
             err?.status === 404 ||
             (err?.message && err.message.includes('REAL_DML_DISABLED')) ||
+            (err?.message && err.message.includes('FAIL_MUTATION_WITHOUT_DURABLE_CHECKPOINT')) ||
             (err?.message && err.message.includes('validation_error'))
           ) {
             this.journal.recordFailed(runId, i, sanitizeErrorMessage(err.message));
@@ -1107,6 +1149,7 @@ export class BackfillExecutor {
 
       this.journal.recordVerified(runId, i, createdPageId, false);
       this.journal.savePageMapping(plan.backfillPlanHash, op.stableId, createdPageId, op.targetDataSource.envKey);
+      await this.durableBarrier('POST_MUTATION_CREATE_VERIFIED');
       actualSimulatedCreateWrites++;
 
       if (this.options.canary === 1) {
@@ -1255,6 +1298,7 @@ export class BackfillExecutor {
         while (attemptCount < maxRetries) {
           attemptCount++;
           this.journal.recordAttempt(runId, opIdx);
+          await this.durableBarrier('PRE_MUTATION_RELATION_PATCH');
           writeRequestsSent++;
 
           try {
@@ -1274,6 +1318,7 @@ export class BackfillExecutor {
               err?.status === 403 ||
               err?.status === 404 ||
               (err?.message && err.message.includes('REAL_DML_DISABLED')) ||
+              (err?.message && err.message.includes('FAIL_MUTATION_WITHOUT_DURABLE_CHECKPOINT')) ||
               (err?.message && err.message.includes('validation_error'))
             ) {
               this.journal.recordFailed(runId, opIdx, sanitizeErrorMessage(err.message));
@@ -1363,6 +1408,7 @@ export class BackfillExecutor {
       }
 
       this.journal.recordVerified(runId, opIdx, billPageId, false);
+      await this.durableBarrier('POST_MUTATION_RELATION_PATCH_VERIFIED');
     }
 
     // Complete run in journal
@@ -1425,6 +1471,8 @@ export class BackfillExecutor {
     resumeRunId: string,
     preflightArtifact: ResumePreflightArtifact,
   ): Promise<BackfillExecutorReport> {
+    this.assertDurabilityForLive();
+
     // 1. Validate run in journal
     const run = this.journal.getRun(resumeRunId);
     if (!run) {
@@ -1583,6 +1631,7 @@ export class BackfillExecutor {
       executorCommitSha,
       reasonCode: CANARY_RECOVERY_REASON_CODE,
     });
+    await this.durableBarrier('RECOVERY_APPLIED');
 
     return this.buildRecoveryReport({
       runId: resumeRunId,
