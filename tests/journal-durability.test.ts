@@ -16,7 +16,11 @@ import {
   restoreJournalFromDurableHead,
 } from '../src/notion/migration-runner/journal-durability';
 import { BackfillExecutor } from '../src/notion/migration-runner/backfill-executor';
-import { durabilityConfigFromEnv } from '../src/notion/migration-runner/drive-checkpoint-sink';
+import {
+  DriveCheckpointSink,
+  durabilityConfigFromEnv,
+  isDriveRateLimitError,
+} from '../src/notion/migration-runner/drive-checkpoint-sink';
 import { runJournalDurability } from '../scripts/journal-durability';
 
 const STABLE_ID = 'a2ce0416-1a27-4592-85be-bff2a9ce6f86';
@@ -371,6 +375,64 @@ describe('Durable encrypted journal checkpoint protocol', () => {
       } finally {
         log.mockRestore();
       }
+    });
+  });
+
+  describe('DriveCheckpointSink rate-limit backoff', () => {
+    const rateLimited = (reason = 'userRateLimitExceeded') =>
+      Object.assign(new Error('User rate limit exceeded.'), { status: 403, errors: [{ reason }] });
+    const fakeDrive = (files: Record<string, any>) => ({ files } as any);
+    const header = { stateDigest: 'd'.repeat(64) } as any;
+
+    it('classifies only rate-limit rejections as retryable', () => {
+      expect(isDriveRateLimitError(rateLimited())).toBe(true);
+      expect(isDriveRateLimitError(rateLimited('rateLimitExceeded'))).toBe(true);
+      expect(isDriveRateLimitError({ response: { status: 429 } })).toBe(true);
+      expect(isDriveRateLimitError(Object.assign(new Error('forbidden'), { status: 403, errors: [{ reason: 'insufficientPermissions' }] }))).toBe(false);
+      expect(isDriveRateLimitError(Object.assign(new Error('boom'), { status: 500 }))).toBe(false);
+      expect(isDriveRateLimitError(new Error('network'))).toBe(false);
+    });
+
+    it('retries list and create after rate-limit rejections with exponential backoff', async () => {
+      const sleeps: number[] = [];
+      let lists = 0;
+      let creates = 0;
+      const drive = fakeDrive({
+        list: vi.fn(async () => {
+          if (++lists <= 2) throw rateLimited();
+          return { data: { files: [{ id: 'f1', md5Checksum: 'm', size: '3', appProperties: { fjcp_seq: '7' } }] } };
+        }),
+        create: vi.fn(async () => {
+          if (++creates === 1) throw rateLimited('rateLimitExceeded');
+          return { data: { id: 'f2', md5Checksum: 'm2', size: '3', appProperties: { fjcp_seq: '8' } } };
+        }),
+      });
+      const sink = new DriveCheckpointSink(drive, undefined, { baseDelayMs: 10, sleep: async (ms) => void sleeps.push(ms) });
+
+      expect(await sink.head(NS)).toEqual({ id: 'f1', seq: 7, md5: 'm', size: 3 });
+      expect(await sink.put(NS, 8, Buffer.from('abc'), header)).toEqual({ id: 'f2', seq: 8, md5: 'm2', size: 3 });
+      expect(lists).toBe(3);
+      expect(creates).toBe(2);
+      expect(sleeps).toHaveLength(3);
+      expect(sleeps[1]).toBeGreaterThanOrEqual(20); // second retry doubles the base delay
+    });
+
+    it('never retries other errors (a failed create surfaces immediately)', async () => {
+      const create = vi.fn(async () => {
+        throw Object.assign(new Error('Internal error'), { status: 500 });
+      });
+      const sink = new DriveCheckpointSink(fakeDrive({ create }), undefined, { sleep: async () => undefined });
+      await expect(sink.put(NS, 1, Buffer.from('x'), header)).rejects.toThrow(/Internal error/);
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after maxRetries and surfaces the rate-limit error', async () => {
+      const list = vi.fn(async () => {
+        throw rateLimited();
+      });
+      const sink = new DriveCheckpointSink(fakeDrive({ list }), undefined, { maxRetries: 3, sleep: async () => undefined });
+      await expect(sink.countAtSeq(NS, 1)).rejects.toThrow(/User rate limit exceeded/);
+      expect(list).toHaveBeenCalledTimes(4);
     });
   });
 });
