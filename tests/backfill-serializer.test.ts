@@ -190,13 +190,13 @@ describe('Phase 2D: Runtime Physical Property Binding & Serializer Hardening', (
   });
 
   it('audits all 159 operations in frozen plan to verify all serialized properties map strictly to valid contracts', { timeout: 30000 }, async () => {
+    // Offline analysis: no API key, fake data source ids (never the shell's real credentials).
     const testEnv = {
-      ...process.env,
-      NOTION_API_KEY: process.env.NOTION_API_KEY || 'fake-key',
-      NOTION_DS_ACCOUNTS: process.env.NOTION_DS_ACCOUNTS || 'fake-acc-ds',
-      NOTION_DS_CATEGORIES: process.env.NOTION_DS_CATEGORIES || 'fake-cat-ds',
-      NOTION_DS_TRANSACTIONS: process.env.NOTION_DS_TRANSACTIONS || 'fake-tx-ds',
-      NOTION_DS_CARD_BILLS: process.env.NOTION_DS_CARD_BILLS || 'fake-bills-ds',
+      NOTION_API_KEY: '',
+      NOTION_DS_ACCOUNTS: 'fake-acc-ds',
+      NOTION_DS_CATEGORIES: 'fake-cat-ds',
+      NOTION_DS_TRANSACTIONS: 'fake-tx-ds',
+      NOTION_DS_CARD_BILLS: 'fake-bills-ds',
       NOTION_TARGET_SNAPSHOT_MANIFEST: 'backups/notion-data-snapshot-20260913T190702-0a3af05c.json.enc.manifest.json',
       SOURCE_SQLITE_SNAPSHOT_MANIFEST: 'backups/financial-backup-20260914T023409-a6df794b.db.enc.manifest.json',
       BACKFILL_ACCOUNT_MAPPING_PATH: 'data/account-mapping.json',

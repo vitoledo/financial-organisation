@@ -79,6 +79,12 @@ pnpm typecheck            # tsc --noEmit
 pnpm build                # compila para dist/
 ```
 
+Os testes nunca usam credenciais reais: `tests/setup/isolate-live-credentials.ts` (carregado via
+`setupFiles` do vitest) zera `NOTION_API_KEY`, as credenciais Google/Drive, os gates
+`FINANCIAL_BACKFILL_*` e os IDs `NOTION_DS_*` antes de qualquer teste (inclusive os vindos do `.env`) e
+bloqueia toda rede que não seja loopback (`TEST_NETWORK_BLOCKED`). Testes que falam com o Notion devem
+injetar um client mock.
+
 ### Flags do CLI
 
 | Flag | Efeito |
