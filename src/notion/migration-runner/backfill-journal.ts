@@ -5,6 +5,12 @@ import Database from 'better-sqlite3';
 
 export type BackfillRunStatus = 'IN_PROGRESS' | 'COMPLETED' | 'FAILED' | 'PAUSED_AFTER_CANARY';
 
+/** operation_index used by run-level audit events (not tied to any plan operation). */
+export const RUN_LEVEL_EVENT_INDEX = -1;
+
+/** The only run failure that may be reopened: a resume drift gate that aborted with 0 writes. */
+export const REOPENABLE_RUN_FAILURE = 'EXTERNAL_DRIFT_DURING_BACKFILL';
+
 export type BackfillOperationStatus =
   | 'PENDING'
   | 'APPLIED'
@@ -462,6 +468,60 @@ export class BackfillJournal {
       this.savePageMapping(params.planHash, params.stableId, params.targetPageId, params.targetDataSource);
 
       this.transitionRunStatus(params.runId, 'IN_PROGRESS', 'PAUSED_AFTER_CANARY');
+    });
+    tx.immediate();
+  }
+
+  /**
+   * Atomic reopening of a run that a drift gate failed without any write while the live state is
+   * consistent with the journal (false positive), in a single IMMEDIATE SQLite transaction:
+   *  1. run must be FAILED with error EXTERNAL_DRIFT_DURING_BACKFILL;
+   *  2. every registered operation must be settled (VERIFIED / NO_OP_VERIFIED): no uncertain write;
+   *  3. append a run-level audit event (operation_index = RUN_LEVEL_EVENT_INDEX) FAILED -> IN_PROGRESS;
+   *  4. run FAILED -> IN_PROGRESS, clearing completed_at and error_sanitized.
+   * Any failure leaves the journal untouched. The caller proves the live state first.
+   */
+  public reopenRunAfterFalseDriftAtomically(params: {
+    runId: string;
+    executorCommitSha: string;
+    reasonCode: string;
+  }): void {
+    const tx = this.db.transaction(() => {
+      const run = this.getRun(params.runId);
+      if (!run || run.status !== 'FAILED' || run.errorSanitized !== REOPENABLE_RUN_FAILURE) {
+        throw new Error(
+          `FAIL_REOPEN_RUN_STATE_INVALID: Run '${params.runId}' deve estar FAILED por ${REOPENABLE_RUN_FAILURE} (atual: ${run?.status ?? 'AUSENTE'} / ${run?.errorSanitized ?? '-'}).`,
+        );
+      }
+      const unsettled = this.getOperations(params.runId).filter(
+        (o) => o.status !== 'VERIFIED' && o.status !== 'NO_OP_VERIFIED',
+      );
+      if (unsettled.length > 0) {
+        throw new Error(
+          `FAIL_REOPEN_OPERATIONS_NOT_SETTLED: Operações não liquidadas no run '${params.runId}': ${unsettled
+            .map((o) => `#${o.operationIndex}=${o.status}`)
+            .join(', ')}.`,
+        );
+      }
+
+      this.recordOperationEvent({
+        runId: params.runId,
+        operationIndex: RUN_LEVEL_EVENT_INDEX,
+        previousStatus: 'FAILED',
+        newStatus: 'IN_PROGRESS',
+        reasonCode: params.reasonCode,
+        executorCommitSha: params.executorCommitSha,
+      });
+
+      const res = this.db
+        .prepare(
+          `UPDATE backfill_runs SET status = 'IN_PROGRESS', completed_at = NULL, error_sanitized = NULL
+           WHERE run_id = ? AND status = 'FAILED' AND error_sanitized = ?`,
+        )
+        .run(params.runId, REOPENABLE_RUN_FAILURE);
+      if (res.changes !== 1) {
+        throw new Error(`FAIL_REOPEN_RUN_STATE_INVALID: Transição FAILED -> IN_PROGRESS do run '${params.runId}' não aplicada.`);
+      }
     });
     tx.immediate();
   }

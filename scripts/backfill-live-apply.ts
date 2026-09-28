@@ -11,6 +11,9 @@
  *    - Working tree clean & remote branch HEAD matching local HEAD
  *    - Fresh preflight authorization artifact (age <= 15m) matching local HEAD
  *    - For initial run: '--canary 1' is MANDATORY (aborts otherwise with CANARY_REQUIRED_FOR_INITIAL_RUN)
+ * 3. With '--execute-live --resume <run_id> --reopen-after-false-drift' (+ FINANCIAL_BACKFILL_REOPEN_RUN_ID=<run_id>):
+ *    reopens a run failed by a resume drift gate whose live state is consistent with the journal; read-only on
+ *    Notion, no preflight artifact (it proves the live state itself). Run the resume preflight afterwards.
  */
 
 import 'dotenv/config';
@@ -125,6 +128,94 @@ function isWorktreeClean(env?: Record<string, string | undefined>): boolean {
   }
 }
 
+/** Workspace identity check (read-only users.me): returns the live hash, fails unless it is the approved one. */
+async function assertApprovedWorkspace(client: Client): Promise<string> {
+  const botUser: any = await client.users.me({});
+  const liveWsId = botUser?.bot?.workspace_id || botUser?.id || '';
+  const liveWsHash = crypto.createHash('sha256').update(liveWsId).digest('hex');
+  if (liveWsHash !== APPROVED_WORKSPACE_IDENTITY_HASH) {
+    throw new Error(
+      `FAIL_PRODUCTION_AUTHORIZATION: Workspace identity (${liveWsHash}) não corresponde ao workspace aprovado (${APPROVED_WORKSPACE_IDENTITY_HASH}).`,
+    );
+  }
+  return liveWsHash;
+}
+
+/**
+ * --reopen-after-false-drift: reopens (FAILED -> IN_PROGRESS) a run failed by a resume drift gate whose live
+ * state is in fact consistent with the journal. Zero Notion mutations by construction (read-only
+ * LiveNotionAdapter); the local journal must equal the durable head and the transition is checkpointed.
+ * A fresh resume preflight is required afterwards, as for any resume.
+ */
+export async function runReopenAfterFalseDrift(
+  env: Record<string, string | undefined>,
+  resumeRunId: string | undefined,
+  currentCommitSha: string,
+  customClient: Client | undefined,
+  deps: { durability?: DurabilityEnvConfig },
+): Promise<void> {
+  if (!resumeRunId) {
+    throw new Error('FAIL_REOPEN_AUTHORIZATION: --reopen-after-false-drift exige --resume <run_id>.');
+  }
+  if (env.FINANCIAL_BACKFILL_REOPEN_RUN_ID?.trim() !== resumeRunId) {
+    throw new Error(
+      `FAIL_REOPEN_AUTHORIZATION: Reabertura do run '${resumeRunId}' exige FINANCIAL_BACKFILL_REOPEN_RUN_ID='${resumeRunId}'.`,
+    );
+  }
+
+  console.log('3. Reabertura de run falhado por drift falso (somente leitura no Notion)...');
+  const apiKey = env.NOTION_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error('FAIL_PRODUCTION_AUTHORIZATION: NOTION_API_KEY não configurada.');
+  }
+  const client = customClient || new Client({ auth: apiKey, notionVersion: '2026-03-11' });
+  await assertApprovedWorkspace(client);
+  console.log('  ✓ Workspace aprovado.');
+
+  const journalPath = path.resolve(process.cwd(), '.local', 'backfill-live-journal.db');
+  if (!fs.existsSync(journalPath)) {
+    throw new Error(`FAIL_RESUME_PREFLIGHT_BINDING: Banco do journal não encontrado em '${journalPath}'.`);
+  }
+  const journal = new BackfillJournal(new Database(journalPath));
+  try {
+    const durabilityCfg = deps.durability || durabilityConfigFromEnv(env);
+    const durability = await DurableJournalCheckpointer.open({ ...durabilityCfg, journal });
+    console.log(`  ✓ Journal local == head durável #${durability.getLastSeq()} (namespace ${durabilityCfg.namespace}).`);
+
+    const executor = new BackfillExecutor({
+      adapter: new LiveNotionAdapter(client, env as Record<string, string | undefined>),
+      journal,
+      envVars: env,
+      commitSha: currentCommitSha,
+      planOriginCommitSha: PLAN_ORIGIN_COMMIT_SHA,
+      resumeRunId,
+      isLive: true,
+      durability,
+      schemaEvidence: {
+        totalDataSources: 13,
+        verifiedDataSources: 13,
+        missingPropertiesCount: 0,
+        structuralMismatchesCount: 0,
+      },
+    });
+    const report = await executor.reopenRunAfterFalseDrift(resumeRunId);
+
+    console.log();
+    console.log('═'.repeat(79));
+    console.log(`  RUN REABERTO: ${report.previousStatus} -> ${report.newStatus}`);
+    console.log('═'.repeat(79));
+    console.log(`  • Run ID:                    ${report.runId}`);
+    console.log(`  • Live Target State Hash:    ${report.observedTargetStateHash}`);
+    console.log(`  • Projected Target State:    ${report.projectedTargetStateHash}`);
+    console.log(`  • Live Mutation Count:       ${report.liveNotionMutations}`);
+    console.log(`  • Head durável:              #${durability.getLastSeq()} (RUN_REOPENED)`);
+    console.log(`  • Status Final no Journal:   ${JSON.stringify(report.journalFinal)}`);
+    console.log();
+  } finally {
+    journal.close();
+  }
+}
+
 export async function runLiveApply(
   customArgs?: string[],
   customEnv?: Record<string, string | undefined>,
@@ -139,6 +230,7 @@ export async function runLiveApply(
   const resumeIdx = args.indexOf('--resume');
   const resumeRunId = resumeIdx !== -1 ? args[resumeIdx + 1] : undefined;
   const isRecoverCanaryOnly = args.includes('--recover-canary-only');
+  const isReopenAfterFalseDrift = args.includes('--reopen-after-false-drift');
 
   const currentCommitSha = getGitCommitSha();
 
@@ -241,6 +333,11 @@ export async function runLiveApply(
     );
   }
   console.log('  ✓ Working tree limpa e sincronizada com o branch remoto (ls-remote verificado).');
+
+  if (isReopenAfterFalseDrift) {
+    await runReopenAfterFalseDrift(env, resumeRunId, currentCommitSha, customClient, deps);
+    return;
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // 3. VALIDAÇÃO DO ARTEFATO DE PREFLIGHT (Itens 4, 5, 6, 16)
@@ -350,15 +447,7 @@ export async function runLiveApply(
 
   const client = customClient || new Client({ auth: apiKey, notionVersion: '2026-03-11' });
 
-  // Workspace Identity Check
-  const botUser: any = await client.users.me({});
-  const liveWsId = botUser?.bot?.workspace_id || botUser?.id || '';
-  const liveWsHash = crypto.createHash('sha256').update(liveWsId).digest('hex');
-  if (liveWsHash !== APPROVED_WORKSPACE_IDENTITY_HASH) {
-    throw new Error(
-      `FAIL_PRODUCTION_AUTHORIZATION: Workspace identity (${liveWsHash}) não corresponde ao workspace aprovado (${APPROVED_WORKSPACE_IDENTITY_HASH}).`,
-    );
-  }
+  const liveWsHash = await assertApprovedWorkspace(client);
   if (liveWsHash !== artifact.workspaceIdentityHash) {
     throw new Error('FAIL_PRODUCTION_AUTHORIZATION: Workspace identity diverge do artefato de preflight.');
   }

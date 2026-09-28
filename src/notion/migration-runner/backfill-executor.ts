@@ -13,6 +13,7 @@ import {
   BackfillOperationStatus,
   BackfillOperationRecord,
   calculateJournalFingerprint,
+  REOPENABLE_RUN_FAILURE,
 } from './backfill-journal';
 import {
   BackfillNotionAdapter,
@@ -26,6 +27,7 @@ import {
   calculateRecordFingerprint,
   canonicalizePageRecord,
   findPropertyContract,
+  normalizeCanonicalPropertiesForFingerprint,
   resolveStableIdentitySpec,
 } from './backfill-serializer';
 import {
@@ -274,6 +276,146 @@ export function projectExpectedBackfillState(
 
   return projected;
 }
+
+/** Relations that Stage 2 (or Notion's dual sync of it) legitimately fills on pages created in Stage 1. */
+const STAGE_2_DEFERRED_RELATIONS = ['Fatura Vinculada', 'Lançamentos do Ciclo', 'Transações de Pagamento'];
+
+export interface ResumeTargetStateEvaluation {
+  projected: Record<string, BaseSnapshotData>;
+  projectedHash: string;
+  observedHash: string;
+  violations: string[];
+}
+
+/**
+ * Evaluates the observed target state of a resumed run against the frozen baseline and the journal.
+ *
+ * Live Notion returns created pages in the sanitized read format (with its own defaults) and maintains
+ * dual relations on related pages, none of which is reproducible from the write payload. The projection is
+ * therefore anchored on what the adapter reads back, and each anchored element is verified first:
+ *  - pages created by this run (settled/applied CREATE ops): must exist, not be archived, and match the plan
+ *    semantically (Stage 1 canonical properties; only Stage 2 relations may differ), otherwise
+ *    FAIL_CREATED_PAGE_MISSING / FAIL_CREATED_PAGE_CONTENT_DRIFT;
+ *  - pre-existing records: exactly the frozen baseline, except that relation arrays may gain back-references
+ *    to pages created by this run that reference that record (dual relations maintained by Notion).
+ * Anything else observed (foreign ids, edits, extra or missing pages) makes observedHash != projectedHash.
+ */
+export function evaluateResumeTargetState(
+  initialState: Record<string, BaseSnapshotData>,
+  plan: BackfillPlanArtifact,
+  journal: BackfillJournal,
+  runId: string,
+  observed: Record<string, BaseSnapshotData>,
+): ResumeTargetStateEvaluation {
+  const projected: Record<string, BaseSnapshotData> = JSON.parse(JSON.stringify(initialState));
+  const violations: string[] = [];
+
+  const createdOps = journal
+    .getOperations(runId)
+    .filter(
+      (o) =>
+        o.action === 'CREATE' &&
+        o.targetPageId &&
+        (o.status === 'VERIFIED' || o.status === 'NO_OP_VERIFIED' || o.status === 'APPLIED'),
+    );
+  const createdPageIds = new Set(createdOps.map((o) => o.targetPageId!));
+  const allowedBackRefs = new Map<string, Set<string>>();
+
+  for (const opRec of createdOps) {
+    const pageId = opRec.targetPageId!;
+    const planOp = plan.operations[opRec.operationIndex];
+    if (!planOp || planOp.stableId !== opRec.stableId || planOp.targetDataSource.envKey !== opRec.targetDataSource) {
+      violations.push(`FAIL_CREATED_PAGE_PLAN_MISMATCH: op #${opRec.operationIndex} diverge do plano.`);
+      continue;
+    }
+    const envKey = planOp.targetDataSource.envKey;
+
+    const existingRelations: Record<string, string[]> = {};
+    const deferred = new Set(STAGE_2_DEFERRED_RELATIONS);
+    for (const [propName, refList] of Object.entries(planOp.relations)) {
+      const existingIds = refList.filter((r) => r.type === 'EXISTING_PAGE_ID').map((r) => r.target);
+      if (existingIds.length > 0) existingRelations[propName] = existingIds;
+      if (refList.some((r) => r.type === 'PLANNED_STABLE_ID')) deferred.add(propName);
+      for (const target of existingIds) {
+        if (!allowedBackRefs.has(target)) allowedBackRefs.set(target, new Set());
+        allowedBackRefs.get(target)!.add(pageId);
+      }
+    }
+
+    const liveRec = observed[envKey]?.records.find((r) => r.id === pageId);
+    if (!liveRec || liveRec.archived) {
+      violations.push(`FAIL_CREATED_PAGE_MISSING: op #${opRec.operationIndex} página ${pageId} ausente ou arquivada.`);
+      continue;
+    }
+
+    const serialized = serializePayloadForNotion(envKey, planOp.sanitizedPayload, existingRelations, true);
+    const withoutDeferred = (props: Record<string, any>) =>
+      Object.fromEntries(
+        Object.entries(normalizeCanonicalPropertiesForFingerprint(envKey, props)).filter(([k]) => !deferred.has(k)),
+      );
+    const expectedFp = calculatePropertiesFingerprint(envKey, withoutDeferred(serialized.canonicalProperties));
+    const liveFp = calculatePropertiesFingerprint(
+      envKey,
+      withoutDeferred(canonicalizePageRecord(envKey, liveRec.properties)),
+    );
+    if (liveFp !== expectedFp) {
+      violations.push(`FAIL_CREATED_PAGE_CONTENT_DRIFT: op #${opRec.operationIndex} página ${pageId} diverge do plano.`);
+      continue;
+    }
+
+    let base = projected[envKey];
+    if (!base) {
+      base = {
+        envKey,
+        defaultTitle: TARGET_CONTRACT[envKey]?.defaultTitle || envKey,
+        dataSourceId: envKey,
+        recordCount: 0,
+        records: [],
+      };
+      projected[envKey] = base;
+    }
+    if (!base.records.some((r) => r.id === pageId)) {
+      base.records.push(JSON.parse(JSON.stringify(liveRec)));
+      base.recordCount = base.records.length;
+    }
+  }
+
+  // Dual relations maintained by Notion on pre-existing records: only back-references to this run's pages.
+  for (const [envKey, base] of Object.entries(projected)) {
+    for (const rec of base.records) {
+      const allowed = allowedBackRefs.get(rec.id);
+      if (!allowed || createdPageIds.has(rec.id)) continue;
+      const liveRec = observed[envKey]?.records.find((r) => r.id === rec.id);
+      if (!liveRec) continue;
+      for (const [propName, frozenVal] of Object.entries(rec.properties)) {
+        const liveVal = liveRec.properties[propName];
+        if (!Array.isArray(frozenVal) || !Array.isArray(liveVal)) continue;
+        const gained = liveVal.filter((id) => typeof id === 'string' && allowed.has(id) && !frozenVal.includes(id));
+        if (gained.length > 0) rec.properties[propName] = [...frozenVal, ...gained];
+      }
+    }
+  }
+
+  return {
+    projected,
+    projectedHash: calculateTargetStateHash(projected),
+    observedHash: calculateTargetStateHash(observed),
+    violations,
+  };
+}
+
+export interface RunReopenReport {
+  runId: string;
+  previousStatus: 'FAILED';
+  newStatus: 'IN_PROGRESS';
+  executorCommitSha: string;
+  observedTargetStateHash: string;
+  projectedTargetStateHash: string;
+  liveNotionMutations: number;
+  journalFinal: Record<BackfillOperationStatus, number>;
+}
+
+export const RUN_REOPEN_REASON_CODE = 'RUN_REOPENED_AFTER_FALSE_DRIFT';
 
 export class BackfillExecutor {
   private adapter: BackfillNotionAdapter;
@@ -588,12 +730,14 @@ export class BackfillExecutor {
     return projected;
   }
 
-  public projectExpectedStateOnResume(
-    initialState: Record<string, BaseSnapshotData>,
-    plan: BackfillPlanArtifact,
-    runId: string,
-  ): Record<string, BaseSnapshotData> {
-    return projectExpectedBackfillState(initialState, plan, this.journal, runId);
+  private static describeDrift(evaluation: ResumeTargetStateEvaluation): string {
+    const shown = evaluation.violations.slice(0, 5).join('; ');
+    const more = evaluation.violations.length > 5 ? ` (+${evaluation.violations.length - 5})` : '';
+    return evaluation.violations.length > 0 ? `: ${shown}${more}` : '';
+  }
+
+  private static isDrift(evaluation: ResumeTargetStateEvaluation): boolean {
+    return evaluation.violations.length > 0 || evaluation.observedHash !== evaluation.projectedHash;
   }
 
   private buildRelationPatchesForBill(
@@ -645,6 +789,92 @@ export class BackfillExecutor {
     }
     await this.durableBarrier('RUN_EXIT');
     return report;
+  }
+
+  /**
+   * Reopens (FAILED -> IN_PROGRESS) a run that a resume drift gate failed although the live state is
+   * consistent with the journal. Performs zero Notion mutations. Requires, in order:
+   *  - explicit gate FINANCIAL_BACKFILL_REOPEN_RUN_ID == runId (FAIL_REOPEN_AUTHORIZATION);
+   *  - run FAILED by EXTERNAL_DRIFT_DURING_BACKFILL (FAIL_REOPEN_RUN_STATE_INVALID);
+   *  - every operation settled, i.e. no uncertain write (FAIL_REOPEN_OPERATIONS_NOT_SETTLED);
+   *  - reproduced frozen plan and run metadata binding (executor preflight);
+   *  - live state exactly equal to the journal projection, with every created page verified
+   *    semantically (FAIL_REOPEN_REAL_DRIFT; the journal is left untouched).
+   * The transition and its audit event are atomic, then durably checkpointed ('RUN_REOPENED').
+   */
+  public async reopenRunAfterFalseDrift(runId: string): Promise<RunReopenReport> {
+    this.assertDurabilityForLive();
+    if (this.envVars.FINANCIAL_BACKFILL_REOPEN_RUN_ID?.trim() !== runId) {
+      throw new Error(
+        `FAIL_REOPEN_AUTHORIZATION: Reabertura do run '${runId}' exige FINANCIAL_BACKFILL_REOPEN_RUN_ID='${runId}'.`,
+      );
+    }
+    const run = this.journal.getRun(runId);
+    if (!run) {
+      throw new Error(`FAIL_RESUME_NO_RUN_FOUND: Run '${runId}' não encontrado no journal.`);
+    }
+    if (run.status !== 'FAILED' || run.errorSanitized !== REOPENABLE_RUN_FAILURE) {
+      throw new Error(
+        `FAIL_REOPEN_RUN_STATE_INVALID: Run '${runId}' deve estar FAILED por ${REOPENABLE_RUN_FAILURE} (atual: ${run.status} / ${run.errorSanitized ?? '-'}).`,
+      );
+    }
+    const unsettled = this.journal
+      .getOperations(runId)
+      .filter((o) => o.status !== 'VERIFIED' && o.status !== 'NO_OP_VERIFIED');
+    if (unsettled.length > 0) {
+      throw new Error(
+        `FAIL_REOPEN_OPERATIONS_NOT_SETTLED: Operações não liquidadas no run '${runId}': ${unsettled
+          .map((o) => `#${o.operationIndex}=${o.status}`)
+          .join(', ')}.`,
+      );
+    }
+
+    const executorCommitSha = this.getGitCommitSha();
+    const preflightRes = await this.preflight();
+    const plan = preflightRes.planArtifact;
+    if (run.planHash !== plan.backfillPlanHash) {
+      throw new Error(
+        `FAIL_JOURNAL_BINDING_MISMATCH: Plan hash do run (${run.planHash}) diverge do plano reproduzido (${plan.backfillPlanHash}).`,
+      );
+    }
+    this.journal.validateRunMetadata(runId, {
+      planHash: plan.backfillPlanHash,
+      planOriginCommitSha: this.options.planOriginCommitSha || PLAN_ORIGIN_COMMIT_SHA,
+      sourceSnapshotHash: preflightRes.sourceSnapshotHash,
+      targetSnapshotHash: preflightRes.targetSnapshotHash,
+      targetStateHash: preflightRes.targetStateHash,
+    });
+
+    const observed = await this.adapter.queryTargetState();
+    const evaluation = evaluateResumeTargetState(preflightRes.preflightBases, plan, this.journal, runId, observed);
+    if (BackfillExecutor.isDrift(evaluation)) {
+      throw new Error(
+        `FAIL_REOPEN_REAL_DRIFT: Estado live (${evaluation.observedHash}) diverge da projeção do journal (${evaluation.projectedHash})${BackfillExecutor.describeDrift(evaluation)}. Run mantido FAILED.`,
+      );
+    }
+
+    const liveNotionMutations = this.adapter.getMutationCount();
+    if (liveNotionMutations !== 0) {
+      throw new Error(`FAIL_MUTATION_DURING_REOPEN: Reabertura executou ${liveNotionMutations} mutações no Notion. Permitido: 0.`);
+    }
+
+    this.journal.reopenRunAfterFalseDriftAtomically({
+      runId,
+      executorCommitSha,
+      reasonCode: RUN_REOPEN_REASON_CODE,
+    });
+    await this.durableBarrier('RUN_REOPENED');
+
+    return {
+      runId,
+      previousStatus: 'FAILED',
+      newStatus: 'IN_PROGRESS',
+      executorCommitSha,
+      observedTargetStateHash: evaluation.observedHash,
+      projectedTargetStateHash: evaluation.projectedHash,
+      liveNotionMutations,
+      journalFinal: this.journal.countByStatus(runId),
+    };
   }
 
   private async executeInner(): Promise<BackfillExecutorReport> {
@@ -836,12 +1066,17 @@ export class BackfillExecutor {
     // 5. Initial Drift Check (State A = pristine, State B = fully applied, or Resume = projected)
     if (!this.options.skipInitialDriftCheck) {
       if (isResume) {
-        const projectedResumeState = this.projectExpectedStateOnResume(preflightRes.preflightBases, plan, runId);
-        const projectedResumeHash = calculateTargetStateHash(projectedResumeState);
-        if (currentTargetHash !== projectedResumeHash) {
+        const evaluation = evaluateResumeTargetState(
+          preflightRes.preflightBases,
+          plan,
+          this.journal,
+          runId,
+          currentTargetState,
+        );
+        if (BackfillExecutor.isDrift(evaluation)) {
           this.journal.failRun(runId, 'EXTERNAL_DRIFT_DURING_BACKFILL');
           throw new Error(
-            `EXTERNAL_DRIFT_DURING_BACKFILL: Target state durante resume (${currentTargetHash}) diverge do estado esperado projetado (${projectedResumeHash}). 0 writes executados.`,
+            `EXTERNAL_DRIFT_DURING_BACKFILL: Target state durante resume (${evaluation.observedHash}) diverge do estado esperado projetado (${evaluation.projectedHash})${BackfillExecutor.describeDrift(evaluation)}. 0 writes executados.`,
           );
         }
       } else {
@@ -1200,18 +1435,22 @@ export class BackfillExecutor {
 
     // Item 18: Checkpoint antes do Stage 2: recalcular estado esperado pelo journal e comparar com live
     if (!this.options.skipInitialDriftCheck) {
-      const projectedStage1State = this.projectExpectedStateOnResume(preflightRes.preflightBases, plan, runId);
-      const projectedStage1Hash = calculateTargetStateHash(projectedStage1State);
       const currentLiveState = await this.adapter.queryTargetState();
-      const currentLiveHash = calculateTargetStateHash(currentLiveState);
+      const evaluation = evaluateResumeTargetState(
+        preflightRes.preflightBases,
+        plan,
+        this.journal,
+        runId,
+        currentLiveState,
+      );
 
       const fullyAppliedState = this.projectFullyAppliedState(preflightRes.preflightBases, plan);
       const fullyAppliedHash = calculateTargetStateHash(fullyAppliedState);
 
-      if (currentLiveHash !== projectedStage1Hash && currentLiveHash !== fullyAppliedHash) {
+      if (BackfillExecutor.isDrift(evaluation) && evaluation.observedHash !== fullyAppliedHash) {
         this.journal.failRun(runId, 'EXTERNAL_DRIFT_DURING_BACKFILL');
         throw new Error(
-          `EXTERNAL_DRIFT_DURING_BACKFILL: Target state após Stage 1 (${currentLiveHash}) diverge do estado esperado projetado pelo journal (${projectedStage1Hash}). Stage 2 abortado.`,
+          `EXTERNAL_DRIFT_DURING_BACKFILL: Target state após Stage 1 (${evaluation.observedHash}) diverge do estado esperado projetado pelo journal (${evaluation.projectedHash})${BackfillExecutor.describeDrift(evaluation)}. Stage 2 abortado.`,
         );
       }
     }

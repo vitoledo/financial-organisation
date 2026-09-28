@@ -36,7 +36,7 @@ import {
   ResumePreflightArtifact,
   calculateJournalFingerprint,
 } from '../src/notion/migration-runner/backfill-live-preflight';
-import { runLiveApply } from '../scripts/backfill-live-apply';
+import { runLiveApply, runReopenAfterFalseDrift } from '../scripts/backfill-live-apply';
 import { serializePayloadForNotion } from '../src/notion/migration-runner/backfill-serializer';
 import {
   DurableJournalCheckpointer,
@@ -1433,6 +1433,25 @@ describe('Phase 2D: Production Live Apply Infrastructure & Canary Verification',
       await expect(runLiveApply(['--execute-live'], env)).rejects.toThrow(
         /FAIL_PRODUCTION_AUTHORIZATION|CANARY_REQUIRED_FOR_INITIAL_RUN|FAIL_EXECUTOR_COMMIT_MISMATCH/,
       );
+    });
+
+    it('--reopen-after-false-drift without --resume: FAIL_REOPEN_AUTHORIZATION before any Notion call', async () => {
+      const client = { users: { me: vi.fn() } } as unknown as Client;
+      await expect(runReopenAfterFalseDrift(testEnv, undefined, 'test-sha', client, {})).rejects.toThrow(
+        /FAIL_REOPEN_AUTHORIZATION: --reopen-after-false-drift exige --resume/,
+      );
+      expect((client as any).users.me).not.toHaveBeenCalled();
+    });
+
+    it('--reopen-after-false-drift without FINANCIAL_BACKFILL_REOPEN_RUN_ID == run: FAIL_REOPEN_AUTHORIZATION before any Notion call', async () => {
+      const client = { users: { me: vi.fn() } } as unknown as Client;
+      for (const gate of [undefined, 'another-run']) {
+        const env = { ...testEnv, FINANCIAL_BACKFILL_REOPEN_RUN_ID: gate };
+        await expect(runReopenAfterFalseDrift(env, 'run-x', 'test-sha', client, {})).rejects.toThrow(
+          /FAIL_REOPEN_AUTHORIZATION: Reabertura do run 'run-x' exige FINANCIAL_BACKFILL_REOPEN_RUN_ID='run-x'/,
+        );
+      }
+      expect((client as any).users.me).not.toHaveBeenCalled();
     });
 
     it('preflight readyForLiveApplyReview=false -> 0 writes', async () => {
