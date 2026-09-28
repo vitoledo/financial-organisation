@@ -5,6 +5,8 @@ export default defineConfig({
     environment: 'node',
     fileParallelism: false,
     include: ['tests/**/*.test.ts'],
+    // Neutralizes live credentials and blocks non-loopback network before any test file loads.
+    setupFiles: ['tests/setup/isolate-live-credentials.ts'],
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
