@@ -15,7 +15,15 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "notion:check-schema": "ts-node scripts/introspect-notion.ts"
+    "notion:check-schema": "ts-node scripts/introspect-notion.ts",
+    "notion:migrate": "ts-node scripts/migrate-notion.ts",
+    "notion:snapshot-data": "ts-node scripts/snapshot-notion-data.ts",
+    "notion:backfill-dry": "ts-node scripts/backfill-dry-run.ts",
+    "notion:backfill-simulate": "ts-node scripts/backfill-simulate.ts",
+    "notion:backfill-live-preflight": "ts-node scripts/backfill-live-preflight.ts",
+    "notion:backfill-live-resume-preflight": "ts-node scripts/backfill-live-resume-preflight.ts",
+    "notion:backfill-live-apply": "ts-node scripts/backfill-live-apply.ts",
+    "notion:journal-durability": "ts-node scripts/journal-durability.ts"
   },
   "keywords": [
     "finance",

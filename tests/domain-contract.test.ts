@@ -755,7 +755,7 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     expect(report.verifiedCount).toBe(0);
     expect(report.failedCount).toBe(12);
 
-    // NOTION_DS_CARD_BILLS is marked as PROPOSED_NEW_DATABASE with PROPOSED_TO_CREATE properties
+    // When NOTION_DS_CARD_BILLS is not in env, it reports as PROPOSED_NEW_DATABASE
     expect(report.results.NOTION_DS_CARD_BILLS.status).toBe('PROPOSED_NEW_DATABASE');
     expect(report.results.NOTION_DS_CARD_BILLS.properties[0].status).toBe('PROPOSED_TO_CREATE');
 
@@ -764,6 +764,20 @@ describe('Notion: Schema Validator (Phase 0 Introspector)', () => {
     expect(report.results.NOTION_DS_ACCOUNTS.properties[0].status).toBe('UNVERIFIED');
     expect(report.results.NOTION_DS_TRANSACTIONS.status).toBe('MISSING_ENV_ID');
     expect(report.results.NOTION_DS_TRANSACTIONS.properties[0].status).toBe('UNVERIFIED');
+  });
+
+  test('treats NOTION_DS_CARD_BILLS as 13th existing database when configured or treatAllAsExisting is set', async () => {
+    const validator = new NotionSchemaValidator(); // Offline mode
+    const report = await validator.runIntrospection({
+      NOTION_DS_CARD_BILLS: 'edc7a23e-d2f4-4e4e-b2e2-af51212f1b0b',
+    });
+
+    expect(report.totalCanonical).toBe(13);
+    expect(report.expectedExisting).toBe(13);
+    expect(report.configuredCount).toBe(1);
+    expect(report.results.NOTION_DS_CARD_BILLS.isExisting).toBe(true);
+    expect(report.results.NOTION_DS_CARD_BILLS.status).toBe('UNVERIFIED_NO_KEY');
+    expect(report.results.NOTION_DS_CARD_BILLS.properties[0].status).toBe('UNVERIFIED');
   });
 
   test('classifies properties into EXACT_MATCH, RENAME_CANDIDATE, RENAME_TYPE_MISMATCH, TYPE_MISMATCH, MISSING, EXTRA_PRESERVE', () => {
@@ -1341,6 +1355,28 @@ describe('Domain: Money & DecimalQuantity Constructor Invariant Hardening', () =
     expect(() => new DecimalQuantity(100n, -1)).toThrow(/Scale must be an integer between 0 and 20/i);
     expect(() => new DecimalQuantity(100n, 21)).toThrow(/Scale must be an integer between 0 and 20/i);
     expect(() => new DecimalQuantity(100n, 2.5)).toThrow(/Scale must be an integer between 0 and 20/i);
+  });
+});
+
+describe('Domain: Schema Contract Invariants', () => {
+  test('all properties with notionType === number must declare explicit numberFormat (real | number)', () => {
+    const violations: Array<{ base: string; prop: string; format?: string }> = [];
+
+    for (const [baseKey, contract] of Object.entries(TARGET_CONTRACT)) {
+      for (const prop of contract.properties) {
+        if (prop.notionType === 'number') {
+          if (!prop.numberFormat || (prop.numberFormat !== 'real' && prop.numberFormat !== 'number')) {
+            violations.push({
+              base: baseKey,
+              prop: prop.notionProperty,
+              format: prop.numberFormat,
+            });
+          }
+        }
+      }
+    }
+
+    expect(violations).toEqual([]);
   });
 });
 

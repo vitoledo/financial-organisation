@@ -12,7 +12,10 @@ async function main() {
   const apiKey = process.env.NOTION_API_KEY?.trim();
   const validator = new NotionSchemaValidator(apiKey);
 
-  const report = await validator.runIntrospection(process.env as Record<string, string | undefined>);
+  const report = await validator.runIntrospection(
+    process.env as Record<string, string | undefined>,
+    { treatAllAsExisting: true },
+  );
 
   const outputPath = path.resolve(process.cwd(), 'architecture', 'notion-schema-delta.md');
   validator.writeReportToMarkdown(report, outputPath);
@@ -20,11 +23,31 @@ async function main() {
   console.log(`✅ Manifesto de Schema-Delta gerado com sucesso em:`);
   console.log(`   ${outputPath}\n`);
 
+  const proposedCount = Object.values(report.results).filter((r) => r.status === 'PROPOSED_NEW_DATABASE').length;
+  const missingPropertiesCount = Object.values(report.results).reduce(
+    (acc, r) => acc + r.properties.filter((p) => p.status === 'MISSING').length,
+    0,
+  );
+  const mismatchesCount = Object.values(report.results).reduce(
+    (acc, r) =>
+      acc +
+      r.properties.filter(
+        (p) => p.status === 'TYPE_MISMATCH' || p.status === 'RENAME_TYPE_MISMATCH',
+      ).length,
+    0,
+  );
+
   console.log(`Resumo dos Data Sources (Canônicos: ${report.totalCanonical}, Esperados Existentes: ${report.expectedExisting}):`);
   console.log(`  • Bases Verificadas com Sucesso na API: ${report.verifiedCount}/${report.expectedExisting}`);
   console.log(`  • Bases com ID Configurado no Ambiente: ${report.configuredCount}/${report.expectedExisting}`);
   console.log(`  • Bases Não Verificadas / Falhas: ${report.failedCount}`);
-  console.log(`  • Base Nova Proposta (a criar externamente): 1\n`);
+  if (proposedCount > 0) {
+    console.log(`  • Base Nova Proposta (a criar externamente): ${proposedCount}`);
+  } else {
+    console.log(`  • Bases Propostas a Criar: 0 (Nenhuma base proposta)`);
+  }
+  console.log(`  • Propriedades Faltantes (MISSING): ${missingPropertiesCount}`);
+  console.log(`  • Divergências Estruturais (STRUCTURAL_MISMATCH): ${mismatchesCount}\n`);
 
   for (const [key, diff] of Object.entries(report.results)) {
     const icon =

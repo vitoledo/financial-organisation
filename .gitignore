@@ -13,11 +13,18 @@ sessao.txt
 # Local data (sensitive)
 data/
 !data/.gitkeep
+.local/
+
+# Backups (encrypted financial snapshots)
+backups/
+*.enc
 
 # Financial summary export — belongs in data/, but ignore it anywhere as a
 # backstop: it contains balances, transactions and the whole net-worth picture.
 financial-summary.json
 **/financial-summary.json
+account-mapping.json
+**/account-mapping.json
 
 # Environment variables (sensitive)
 .env
@@ -37,3 +44,6 @@ exploration/
 
 # Documentation files
 docs/
+
+# Privacy blocklist
+.privacy-blocklist*
