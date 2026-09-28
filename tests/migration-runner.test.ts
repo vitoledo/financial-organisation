@@ -544,14 +544,21 @@ describe('Notion Migration Runner (Phase 1 Dry-Run & Planning)', () => {
     });
 
     it('nenhum backup de DB real funciona sem chave ou com chave que não decodifica para exatamente 32 bytes', async () => {
-      const backupManagerNoKey = new FinancialBackupManager({
-        dbPath: testDbPath,
-        backupDir: testBackupDir,
-        key: undefined,
-      });
-      await expect(backupManagerNoKey.createEncryptedBackup()).rejects.toThrow(
-        /Chave de backup ausente/,
-      );
+      // The manager falls back to process.env.MIGRATION_BACKUP_KEY; isolate it so "no key" really means none.
+      const savedEnvKey = process.env.MIGRATION_BACKUP_KEY;
+      delete process.env.MIGRATION_BACKUP_KEY;
+      try {
+        const backupManagerNoKey = new FinancialBackupManager({
+          dbPath: testDbPath,
+          backupDir: testBackupDir,
+          key: undefined,
+        });
+        await expect(backupManagerNoKey.createEncryptedBackup()).rejects.toThrow(
+          /Chave de backup ausente/,
+        );
+      } finally {
+        if (savedEnvKey !== undefined) process.env.MIGRATION_BACKUP_KEY = savedEnvKey;
+      }
 
       const backupManagerWeakKey = new FinancialBackupManager({
         dbPath: testDbPath,
