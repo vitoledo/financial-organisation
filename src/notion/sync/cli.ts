@@ -12,8 +12,10 @@ import { NotionSyncGateway } from './notion-gateway';
 
 const LOCK_STALE_MS = 2 * 60 * 60 * 1000;
 
+// With --json, stdout carries only the report; progress goes to stderr.
+const jsonMode = process.argv.includes('--json');
 const logger: Logger = {
-  info: (msg) => console.log(`${new Date().toISOString().substring(11, 19)} ${msg}`),
+  info: (msg) => (jsonMode ? console.error : console.log)(`${new Date().toISOString().substring(11, 19)} ${msg}`),
   warn: (msg, meta) => console.warn(`${new Date().toISOString().substring(11, 19)} ⚠ ${msg}${meta ? ` ${JSON.stringify(meta)}` : ''}`),
   error: (msg, meta) => console.error(`${new Date().toISOString().substring(11, 19)} ✖ ${msg}${meta ? ` ${JSON.stringify(meta)}` : ''}`),
 };

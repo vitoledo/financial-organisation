@@ -91,6 +91,16 @@ describe('classifyTransaction', () => {
     const c = classifyTransaction(row({ amount: -300, description: 'Pagamento de fatura', category_pierre: 'Pagamento de cartão de crédito' }), kw);
     expect(c).toMatchObject({ branch: 'CARD_BILL_PAYMENT', economicNature: 'Pagamento de fatura', budgetEffect: 'Neutro' });
   });
+  it('does not mistake a Pix to a payment institution for a bill payment', () => {
+    const c = classifyTransaction(row({ amount: -67.21, category_pierre: 'Serviços', description: 'Transferência enviada|Pagar Me Instituição De Pagamento S.A.' }), kw);
+    expect(c).toMatchObject({ branch: 'STANDARD_EXPENSE', economicNature: 'Despesa', categoryName: 'Serviços e assinaturas' });
+    const nu = classifyTransaction(row({ amount: -50, category_pierre: 'Transferências', description: 'Transferência enviada|Nu Pagamentos S.A.' }), kw);
+    expect(nu.branch).toBe('THIRD_PARTY_OUTGOING');
+  });
+  it('recognizes the bank card-payment descriptions even without the Pierre category', () => {
+    expect(classifyTransaction(row({ amount: -10, category_pierre: null, description: 'Pagamento recebido' }), kw).branch).toBe('CARD_BILL_PAYMENT');
+    expect(classifyTransaction(row({ amount: -10, category_pierre: 'Outros', description: 'Pagamento de fatura' }), kw).branch).toBe('CARD_BILL_PAYMENT');
+  });
   it('keeps third-party outgoing transfers pending review', () => {
     const c = classifyTransaction(row({ amount: -30, category_pierre: 'Transferências', description: 'Transferência enviada|Beltrano' }), kw);
     expect(c).toMatchObject({ branch: 'THIRD_PARTY_OUTGOING', reviewReason: THIRD_PARTY_OUTGOING_REASON });
