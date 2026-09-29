@@ -23,7 +23,9 @@
     "notion:backfill-live-preflight": "ts-node scripts/backfill-live-preflight.ts",
     "notion:backfill-live-resume-preflight": "ts-node scripts/backfill-live-resume-preflight.ts",
     "notion:backfill-live-apply": "ts-node scripts/backfill-live-apply.ts",
-    "notion:journal-durability": "ts-node scripts/journal-durability.ts"
+    "notion:journal-durability": "ts-node scripts/journal-durability.ts",
+    "notion:sync": "ts-node src/notion/sync/cli.ts",
+    "notion:sync:apply": "ts-node src/notion/sync/cli.ts --apply"
   },
   "keywords": [
     "finance",

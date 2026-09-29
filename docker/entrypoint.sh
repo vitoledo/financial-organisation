@@ -8,6 +8,12 @@ if [ "$1" = "sync" ]; then
   exec node /app/dist/index.js "$@"
 fi
 
+# `docker compose run --rm app notion-sync [--apply] [--flags]` → one Pierre → Notion run (simulates without --apply).
+if [ "$1" = "notion-sync" ]; then
+  shift
+  exec node /app/dist/notion/sync/cli.js "$@"
+fi
+
 # Default (`docker compose up`) → resident scheduler. supercronic stays up as
 # PID 1 and spawns a fresh `node` process per scheduled run, so each sync gets
 # a clean SQLite connection and honest exit codes.

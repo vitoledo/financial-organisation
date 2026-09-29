@@ -155,6 +155,54 @@ docker compose run --rm app sync  # sync manual sob demanda
 
 ---
 
+## Sincronização com o Notion
+
+`pnpm notion:sync` leva os dados do Pierre para o painel **Finanças** no Notion (Transações, Faturas /
+Ciclos de Cartão, Contas e Log de Sincronização):
+
+```
+Pierre → normalização → SQLite (verdade local) → projeção determinística → Notion
+```
+
+```bash
+pnpm notion:sync                 # simula: mostra o que mudaria e não grava nada
+pnpm notion:sync:apply           # grava no Notion
+pnpm notion:sync --skip-pierre   # projeta só o histórico local do SQLite (sem chamar o Pierre)
+docker compose run --rm app notion-sync --apply   # no servidor
+```
+
+No servidor ela roda sozinha às 06:40 e 18:40 (`docker/crontab`), dez minutos depois da planilha.
+
+**Como decide o que gravar.** Cada execução recalcula, a partir de todo o histórico do SQLite, o estado
+esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` no contrato
+`src/domain/schema-contract.ts`), compara com as páginas existentes e aplica o mínimo:
+
+- **Transações novas** são criadas com a mesma classificação da migração (a projeção é validada contra o
+  plano congelado de 159 operações em `tests/notion-sync-parity.test.ts`). O casamento é pelo
+  `ID da fonte`, então rodar duas vezes nunca duplica nada.
+- **Transações existentes**: só data, valor, status do banco, categoria do Pierre, conta, fatura e hash são
+  atualizados. A classificação que você revisou (Natureza, Efeito, Categoria, Status de Revisão) e os seus
+  campos (Revisado, Observações, Conta no orçamento…) **nunca** são sobrescritos.
+- **Regras de Classificação**: regras ativas com *Auto aplicar* classificam as transações novas e também as
+  pendentes que ninguém tocou ainda. *Exigir revisão* deixa o resultado como *Provável*. Vale a primeira
+  regra por *Prioridade* (menor primeiro).
+- **Faturas**: ciclos novos são criados; período, total de compras e pagamentos são recalculados. Status
+  oficial, valor oficial e liquidação preenchidos por você são preservados.
+- **Contas**: saldo e limites só são atualizados quando o dado da fonte é tão ou mais recente que o
+  *Atualizado em* da página.
+- Nada é apagado ou arquivado. Opções novas de select e propriedades inexistentes abortam a execução antes
+  de gravar (nenhuma mudança de schema). Mais de `NOTION_SYNC_MAX_CREATES` (300) páginas novas numa execução
+  exigem `--allow-large`. Uma trava (`data/notion-sync.lock`) impede duas execuções simultâneas.
+- Cada execução com `--apply` registra uma linha no **Log de Sincronização** e grava
+  `data/last-notion-sync.json`; depois de gravar, relê o Notion e confirma que não sobrou diferença.
+
+**Configuração** (além das variáveis do Pierre): `NOTION_API_KEY`, `NOTION_DS_TRANSACTIONS`,
+`NOTION_DS_CARD_BILLS`, `NOTION_DS_ACCOUNTS`, `NOTION_DS_CATEGORIES`, `NOTION_DS_RULES`,
+`NOTION_DS_SYNC_LOG`, `COUNTERPARTY_HMAC_KEY` (a mesma da migração) e `data/account-mapping.json`
+(`ACCOUNT_MAPPING_PATH`), que diz qual conta do Pierre é a conta corrente e qual é o cartão.
+
+---
+
 ## Estrutura
 
 ```
