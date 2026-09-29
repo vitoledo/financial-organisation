@@ -12,6 +12,7 @@ import { AccountRole, ProjectionContext, SqliteAccountRow, SqliteTransactionRow 
 
 const SYNC_LOG_ENV = 'NOTION_DS_SYNC_LOG';
 const PIERRE_SYNC_WAIT_MS = 30_000;
+const PENDING_LOOKBACK_DAYS = 3;
 
 export interface NotionSyncSettings {
   accountRoles: Record<string, AccountRole>;
@@ -237,6 +238,16 @@ export class NotionSyncEngine {
     const allAccounts = (await pierre.getAccounts()).data;
     const relevant = allAccounts.filter((a) => !shouldExcludeAccount(a));
     const window = calculateDateRange(repo.getLastSuccessfulSync()?.completed_at ?? null, options.fullSync, this.now());
+    // Pending rows change date, status and bill when the bank posts them (often weeks later), and the posted
+    // copies can arrive back-dated: re-read from the oldest pending row, bounded by the full-sync window.
+    const oldestPending = (this.deps.db.prepare("SELECT MIN(date) AS d FROM transactions WHERE status = 'PENDING'").get() as { d: string | null }).d;
+    if (oldestPending) {
+      const start = new Date(oldestPending);
+      start.setUTCDate(start.getUTCDate() - PENDING_LOOKBACK_DAYS);
+      const floor = calculateDateRange(null, true, this.now()).startDate;
+      const candidate = start.toISOString().substring(0, 10) < floor ? floor : start.toISOString().substring(0, 10);
+      if (candidate < window.startDate) window.startDate = candidate;
+    }
     const rawTxs = (await pierre.getTransactions(window.startDate, window.endDate)).data;
     const relevantIds = new Set(relevant.map((a) => a.id));
     const txs = rawTxs.filter((t) => relevantIds.has(t.account_id)).map(normalizeTransaction);

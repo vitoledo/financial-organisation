@@ -254,11 +254,39 @@ function reconcileTransactions(
 
 function reconcileBills(projection: ProjectionResult, live: LiveState, txPageId: Map<string, string>, plan: SyncPlan): void {
   const projectedIds = new Set(projection.bills.map((b) => b.stableId));
+  // Transactions whose bill link this plan already points elsewhere.
+  const relinked = new Set(plan.txUpdates.filter((u) => 'Fatura Vinculada' in u.relations).map((u) => u.pageId));
+  const stillLinkedTo = (billPageId: string) =>
+    [...live.transactions.values()].some((pages) =>
+      pages.some((t) => !relinked.has(t.pageId) && (liveValue(TX_ENV, 'Fatura Vinculada', t) as string[]).includes(billPageId)),
+    );
   for (const [stableId, pages] of live.bills) {
     if (pages.length > 1) plan.fatal.push(`DUPLICATE_STABLE_ID: ${pages.length} páginas em Faturas com ID Estável ${stableId}.`);
-    if (!projectedIds.has(stableId)) {
-      plan.warnings.push(`STALE_BILL: a fatura ${stableId} existe no Notion mas não é mais derivada da fonte; mantida intacta.`);
+    if (projectedIds.has(stableId)) continue;
+    const page = pages[0];
+    // An estimated cycle whose purchases the bank has since assigned to its official bill: its derived
+    // totals would double-count them, so they are zeroed. The page and the user's fields stay.
+    if (pages.length === 1 && liveValue(BILL_ENV, 'Tipo de Ciclo', page) === 'Ciclo Estimado' && !stillLinkedTo(page.pageId)) {
+      const payload: Record<string, any> = {};
+      const relations: Record<string, RefTarget[]> = {};
+      const fields: string[] = [];
+      for (const f of ['Total de Compras no Ciclo', 'Valor Pago']) {
+        if (!same(canonicalValue(BILL_ENV, f, 0), liveValue(BILL_ENV, f, page))) {
+          payload[f] = 0;
+          fields.push(f);
+        }
+      }
+      if ((liveValue(BILL_ENV, 'Transações de Pagamento', page) as string[]).length > 0) {
+        relations['Transações de Pagamento'] = [];
+        fields.push('Transações de Pagamento');
+      }
+      if (fields.length > 0) plan.billUpdates.push({ stableId, pageId: page.pageId, payload, relations, fields });
+      plan.warnings.push(
+        `SUPERSEDED_ESTIMATED_BILL: o ciclo estimado ${stableId} foi substituído pela fatura oficial do banco; totais zerados e página mantida (pode ser apagada manualmente).`,
+      );
+      continue;
     }
+    plan.warnings.push(`STALE_BILL: a fatura ${stableId} existe no Notion mas não é mais derivada da fonte; mantida intacta.`);
   }
 
   for (const bill of projection.bills) {

@@ -312,6 +312,39 @@ describe('reconcile', () => {
     expect(plan.warnings.join()).toMatch(/STALE_BILL: a fatura nubank:cartao:2026-01:cycle/);
   });
 
+  const estimatedCycle = () => {
+    const raw = { 'Tipo de Ciclo': sel('Ciclo Estimado'), 'Total de Compras no Ciclo': num(50), 'Valor Pago': num(20), 'Transações de Pagamento': rel('pay-page'), 'Status da Fatura': sel('Paga Integralmente') };
+    return { pageId: 'old-est', canonical: canonicalizeLive('NOTION_DS_CARD_BILLS', raw), raw };
+  };
+
+  it('zeroes an estimated cycle once the bank moved all its purchases to the official bill', () => {
+    const rows = [purchase];
+    const live = liveFromProjection(rows);
+    live.bills.set('nubank:cartao:2026-01:cycle', [estimatedCycle()]);
+    const plan = reconcile(projectNotionState(ACCOUNTS, rows, ctx()), rows, [], live, noAccounts, { hmacKeyAvailable: true });
+    expect(plan.billUpdates).toEqual([
+      {
+        stableId: 'nubank:cartao:2026-01:cycle',
+        pageId: 'old-est',
+        payload: { 'Total de Compras no Ciclo': 0, 'Valor Pago': 0 },
+        relations: { 'Transações de Pagamento': [] },
+        fields: ['Total de Compras no Ciclo', 'Valor Pago', 'Transações de Pagamento'],
+      },
+    ]);
+    expect(plan.warnings.join()).toMatch(/SUPERSEDED_ESTIMATED_BILL: o ciclo estimado nubank:cartao:2026-01:cycle/);
+  });
+
+  it('leaves an estimated cycle alone while some transaction still points to it', () => {
+    const rows = [purchase];
+    const live = liveFromProjection(rows);
+    live.bills.set('nubank:cartao:2026-01:cycle', [estimatedCycle()]);
+    const manual = { 'ID da fonte': rt('manual-1'), 'Fatura Vinculada': rel('old-est') };
+    live.transactions.set('manual-1', [{ pageId: 'manual-page', canonical: canonicalizeLive('NOTION_DS_TRANSACTIONS', manual), raw: manual }]);
+    const plan = reconcile(projectNotionState(ACCOUNTS, rows, ctx()), rows, [], live, noAccounts, { hmacKeyAvailable: true });
+    expect(plan.billUpdates).toEqual([]);
+    expect(plan.warnings.join()).toMatch(/STALE_BILL: a fatura nubank:cartao:2026-01:cycle/);
+  });
+
   it('refreshes balances only from a snapshot at least as recent as the page', () => {
     const accountPage = (name: string, props: Record<string, any>) => ({ pageId: name === 'Nubank Conta' ? PAGES.conta : PAGES.cartao, name, canonical: canonicalizeLive('NOTION_DS_ACCOUNTS', props), raw: props });
     const live: LiveState = {
@@ -509,6 +542,23 @@ describe('NotionSyncEngine', () => {
     expect((db.prepare("SELECT status FROM transactions WHERE id = 't-loja'").get() as any).status).toBe('POSTED');
     const loja = notion.byDs(DS.transactions).find((p) => p.properties['ID da fonte'].rich_text[0].text.content === 't-loja')!;
     expect(loja.properties['Status']).toEqual(sel('Confirmado'));
+  });
+
+  it('re-reads Pierre from the oldest pending transaction, bounded by the full-sync window', async () => {
+    const withWindow = (pierreTxs: any[], starts: string[]) => {
+      const pierre = fakePierre(pierreTxs);
+      pierre.getTransactions = async (start: string) => (starts.push(start), { data: pierreTxs });
+      return new NotionSyncEngine(SETTINGS, { gateway: new NotionSyncGateway(notion as any, DS, { minIntervalMs: 0, sleep: async () => {} }), db, pierre, now: () => new Date('2026-09-29T12:00:00.000Z'), sleep: async () => {} }, quiet);
+    };
+    const starts: string[] = [];
+    await withWindow(txs, starts).run(opts); // t-loja is PENDING on 2026-09-18
+    await withWindow(txs, starts).run(opts);
+    expect(starts[1]).toBe('2026-09-15');
+
+    const old = [...txs, pierreTx({ id: 't-old', status: 'PENDING', date: '2026-01-05T12:00:00.000Z' })];
+    await withWindow(old, starts).run(opts);
+    await withWindow(old, starts).run(opts);
+    expect(starts[3]).toBe('2026-06-29');
   });
 
   it('fails closed before writing when the plan would create an unknown select option', async () => {
