@@ -64,17 +64,24 @@ function parseRaw(tx: SqliteTransactionRow): any {
 
 const lower = (v: string | null | undefined) => (v || '').toLowerCase().trim();
 
+/**
+ * Card bill payment: Pierre's own category, or the bank's fixed descriptions ("Pagamento de fatura" on the
+ * account, "Pagamento recebido" on the card). The planner matched "pagamento" anywhere in the description,
+ * which also caught Pix to payment institutions ("… Instituição de Pagamento", "Nu Pagamentos"); every
+ * payment in the migrated history matches this narrower test, so the frozen plan is unchanged.
+ */
 function isPaymentTx(tx: SqliteTransactionRow): boolean {
-  return tx.description.toLowerCase().includes('pagamento') || Boolean(tx.category_pierre && tx.category_pierre.toLowerCase().includes('pagamento'));
+  const desc = lower(tx.description);
+  return (
+    lower(tx.category_pierre) === 'pagamento de cartão de crédito' ||
+    desc.startsWith('pagamento de fatura') ||
+    desc.startsWith('pagamento recebido')
+  );
 }
 
 /** Card "purchase" as used to derive cycle windows (negative, not a payment). */
 function isCyclePurchase(tx: SqliteTransactionRow): boolean {
-  return (
-    Number(tx.amount) < 0 &&
-    !tx.description.toLowerCase().includes('pagamento') &&
-    (!tx.category_pierre || !tx.category_pierre.toLowerCase().includes('pagamento'))
-  );
+  return Number(tx.amount) < 0 && !isPaymentTx(tx);
 }
 
 function resolvePage(accounts: NotionAccountRef[], sourceId: string | undefined, name: string): NotionAccountRef | undefined {
