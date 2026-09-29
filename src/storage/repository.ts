@@ -132,14 +132,39 @@ export class Repository {
     categoryMapping?: CategoryMapping,
   ): 'added' | 'updated' | 'unchanged' {
     const existing = this.db
-      .prepare('SELECT id, amount, direction, category_pierre FROM transactions WHERE id = ?')
-      .get(tx.id) as { id: string; amount: number; direction: string; category_pierre: string } | undefined;
+      .prepare(
+        'SELECT id, amount, direction, category_pierre, category_mapped, category_group, category_variability, status, date, description FROM transactions WHERE id = ?',
+      )
+      .get(tx.id) as
+      | {
+          id: string;
+          amount: number;
+          direction: string;
+          category_pierre: string;
+          category_mapped: string | null;
+          category_group: string | null;
+          category_variability: string | null;
+          status: string | null;
+          date: string;
+          description: string;
+        }
+      | undefined;
 
-    const mapped = categoryMapping ?? {
-      categoryMapped: tx.categoryPierre,
-      group: '',
-      variability: '',
-    };
+    // Without an explicit mapping, an existing row whose Pierre category did not change keeps the mapping it
+    // already has (it feeds the canonical hash the Notion sync compares against).
+    const keepExisting = !categoryMapping && existing && existing.category_pierre === tx.categoryPierre;
+    const mapped = categoryMapping ??
+      (keepExisting
+        ? {
+            categoryMapped: existing!.category_mapped ?? tx.categoryPierre,
+            group: existing!.category_group ?? '',
+            variability: existing!.category_variability ?? '',
+          }
+        : {
+            categoryMapped: tx.categoryPierre,
+            group: '',
+            variability: '',
+          });
 
     if (!existing) {
       this.db.prepare(`
@@ -154,20 +179,26 @@ export class Repository {
       return 'added';
     }
 
-    // Update if anything changed
+    // Update if anything changed. Status matters too: a PENDING purchase that the bank later posts must
+    // become POSTED here, or every downstream view keeps showing it as pending forever.
     const hasChanged =
       existing.amount !== tx.amount ||
       existing.direction !== tx.direction ||
-      existing.category_pierre !== tx.categoryPierre;
+      existing.category_pierre !== tx.categoryPierre ||
+      existing.status !== tx.status ||
+      existing.date !== tx.date ||
+      existing.description !== tx.description;
 
     if (hasChanged) {
       this.db.prepare(`
         UPDATE transactions SET
+          date = ?, description = ?,
           amount = ?, original_amount = ?, direction = ?,
           category_pierre = ?, category_mapped = ?, category_group = ?, category_variability = ?,
           status = ?, raw_json = ?, updated_at = datetime('now')
         WHERE id = ?
       `).run(
+        tx.date, tx.description,
         tx.amount, tx.originalAmount, tx.direction,
         tx.categoryPierre, mapped.categoryMapped, mapped.group, mapped.variability,
         tx.status, tx.rawJson, tx.id,

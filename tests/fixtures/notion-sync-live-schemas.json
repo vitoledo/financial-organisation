@@ -1,0 +1,843 @@
+{
+ "_comment": "Property names/types/select options of the live data sources (no records). Used by the Notion sync tests as the fake Notion schema.",
+ "NOTION_DS_TRANSACTIONS": {
+  "Categoria": {
+   "type": "relation"
+  },
+  "Categoria Pierre": {
+   "type": "rich_text"
+  },
+  "Conta": {
+   "type": "relation"
+  },
+  "Conta Destino": {
+   "type": "relation"
+  },
+  "Conta como aporte": {
+   "type": "checkbox"
+  },
+  "Conta no orçamento": {
+   "type": "checkbox"
+  },
+  "Contribuição Meta Poupança": {
+   "type": "number"
+  },
+  "Data": {
+   "type": "date"
+  },
+  "Descrição original": {
+   "type": "rich_text"
+  },
+  "Efeito Orçamentário": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Receita"
+     },
+     {
+      "name": "Despesa"
+     },
+     {
+      "name": "Estorno"
+     },
+     {
+      "name": "Neutro"
+     }
+    ]
+   }
+  },
+  "Fatura Vinculada": {
+   "type": "relation"
+  },
+  "Fonte": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Pierre"
+     },
+     {
+      "name": "Manual"
+     },
+     {
+      "name": "Migração"
+     },
+     {
+      "name": "Outra"
+     }
+    ]
+   }
+  },
+  "HMAC Contraparte": {
+   "type": "rich_text"
+  },
+  "Hash Canônico": {
+   "type": "rich_text"
+  },
+  "ID da fonte": {
+   "type": "rich_text"
+  },
+  "Lançamento": {
+   "type": "title"
+  },
+  "Moeda": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "BRL"
+     },
+     {
+      "name": "USD"
+     },
+     {
+      "name": "Outra"
+     }
+    ]
+   }
+  },
+  "Motivo da Revisão": {
+   "type": "rich_text"
+  },
+  "Movimento": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Entrada"
+     },
+     {
+      "name": "Saída"
+     }
+    ]
+   }
+  },
+  "Natureza": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Receita"
+     },
+     {
+      "name": "Despesa"
+     },
+     {
+      "name": "Transferência interna"
+     },
+     {
+      "name": "Aporte"
+     },
+     {
+      "name": "Resgate"
+     },
+     {
+      "name": "Reembolso"
+     },
+     {
+      "name": "Pagamento de fatura"
+     },
+     {
+      "name": "Ajuste"
+     }
+    ]
+   }
+  },
+  "Observações": {
+   "type": "rich_text"
+  },
+  "Propósito de Alocação": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Caixa Operacional"
+     },
+     {
+      "name": "Reserva de Investimento"
+     },
+     {
+      "name": "Reserva de Emergência"
+     },
+     {
+      "name": "Poupança Geral"
+     }
+    ]
+   }
+  },
+  "Revisado": {
+   "type": "checkbox"
+  },
+  "Status": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Pendente"
+     },
+     {
+      "name": "Confirmado"
+     },
+     {
+      "name": "Cancelado"
+     }
+    ]
+   }
+  },
+  "Status de Revisão": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Confirmado Auto"
+     },
+     {
+      "name": "Provável"
+     },
+     {
+      "name": "Pendente Revisão"
+     },
+     {
+      "name": "Validado Manual"
+     },
+     {
+      "name": "Legado Não Verificado"
+     }
+    ]
+   }
+  },
+  "Valor": {
+   "type": "number"
+  },
+  "Valor Bruto da Fonte": {
+   "type": "number"
+  }
+ },
+ "NOTION_DS_CARD_BILLS": {
+  "Cartão Vinculado": {
+   "type": "relation"
+  },
+  "Componentes Adicionais da Fatura": {
+   "type": "number"
+  },
+  "Data de Fechamento": {
+   "type": "date"
+  },
+  "Data de Liquidação": {
+   "type": "date"
+  },
+  "Data de Vencimento": {
+   "type": "date"
+  },
+  "Divergência Não Explicada": {
+   "type": "number"
+  },
+  "Fatura / Ciclo": {
+   "type": "title"
+  },
+  "Fim do Período": {
+   "type": "date"
+  },
+  "Fonte": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Pierre"
+     },
+     {
+      "name": "Manual"
+     },
+     {
+      "name": "Migração"
+     },
+     {
+      "name": "Outra"
+     }
+    ]
+   }
+  },
+  "ID Estável da Fatura": {
+   "type": "rich_text"
+  },
+  "ID da Fatura na Fonte": {
+   "type": "rich_text"
+  },
+  "Início do Período": {
+   "type": "date"
+  },
+  "Lançamentos do Ciclo": {
+   "type": "relation"
+  },
+  "Moeda": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "BRL"
+     },
+     {
+      "name": "USD"
+     },
+     {
+      "name": "EUR"
+     }
+    ]
+   }
+  },
+  "Origem / Qualidade dos Dados": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "UPSTREAM_OFFICIAL"
+     },
+     {
+      "name": "UPSTREAM_APPROXIMATE"
+     },
+     {
+      "name": "DERIVED"
+     },
+     {
+      "name": "MANUAL"
+     }
+    ]
+   }
+  },
+  "Qualidade da Identidade": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "SOURCE_ID"
+     },
+     {
+      "name": "PERIOD_FALLBACK"
+     }
+    ]
+   }
+  },
+  "Status da Fatura": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Aberta em Curso"
+     },
+     {
+      "name": "Fechada a Vencer"
+     },
+     {
+      "name": "Vencida"
+     },
+     {
+      "name": "Paga Integralmente"
+     },
+     {
+      "name": "Paga Parcialmente"
+     }
+    ]
+   }
+  },
+  "Tipo de Ciclo": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Ciclo Real Banco"
+     },
+     {
+      "name": "Ciclo Configurado"
+     },
+     {
+      "name": "Ciclo Estimado"
+     }
+    ]
+   }
+  },
+  "Total de Compras no Ciclo": {
+   "type": "number"
+  },
+  "Transações de Pagamento": {
+   "type": "relation"
+  },
+  "Valor Estimado da Fatura Aberta": {
+   "type": "number"
+  },
+  "Valor Pago": {
+   "type": "number"
+  },
+  "Valor da Fatura Fechada (Oficial)": {
+   "type": "number"
+  }
+ },
+ "NOTION_DS_ACCOUNTS": {
+  "Ativa": {
+   "type": "checkbox"
+  },
+  "Atualizado em": {
+   "type": "date"
+  },
+  "Conta": {
+   "type": "title"
+  },
+  "Dia de Fechamento": {
+   "type": "number"
+  },
+  "Dia de Vencimento": {
+   "type": "number"
+  },
+  "Fonte": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Pierre"
+     },
+     {
+      "name": "Manual"
+     },
+     {
+      "name": "Outra"
+     }
+    ]
+   }
+  },
+  "ID da fonte": {
+   "type": "rich_text"
+  },
+  "Inclui no caixa": {
+   "type": "checkbox"
+  },
+  "Inclui no patrimônio": {
+   "type": "checkbox"
+  },
+  "Instituição": {
+   "type": "rich_text"
+  },
+  "Limite Operacional Usado": {
+   "type": "number"
+  },
+  "Limite Usado da Fonte (Bruto)": {
+   "type": "number"
+  },
+  "Limite contratado": {
+   "type": "number"
+  },
+  "Limite disponível": {
+   "type": "number"
+  },
+  "Limite personalizado": {
+   "type": "number"
+  },
+  "Moeda": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "BRL"
+     },
+     {
+      "name": "USD"
+     },
+     {
+      "name": "Outra"
+     }
+    ]
+   }
+  },
+  "Observações": {
+   "type": "rich_text"
+  },
+  "Saldo": {
+   "type": "number"
+  },
+  "Tipo": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Conta corrente"
+     },
+     {
+      "name": "Cartão de crédito"
+     },
+     {
+      "name": "Carteira"
+     },
+     {
+      "name": "Corretora"
+     },
+     {
+      "name": "Dinheiro"
+     },
+     {
+      "name": "Outro"
+     }
+    ]
+   }
+  }
+ },
+ "NOTION_DS_SYNC_LOG": {
+  "Concluída em": {
+   "type": "date"
+  },
+  "Contas recebidas": {
+   "type": "number"
+  },
+  "Código do Erro": {
+   "type": "select",
+   "select": {
+    "options": []
+   }
+  },
+  "Duração (ms)": {
+   "type": "number"
+  },
+  "Duração (s)": {
+   "type": "number"
+  },
+  "Erro / alerta": {
+   "type": "rich_text"
+  },
+  "Erros Encontrados": {
+   "type": "number"
+  },
+  "Execução": {
+   "type": "title"
+  },
+  "Fonte": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Pierre"
+     },
+     {
+      "name": "Migração"
+     },
+     {
+      "name": "Manual"
+     }
+    ]
+   }
+  },
+  "Freshness da fonte": {
+   "type": "date"
+  },
+  "Hash do Lote RAW": {
+   "type": "rich_text"
+  },
+  "ID da Execução (Run ID)": {
+   "type": "rich_text"
+  },
+  "Iniciada em": {
+   "type": "date"
+  },
+  "Obrigações Conciliadas": {
+   "type": "number"
+  },
+  "Observações": {
+   "type": "rich_text"
+  },
+  "Parcelas recebidas": {
+   "type": "number"
+  },
+  "Pendências de revisão": {
+   "type": "number"
+  },
+  "Referência do Log Privado": {
+   "type": "rich_text"
+  },
+  "Status": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Executando"
+     },
+     {
+      "name": "Sucesso"
+     },
+     {
+      "name": "Parcial"
+     },
+     {
+      "name": "Erro"
+     }
+    ]
+   }
+  },
+  "Transações Inalteradas": {
+   "type": "number"
+  },
+  "Transações atualizadas": {
+   "type": "number"
+  },
+  "Transações novas": {
+   "type": "number"
+  },
+  "Transações recebidas": {
+   "type": "number"
+  },
+  "Versão do Worker / Commit": {
+   "type": "rich_text"
+  }
+ },
+ "NOTION_DS_CATEGORIES": {
+  "Ativa": {
+   "type": "checkbox"
+  },
+  "Categoria": {
+   "type": "title"
+  },
+  "Conta no orçamento": {
+   "type": "checkbox"
+  },
+  "Contas fixas": {
+   "type": "relation"
+  },
+  "Grupo": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Necessidade"
+     },
+     {
+      "name": "Desejo"
+     },
+     {
+      "name": "Poupança/Investimento"
+     },
+     {
+      "name": "Fora do orçamento"
+     }
+    ]
+   }
+  },
+  "Natureza padrão": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Receita"
+     },
+     {
+      "name": "Despesa"
+     },
+     {
+      "name": "Patrimonial"
+     },
+     {
+      "name": "Mista"
+     }
+    ]
+   }
+  },
+  "Observações": {
+   "type": "rich_text"
+  },
+  "Transações": {
+   "type": "relation"
+  },
+  "Variabilidade": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Fixa"
+     },
+     {
+      "name": "Variável"
+     },
+     {
+      "name": "N/A"
+     }
+    ]
+   }
+  }
+ },
+ "NOTION_DS_RULES": {
+  "Ativa": {
+   "type": "checkbox"
+  },
+  "Atribuir: Alocação": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Caixa Operacional"
+     },
+     {
+      "name": "Reserva de Investimento"
+     },
+     {
+      "name": "Reserva de Emergência"
+     },
+     {
+      "name": "Poupança Geral"
+     }
+    ]
+   }
+  },
+  "Atribuir: Conta Destino": {
+   "type": "relation"
+  },
+  "Atribuir: Efeito Orçamento": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Receita"
+     },
+     {
+      "name": "Despesa"
+     },
+     {
+      "name": "Estorno"
+     },
+     {
+      "name": "Neutro"
+     }
+    ]
+   }
+  },
+  "Auto aplicar": {
+   "type": "checkbox"
+  },
+  "Categoria Pierre": {
+   "type": "rich_text"
+  },
+  "Categoria resultante": {
+   "type": "relation"
+  },
+  "Conta como aporte": {
+   "type": "checkbox"
+  },
+  "Conta no orçamento": {
+   "type": "checkbox"
+  },
+  "Conta origem": {
+   "type": "relation"
+  },
+  "Contraparte contém": {
+   "type": "rich_text"
+  },
+  "Descrição contém": {
+   "type": "rich_text"
+  },
+  "Destino / contexto": {
+   "type": "rich_text"
+  },
+  "Dia máximo": {
+   "type": "number"
+  },
+  "Dia mínimo": {
+   "type": "number"
+  },
+  "Exigir revisão": {
+   "type": "checkbox"
+  },
+  "Movimento esperado": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Entrada"
+     },
+     {
+      "name": "Saída"
+     },
+     {
+      "name": "Qualquer"
+     }
+    ]
+   }
+  },
+  "Natureza resultante": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Receita"
+     },
+     {
+      "name": "Despesa"
+     },
+     {
+      "name": "Transferência interna"
+     },
+     {
+      "name": "Aporte"
+     },
+     {
+      "name": "Resgate"
+     },
+     {
+      "name": "Reembolso"
+     },
+     {
+      "name": "Pagamento de fatura"
+     },
+     {
+      "name": "Ajuste"
+     }
+    ]
+   }
+  },
+  "Observações": {
+   "type": "rich_text"
+  },
+  "Prioridade": {
+   "type": "number"
+  },
+  "Regra": {
+   "type": "title"
+  },
+  "Tipo": {
+   "type": "select",
+   "select": {
+    "options": [
+     {
+      "name": "Contraparte + valor"
+     },
+     {
+      "name": "Contraparte"
+     },
+     {
+      "name": "Descrição"
+     },
+     {
+      "name": "Categoria Pierre"
+     },
+     {
+      "name": "Conta"
+     },
+     {
+      "name": "Personalizada"
+     }
+    ]
+   }
+  },
+  "Tolerância": {
+   "type": "number"
+  },
+  "Valor exato": {
+   "type": "number"
+  },
+  "Valor máximo": {
+   "type": "number"
+  },
+  "Valor mínimo": {
+   "type": "number"
+  },
+  "Válida até": {
+   "type": "date"
+  },
+  "Válida de": {
+   "type": "date"
+  }
+ }
+}

@@ -18,6 +18,7 @@ export default defineConfig({
       // tests regardless of the % denominator.
       exclude: [
         'src/index.ts',            // CLI entrypoint
+        'src/notion/sync/cli.ts',  // CLI entrypoint (engine/gateway/config are tested)
         'src/**/index.ts',         // barrel re-exports
         'src/sheets/client.ts',    // thin googleapis wrapper (builders tested separately)
         'src/sheets/setup.ts',     // live spreadsheet creation + seeding
