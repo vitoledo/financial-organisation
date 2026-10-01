@@ -1,14 +1,21 @@
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { PierreClient } from '../../pierre/client';
-import { normalizeAccount, normalizeTransaction, shouldExcludeAccount, NormalizedAccount, NormalizedTransaction } from '../../pierre/normalizer';
+import { normalizeAccount, normalizeBill, normalizeTransaction, shouldExcludeAccount, NormalizedAccount, NormalizedCardBill, NormalizedTransaction } from '../../pierre/normalizer';
 import { CategoryMapping, Repository } from '../../storage/repository';
 import { calculateDateRange } from '../../sync/engine';
 import { findPropertyContract, serializePayloadForNotion } from '../migration-runner/backfill-serializer';
 import { NotionSyncGateway, LoadedNotionState } from './notion-gateway';
 import { projectNotionState } from './projection';
 import { ACCOUNT_ENV, AccountSourceContext, BILL_ENV, reconcile, RefTarget, SyncPlan, TX_ENV } from './reconcile';
-import { AccountRole, ProjectionContext, SqliteAccountRow, SqliteTransactionRow } from './types';
+import { AccountRole, OfficialBill, ProjectionContext, SqliteAccountRow, SqliteTransactionRow } from './types';
+
+/** Everything the projection reads from the local database. */
+export interface SourceRows {
+  accounts: SqliteAccountRow[];
+  transactions: SqliteTransactionRow[];
+  bills: OfficialBill[];
+}
 
 const SYNC_LOG_ENV = 'NOTION_DS_SYNC_LOG';
 const PIERRE_SYNC_WAIT_MS = 30_000;
@@ -82,12 +89,26 @@ export class NotionSyncError extends Error {
 // SQLite helpers
 // ---------------------------------------------------------------------------
 
-export function readSqliteRows(db: Database.Database): { accounts: SqliteAccountRow[]; transactions: SqliteTransactionRow[] } {
-  const accounts = db.prepare('SELECT id, name, type, subtype, closing_balance, credit_limit, available_credit, last_synced_at FROM accounts').all() as SqliteAccountRow[];
+export function readSqliteRows(db: Database.Database): SourceRows {
+  const accounts = db.prepare('SELECT id, name, type, subtype, closing_balance, credit_limit, available_credit, last_synced_at, raw_json FROM accounts').all() as SqliteAccountRow[];
   const transactions = db
     .prepare('SELECT id, account_id, date, description, amount, direction, category_pierre, category_mapped, account_type, status, raw_json FROM transactions ORDER BY date ASC, id ASC')
     .all() as SqliteTransactionRow[];
-  return { accounts, transactions };
+  // A database from before migration 004 (e.g. the frozen migration snapshot) has no official bills.
+  const hasBills = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'card_bills'").get() !== undefined;
+  const bills = hasBills
+    ? (db
+        .prepare('SELECT id, account_id AS accountId, due_date AS dueDate, closing_date AS closingDate, total_amount AS totalAmount FROM card_bills ORDER BY closing_date ASC, id ASC')
+        .all() as OfficialBill[])
+    : [];
+  return { accounts, transactions, bills };
+}
+
+const toOfficial = (b: NormalizedCardBill): OfficialBill => ({ id: b.id, accountId: b.accountId, dueDate: b.dueDate, closingDate: b.closingDate, totalAmount: b.totalAmount });
+
+/** Today's date in Brazil (the bank's calendar), YYYY-MM-DD. */
+export function brazilDate(now: Date): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 }
 
 /** Category mapping learned from the local history (most frequent mapping per Pierre category). */
@@ -105,17 +126,29 @@ export function learnedCategoryMappings(db: Database.Database): Map<string, Cate
 
 /** Dry-run: the rows the database WOULD hold after upserting the fetched data (nothing is written). */
 function mergeInMemory(
-  current: { accounts: SqliteAccountRow[]; transactions: SqliteTransactionRow[] },
+  current: SourceRows,
   accounts: NormalizedAccount[],
   txs: NormalizedTransaction[],
+  bills: NormalizedCardBill[] | null,
   mappings: Map<string, { categoryMapped: string }>,
   nowSql: string,
-): { accounts: SqliteAccountRow[]; transactions: SqliteTransactionRow[] } {
+): SourceRows {
   const acc = new Map(current.accounts.map((a) => [a.id, a]));
   for (const a of accounts) {
     acc.set(a.id, {
       id: a.id, name: a.name, type: a.type, subtype: a.subtype, closing_balance: a.closingBalance,
-      credit_limit: a.creditLimit, available_credit: a.availableCredit, last_synced_at: nowSql,
+      credit_limit: a.creditLimit, available_credit: a.availableCredit, last_synced_at: nowSql, raw_json: a.rawJson,
+    });
+  }
+  const billById = new Map(current.bills.map((b) => [b.id, b]));
+  for (const b of bills ?? []) {
+    const prev = billById.get(b.id);
+    const next = toOfficial(b);
+    billById.set(b.id, {
+      ...next,
+      dueDate: next.dueDate ?? prev?.dueDate ?? null,
+      closingDate: next.closingDate ?? prev?.closingDate ?? null,
+      totalAmount: next.totalAmount ?? prev?.totalAmount ?? null,
     });
   }
   const tx = new Map(current.transactions.map((t) => [t.id, t]));
@@ -128,7 +161,11 @@ function mergeInMemory(
       account_type: t.accountType, status: t.status, raw_json: t.rawJson,
     });
   }
-  return { accounts: Array.from(acc.values()), transactions: Array.from(tx.values()).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) };
+  return {
+    accounts: Array.from(acc.values()),
+    transactions: Array.from(tx.values()).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    bills: Array.from(billById.values()),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +227,10 @@ export class NotionSyncEngine {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
-  private buildContext(state: LoadedNotionState): ProjectionContext {
+  private buildContext(state: LoadedNotionState, rows: SourceRows): ProjectionContext {
     return {
+      officialBills: rows.bills,
+      today: brazilDate(this.now()),
       accountRoles: this.settings.accountRoles,
       defaultDueDay: this.settings.defaultDueDay,
       notionAccounts: state.live.accounts.map((a) => ({ id: a.pageId, name: a.name, sourceId: (a as any).sourceId ?? null })),
@@ -216,8 +255,8 @@ export class NotionSyncEngine {
     return { rows, roles: this.settings.accountRoles, pageBySourceId };
   }
 
-  private plan(rows: { accounts: SqliteAccountRow[]; transactions: SqliteTransactionRow[] }, state: LoadedNotionState): SyncPlan {
-    const ctx = this.buildContext(state);
+  private plan(rows: SourceRows, state: LoadedNotionState): SyncPlan {
+    const ctx = this.buildContext(state, rows);
     const projection = projectNotionState(rows.accounts, rows.transactions, ctx);
     return reconcile(projection, rows.transactions, state.rules, state.live, this.accountContext(rows.accounts, ctx), {
       hmacKeyAvailable: Boolean(this.settings.hmacKey && this.settings.hmacKey.trim()),
@@ -251,7 +290,14 @@ export class NotionSyncEngine {
     const rawTxs = (await pierre.getTransactions(window.startDate, window.endDate)).data;
     const relevantIds = new Set(relevant.map((a) => a.id));
     const txs = rawTxs.filter((t) => relevantIds.has(t.account_id)).map(normalizeTransaction);
-    return { accounts: relevant.map(normalizeAccount), txs, window, received: rawTxs.length };
+    // Official bills are an enrichment: without them the cycles fall back to the last ones stored locally.
+    let bills: NormalizedCardBill[] | null = null;
+    try {
+      bills = (await pierre.getBills()).data.filter((b) => relevantIds.has(b.accountId)).map(normalizeBill);
+    } catch (err) {
+      this.logger.warn('  get-bills falhou (usando as faturas oficiais já guardadas)', { error: (err as Error).message });
+    }
+    return { accounts: relevant.map(normalizeAccount), txs, bills, window, received: rawTxs.length };
   }
 
   async run(options: NotionSyncOptions): Promise<NotionSyncReport> {
@@ -275,13 +321,14 @@ export class NotionSyncEngine {
       if (options.apply) {
         sqliteSyncId = repo.startSync();
         for (const a of fetched.accounts) repo.upsertAccount(a);
+        if (fetched.bills) repo.upsertCardBills(fetched.bills);
         const stats = repo.upsertTransactions(fetched.txs, mappings);
         repo.completeSync(sqliteSyncId, stats);
         rows = readSqliteRows(this.deps.db);
         this.logger.info(`  SQLite: ${stats.added} novas, ${stats.updated} atualizadas, ${stats.unchanged} sem alteração.`);
       } else {
         const nowSql = this.now().toISOString().replace('T', ' ').substring(0, 19);
-        rows = mergeInMemory(rows, fetched.accounts, fetched.txs, mappings, nowSql);
+        rows = mergeInMemory(rows, fetched.accounts, fetched.txs, fetched.bills, mappings, nowSql);
       }
     } else {
       this.logger.info('[1/5] Pierre ignorado: usando o histórico local do SQLite como fonte.');
@@ -342,6 +389,7 @@ export class NotionSyncEngine {
     for (const [id, pages] of state.live.transactions) if (pages.length === 1) idByTx.set(id, pages[0].pageId);
     const idByBill = new Map<string, string>();
     for (const [id, pages] of state.live.bills) if (pages.length === 1) idByBill.set(id, pages[0].pageId);
+    for (const a of plan.billAdoptions) idByBill.set(a.stableId, a.pageId);
 
     const resolve = (refs: Record<string, RefTarget[]>): Record<string, string[]> | null => {
       const out: Record<string, string[]> = {};

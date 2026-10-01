@@ -3,6 +3,7 @@ import { generateCounterpartyPseudonym, getLastDayOfMonth, isValidIsoDate } from
 import {
   ClassificationBranch,
   NotionAccountRef,
+  OfficialBill,
   ProjectedBill,
   ProjectedTransaction,
   ProjectionContext,
@@ -114,26 +115,102 @@ interface Cycle {
   tipoCiclo: string;
   purchases: SqliteTransactionRow[];
   payments: string[];
+  /** Statement balance the bank reported for this bill (GET /get-bills), when known. */
+  officialAmount: number | null;
 }
 
-function deriveCycles(creditTxs: SqliteTransactionRow[], cardName: string, defaultDueDay?: number): Map<string, Cycle> {
+/**
+ * The bank's own calendar for the card, from the official bills: the latest known closing and due dates.
+ * Later closings are projected by keeping the day of the month (the bank moves both together).
+ */
+interface CardAnchor {
+  bills: Map<string, OfficialBill>;
+  /** Official bills with a closing date, oldest first. */
+  closings: OfficialBill[];
+  lastClosing: string;
+  lastDue: string | null;
+}
+
+function addDays(iso: string, days: number): string {
+  const d = new Date(`${iso}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().substring(0, 10);
+}
+
+/** Same day of the month `months` later, clamped to the month's last day. */
+function addMonthsKeepDay(iso: string, months: number): string {
+  const [y, m, day] = iso.split('-').map(Number);
+  const total = y * 12 + (m - 1) + months;
+  const ny = Math.floor(total / 12);
+  const nm = (total % 12) + 1;
+  const safeDay = Math.min(day, getLastDayOfMonth(ny, nm));
+  return `${ny}-${String(nm).padStart(2, '0')}-${String(safeDay).padStart(2, '0')}`;
+}
+
+function buildAnchor(official: OfficialBill[] | undefined, cardAccountId: string | undefined): CardAnchor | null {
+  const mine = (official ?? []).filter((b) => !cardAccountId || b.accountId === cardAccountId);
+  const closings = mine.filter((b) => b.closingDate && isValidIsoDate(b.closingDate)).sort((a, b) => a.closingDate!.localeCompare(b.closingDate!));
+  if (closings.length === 0) return null;
+  const last = closings[closings.length - 1];
+  return {
+    bills: new Map(mine.map((b) => [b.id, b])),
+    closings,
+    lastClosing: last.closingDate!,
+    lastDue: last.dueDate && isValidIsoDate(last.dueDate) ? last.dueDate : null,
+  };
+}
+
+/** Index (k ≥ 1) of the projected closing after the last official one that a date falls into. */
+function projectedCycleIndex(anchor: CardAnchor, day: string): number {
+  let k = 1;
+  while (addMonthsKeepDay(anchor.lastClosing, k) < day && k < 240) k++;
+  return k;
+}
+
+const titleFor = (cardName: string, month: string, vencimento: string | null, open: boolean) =>
+  `${cardName} - Ciclo ${month}${open ? ' Aberto' : ''}${vencimento ? ` (Venc ${vencimento.substring(8, 10)}/${vencimento.substring(5, 7)})` : ''}`;
+
+/**
+ * Builds the card cycles and returns, for each credit transaction, the cycle key it belongs to.
+ *
+ * Without official bills this is the planner's logic (cycles by upstream bill id, pending purchases grouped
+ * by calendar month), which the parity test pins. With official bills (`anchor`):
+ * - a bill the bank reported takes its closing and due dates from the bank, and its period runs from the
+ *   previous official closing (+1 day) to its own closing;
+ * - a bill id the bank has not reported yet (closed, not yet due) and pending purchases are placed on the
+ *   bank's projected calendar. A pending purchase always belongs to an open bill: a closed bill's content is
+ *   final, and a purchase still pending at closing is billed on the next one.
+ */
+function deriveCycles(
+  creditTxs: SqliteTransactionRow[],
+  cardName: string,
+  defaultDueDay: number | undefined,
+  anchor: CardAnchor | null,
+): { cycles: Map<string, Cycle>; keyFor: (tx: SqliteTransactionRow) => string } {
   const cycles = new Map<string, Cycle>();
   const upstreamBillIds = new Set<string>();
   const periodMonths = new Set<string>();
+  const billIdOf = (tx: SqliteTransactionRow): string | null => {
+    const bId = parseRaw(tx).credit_card_data?.billId;
+    return bId && typeof bId === 'string' && bId.trim().length > 0 ? bId.trim() : null;
+  };
 
   for (const tx of creditTxs) {
-    const bId = parseRaw(tx).credit_card_data?.billId;
-    if (bId && typeof bId === 'string' && bId.trim().length > 0) upstreamBillIds.add(bId.trim());
+    const bId = billIdOf(tx);
+    if (bId) upstreamBillIds.add(bId);
     else if (isCyclePurchase(tx)) periodMonths.add(tx.date.substring(0, 7));
   }
 
+  // Projected calendar slot k (≥ 1) → the cycle key that represents it (a not-yet-reported bill id, or a period).
+  const slotKey = new Map<number, string>();
+
   for (const bId of upstreamBillIds) {
-    const txsInBill = creditTxs.filter((t) => parseRaw(t).credit_card_data?.billId === bId);
+    const txsInBill = creditTxs.filter((t) => billIdOf(t) === bId);
     const purchases = txsInBill.filter(isCyclePurchase);
     const sortedTxs = [...txsInBill].sort((a, b) => a.date.localeCompare(b.date));
     const minDate = (purchases[0] || sortedTxs[0]).date.substring(0, 10);
     const maxDate = (purchases[purchases.length - 1] || sortedTxs[sortedTxs.length - 1]).date.substring(0, 10);
-    const month = maxDate.substring(0, 7);
+    let month = maxDate.substring(0, 7);
 
     // Due date precedence: bill metadata → card account due day → configured default.
     let vencimento: string | null = null;
@@ -160,52 +237,117 @@ function deriveCycles(creditTxs: SqliteTransactionRow[], cardName: string, defau
     if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || (vencimento !== null && !isValidIsoDate(vencimento))) {
       throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para fatura upstream ${bId}`);
     }
-    const title =
-      vencimento !== null
-        ? `${cardName} - Ciclo ${month} (Venc ${vencimento.substring(8, 10)}/${vencimento.substring(5, 7)})`
-        : `${cardName} - Ciclo ${month}`;
+
+    let inicio = minDate;
+    let fim = maxDate;
+    let fechamento = maxDate;
+    let qualidade = 'UPSTREAM_APPROXIMATE';
+    let officialAmount: number | null = null;
+    const ob = anchor?.bills.get(bId);
+    if (anchor && ob) {
+      if (ob.closingDate && isValidIsoDate(ob.closingDate)) {
+        fechamento = ob.closingDate;
+        const prev = anchor.closings.filter((b) => b.closingDate! < fechamento).pop();
+        inicio = prev ? addDays(prev.closingDate!, 1) : minDate;
+        fim = fechamento;
+        month = fechamento.substring(0, 7);
+      }
+      if (ob.dueDate && isValidIsoDate(ob.dueDate)) vencimento = ob.dueDate;
+      qualidade = 'UPSTREAM_OFFICIAL';
+      officialAmount = ob.totalAmount;
+    } else if (anchor && maxDate > anchor.lastClosing) {
+      // Closed or open at the bank but not reported yet: the bank's projected calendar.
+      const k = projectedCycleIndex(anchor, maxDate);
+      fechamento = addMonthsKeepDay(anchor.lastClosing, k);
+      inicio = addDays(addMonthsKeepDay(anchor.lastClosing, k - 1), 1);
+      fim = fechamento;
+      month = fechamento.substring(0, 7);
+      if (anchor.lastDue) vencimento = addMonthsKeepDay(anchor.lastDue, k);
+      if (!slotKey.has(k)) slotKey.set(k, `BILL_${bId}`);
+    }
+
     cycles.set(`BILL_${bId}`, {
       key: `BILL_${bId}`,
-      title,
+      title: titleFor(cardName, month, vencimento, false),
       stableBillId: `nubank:bill:${bId}`,
       sourceBillId: bId,
-      inicio: minDate,
-      fim: maxDate,
-      fechamento: maxDate,
+      inicio,
+      fim,
+      fechamento,
       vencimento,
       origem: 'UPSTREAM_BILL_ID',
-      qualidade: 'UPSTREAM_APPROXIMATE',
+      qualidade,
       tipoCiclo: 'Ciclo Real Banco',
       purchases: [],
       payments: [],
+      officialAmount,
     });
   }
 
-  for (const month of Array.from(periodMonths).sort()) {
-    const txsInMonth = creditTxs.filter((t) => !parseRaw(t).credit_card_data?.billId && t.date.startsWith(month));
-    const sortedPurchases = txsInMonth.filter(isCyclePurchase).sort((a, b) => a.date.localeCompare(b.date));
-    const [y, m] = month.split('-').map(Number);
-    const monthEnd = `${month}-${String(getLastDayOfMonth(y, m)).padStart(2, '0')}`;
-    const minDate = sortedPurchases.length > 0 ? sortedPurchases[0].date.substring(0, 10) : `${month}-01`;
-    const maxDate = sortedPurchases.length > 0 ? sortedPurchases[sortedPurchases.length - 1].date.substring(0, 10) : monthEnd;
-    const fechamento = monthEnd;
+  if (!anchor) {
+    for (const month of Array.from(periodMonths).sort()) {
+      const txsInMonth = creditTxs.filter((t) => !billIdOf(t) && t.date.startsWith(month));
+      const sortedPurchases = txsInMonth.filter(isCyclePurchase).sort((a, b) => a.date.localeCompare(b.date));
+      const [y, m] = month.split('-').map(Number);
+      const monthEnd = `${month}-${String(getLastDayOfMonth(y, m)).padStart(2, '0')}`;
+      const minDate = sortedPurchases.length > 0 ? sortedPurchases[0].date.substring(0, 10) : `${month}-01`;
+      const maxDate = sortedPurchases.length > 0 ? sortedPurchases[sortedPurchases.length - 1].date.substring(0, 10) : monthEnd;
+      const fechamento = monthEnd;
 
-    let vencimento: string | null = null;
-    let title = `${cardName} - Ciclo ${month} Aberto`;
-    if (typeof defaultDueDay === 'number') {
-      vencimento = nextMonthDue(month, defaultDueDay);
-      title = `${cardName} - Ciclo ${month} Aberto (Venc ${vencimento.substring(8, 10)}/${vencimento.substring(5, 7)})`;
+      let vencimento: string | null = null;
+      if (typeof defaultDueDay === 'number') vencimento = nextMonthDue(month, defaultDueDay);
+      if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(fechamento) || (vencimento !== null && !isValidIsoDate(vencimento))) {
+        throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para ciclo de período ${month}`);
+      }
+      cycles.set(`PERIOD_${month}`, {
+        key: `PERIOD_${month}`,
+        title: titleFor(cardName, month, vencimento, true),
+        stableBillId: `nubank:cartao:${month}:cycle`,
+        sourceBillId: '',
+        inicio: minDate,
+        fim: maxDate,
+        fechamento,
+        vencimento,
+        origem: 'PERIOD_ESTIMATED',
+        qualidade: 'DERIVED',
+        tipoCiclo: 'Ciclo Estimado',
+        purchases: [],
+        payments: [],
+        officialAmount: null,
+      });
     }
-    if (!isValidIsoDate(minDate) || !isValidIsoDate(maxDate) || !isValidIsoDate(fechamento) || (vencimento !== null && !isValidIsoDate(vencimento))) {
-      throw new Error(`FAIL_CLOSED_DATE_VALIDATION: Datas inválidas detectadas para ciclo de período ${month}`);
-    }
-    cycles.set(`PERIOD_${month}`, {
-      key: `PERIOD_${month}`,
-      title,
+    return {
+      cycles,
+      keyFor: (tx) => {
+        const bId = billIdOf(tx);
+        return bId ? `BILL_${bId}` : `PERIOD_${tx.date.substring(0, 7)}`;
+      },
+    };
+  }
+
+  // Anchored: pending purchases go to the open slot of their date (never to a closed bill), sharing it with
+  // an upstream bill id already placed on that slot.
+  const pendingSlot = (tx: SqliteTransactionRow) => projectedCycleIndex(anchor, tx.date.substring(0, 10));
+  for (const tx of creditTxs) {
+    if (billIdOf(tx) || !isCyclePurchase(tx)) continue;
+    const k = pendingSlot(tx);
+    if (slotKey.has(k)) continue;
+    const fechamento = addMonthsKeepDay(anchor.lastClosing, k);
+    const month = fechamento.substring(0, 7);
+    const vencimento = anchor.lastDue
+      ? addMonthsKeepDay(anchor.lastDue, k)
+      : typeof defaultDueDay === 'number'
+        ? nextMonthDue(addMonthsKeepDay(anchor.lastClosing, k - 1).substring(0, 7), defaultDueDay)
+        : null;
+    const key = `PERIOD_${month}`;
+    slotKey.set(k, key);
+    cycles.set(key, {
+      key,
+      title: titleFor(cardName, month, vencimento, true),
       stableBillId: `nubank:cartao:${month}:cycle`,
       sourceBillId: '',
-      inicio: minDate,
-      fim: maxDate,
+      inicio: addDays(addMonthsKeepDay(anchor.lastClosing, k - 1), 1),
+      fim: fechamento,
       fechamento,
       vencimento,
       origem: 'PERIOD_ESTIMATED',
@@ -213,9 +355,31 @@ function deriveCycles(creditTxs: SqliteTransactionRow[], cardName: string, defau
       tipoCiclo: 'Ciclo Estimado',
       purchases: [],
       payments: [],
+      officialAmount: null,
     });
   }
-  return cycles;
+  return {
+    cycles,
+    keyFor: (tx) => {
+      const bId = billIdOf(tx);
+      if (bId) return `BILL_${bId}`;
+      return slotKey.get(pendingSlot(tx)) ?? `PERIOD_${tx.date.substring(0, 7)}`;
+    },
+  };
+}
+
+/** Bill status (REGRA_AUTOMATICA) from the bank's dates and amounts; null when there is no evidence. */
+function billStatus(cycle: Cycle, today: string | undefined, settledAfterClosing: number): string | null {
+  if (!today) return null;
+  if (cycle.qualidade === 'UPSTREAM_OFFICIAL' && cycle.officialAmount !== null) {
+    if (cycle.officialAmount <= 0.005) return 'Paga Integralmente';
+    if (cycle.vencimento && today <= cycle.vencimento) return 'Fechada a Vencer';
+    if (settledAfterClosing >= cycle.officialAmount - 0.005) return 'Paga Integralmente';
+    return settledAfterClosing > 0 ? 'Paga Parcialmente' : 'Vencida';
+  }
+  if (today <= cycle.fechamento) return 'Aberta em Curso';
+  if (cycle.vencimento && today <= cycle.vencimento) return 'Fechada a Vencer';
+  return null;
 }
 
 const isBatchTimestamp = (date: string) => date.includes('03:00:00') || date.endsWith('03:00:00.000Z');
@@ -336,8 +500,9 @@ export function classifyTransaction(tx: SqliteTransactionRow, sameOwnershipKeywo
   }
   if (
     amount < 0 &&
-    !isCredit &&
-    (pierreLower === 'transferências' || (TRANSFER_FAMILY.has(pierreLower) && descLower.startsWith('transferência enviada')))
+    (pierreLower === 'transferências'
+      ? true // on the account a Pix sent; on the card a Pix paid with credit
+      : !isCredit && TRANSFER_FAMILY.has(pierreLower) && descLower.startsWith('transferência enviada'))
   ) {
     return { economicNature: null, budgetEffect: null, reviewStatus: 'Pendente Revisão', reviewReason: THIRD_PARTY_OUTGOING_REASON, categoryName: null, branch: 'THIRD_PARTY_OUTGOING' };
   }
@@ -387,7 +552,8 @@ export function projectNotionState(
     else if (role === 'CREDIT' && acc.type === 'CREDIT') accountPageById.set(acc.id, cardPage.id);
   }
 
-  const cycles = deriveCycles(txs.filter((t) => t.account_type === 'CREDIT'), cardPage.name, ctx.defaultDueDay);
+  const anchor = buildAnchor(ctx.officialBills, creditIds[0]);
+  const { cycles, keyFor } = deriveCycles(txs.filter((t) => t.account_type === 'CREDIT'), cardPage.name, ctx.defaultDueDay, anchor);
 
   const projected: ProjectedTransaction[] = [];
   const unresolved = new Set<string>();
@@ -406,8 +572,7 @@ export function projectNotionState(
 
     let billStableId: string | null = null;
     if (isCredit) {
-      const upstreamBillId = raw.credit_card_data?.billId;
-      const cycle = cycles.get(upstreamBillId ? `BILL_${upstreamBillId}` : `PERIOD_${tx.date.substring(0, 7)}`);
+      const cycle = cycles.get(keyFor(tx));
       if (cycle) {
         billStableId = cycle.stableBillId;
         if (isPurchase) cycle.purchases.push(tx);
@@ -468,9 +633,31 @@ export function projectNotionState(
 
   const bills: ProjectedBill[] = [];
   const txById = new Map(txs.map((t) => [t.id, t]));
+  // The card balance Pierre reports is the bank's own figure for the open bill.
+  const cardRow = accounts.find((a) => a.id === creditIds[0]);
+  let openBillAmount: number | null = null;
+  try {
+    const balance = cardRow?.raw_json ? Number(JSON.parse(cardRow.raw_json).balance) : NaN;
+    if (Number.isFinite(balance)) openBillAmount = Math.round(balance * 100) / 100;
+  } catch {
+    openBillAmount = null;
+  }
+  const bankPayments = txs.filter((t) => t.account_type === 'BANK' && isPaymentTx(t) && Number(t.amount) < 0);
   for (const cycle of cycles.values()) {
     const purchasesTotal = Math.round(cycle.purchases.reduce((s, p) => s + Math.abs(Number(p.amount)), 0) * 100) / 100;
     const paid = Math.round(cycle.payments.reduce((s, id) => s + Math.abs(Number(txById.get(id)?.amount ?? 0)), 0) * 100) / 100;
+    let status: string | null = null;
+    let openEstimate: number | null = null;
+    if (anchor) {
+      // Payments from the account after the closing, up to a few days past the due date, settle the statement.
+      const settleUntil = cycle.vencimento ? addDays(cycle.vencimento, 5) : cycle.fechamento;
+      const settled = bankPayments
+        .filter((t) => t.date.substring(0, 10) > cycle.fechamento && t.date.substring(0, 10) <= settleUntil)
+        .reduce((sum, t) => sum + Math.abs(Number(t.amount)), 0);
+      status = billStatus(cycle, ctx.today, Math.round(settled * 100) / 100);
+      const isCurrent = ctx.today !== undefined && cycle.inicio <= ctx.today && ctx.today <= cycle.fechamento;
+      if (isCurrent && cycle.qualidade !== 'UPSTREAM_OFFICIAL') openEstimate = openBillAmount;
+    }
     bills.push({
       stableId: cycle.stableBillId,
       cardPageId: cardPage.id,
@@ -489,9 +676,9 @@ export function projectNotionState(
         'Data de Vencimento': cycle.vencimento ? { start: cycle.vencimento, end: null } : null,
         'Tipo de Ciclo': cycle.tipoCiclo,
         'Origem / Qualidade dos Dados': cycle.qualidade,
-        'Status da Fatura': null,
-        'Valor da Fatura Fechada (Oficial)': null,
-        'Valor Estimado da Fatura Aberta': null,
+        'Status da Fatura': status,
+        'Valor da Fatura Fechada (Oficial)': cycle.officialAmount,
+        'Valor Estimado da Fatura Aberta': openEstimate,
         'Total de Compras no Ciclo': purchasesTotal,
         'Componentes Adicionais da Fatura': null,
         'Divergência Não Explicada': null,

@@ -33,6 +33,19 @@ export interface SqliteAccountRow {
   credit_limit: number | null;
   available_credit: number | null;
   last_synced_at: string | null;
+  /** Full Pierre account payload (card balance = current open bill, customized limit). */
+  raw_json?: string | null;
+}
+
+/** An official bill from Pierre's GET /get-bills, as kept in the local `card_bills` table. */
+export interface OfficialBill {
+  id: string;
+  accountId: string;
+  /** YYYY-MM-DD */
+  dueDate: string | null;
+  closingDate: string | null;
+  /** Statement balance at closing (negative = credit). */
+  totalAmount: number | null;
 }
 
 export type AccountRole = 'CHECKING' | 'CREDIT';
@@ -56,6 +69,13 @@ export interface ProjectionContext {
   sameOwnershipKeywords: string[];
   checkingAccountName: string;
   creditAccountName: string;
+  /**
+   * Official bills of the card. When at least one carries a closing date, cycles are anchored on the bank's
+   * own closing/due dates instead of being inferred from purchase dates.
+   */
+  officialBills?: OfficialBill[];
+  /** Today in America/Sao_Paulo (YYYY-MM-DD); drives the bill status. Kept out of the projection's clock. */
+  today?: string;
 }
 
 export type ClassificationBranch =

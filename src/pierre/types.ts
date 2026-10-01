@@ -215,6 +215,28 @@ export interface PierreBillSummaryResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Bills (GET /get-bills) — official closed bills; Pierre lists only past-due ones
+// ---------------------------------------------------------------------------
+
+export interface PierreBill {
+  id: string;
+  accountId: string;
+  dueDate: string | null;
+  billClosingDate: string | null;
+  /** Statement balance at closing, as a decimal string ("0.00"; negative = credit). */
+  totalAmount: string | number | null;
+  totalAmountCurrencyCode: string | null;
+  minimumPaymentAmount: string | number | null;
+  updatedAt: string | null;
+}
+
+export interface PierreBillsResponse {
+  success: boolean;
+  data: PierreBill[];
+  count: number;
+}
+
+// ---------------------------------------------------------------------------
 // Installments (GET /get-installments)
 // ---------------------------------------------------------------------------
 

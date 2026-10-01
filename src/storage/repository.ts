@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { NormalizedTransaction, NormalizedAccount } from '../pierre/normalizer';
+import { NormalizedTransaction, NormalizedAccount, NormalizedCardBill } from '../pierre/normalizer';
 
 // ---------------------------------------------------------------------------
 // Category mapping (read from Google Sheets Config tab)
@@ -524,6 +524,25 @@ export class Repository {
         error_message = ?
       WHERE id = ?
     `).run(errorMessage, syncId);
+  }
+
+  upsertCardBills(bills: NormalizedCardBill[]): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO card_bills (id, account_id, due_date, closing_date, total_amount, currency, source_updated_at, last_synced_at, raw_json)
+      VALUES (@id, @accountId, @dueDate, @closingDate, @totalAmount, @currency, @sourceUpdatedAt, datetime('now'), @rawJson)
+      ON CONFLICT(id) DO UPDATE SET
+        account_id = @accountId,
+        due_date = COALESCE(@dueDate, due_date),
+        closing_date = COALESCE(@closingDate, closing_date),
+        total_amount = COALESCE(@totalAmount, total_amount),
+        currency = COALESCE(@currency, currency),
+        source_updated_at = @sourceUpdatedAt,
+        last_synced_at = datetime('now'),
+        raw_json = @rawJson
+    `);
+    this.db.transaction(() => {
+      for (const b of bills) stmt.run(b);
+    })();
   }
 
   getLastSuccessfulSync(): { completed_at: string } | undefined {

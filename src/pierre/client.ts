@@ -2,6 +2,7 @@ import {
   PierreAccountsResponse,
   PierreTransactionsResponse,
   PierreBillSummaryResponse,
+  PierreBillsResponse,
   PierreInstallmentsResponse,
   PierreManualUpdateResponse,
 } from './types';
@@ -73,6 +74,15 @@ export class PierreClient {
   async getBillSummary(): Promise<PierreBillSummaryResponse> {
     this.logger?.info('Fetching bill summary...');
     return this.request<PierreBillSummaryResponse>('/get-bill-summary');
+  }
+
+  /**
+   * Fetch the official closed bills (closing date, due date, statement balance). Pierre lists only
+   * bills whose due date has passed.
+   */
+  async getBills(): Promise<PierreBillsResponse> {
+    this.logger?.info('Fetching bills...');
+    return this.request<PierreBillsResponse>('/get-bills');
   }
 
   /**

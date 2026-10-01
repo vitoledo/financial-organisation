@@ -1,4 +1,4 @@
-import { PierreTransaction, PierreAccount } from './types';
+import { PierreTransaction, PierreAccount, PierreBill } from './types';
 
 // ---------------------------------------------------------------------------
 // Normalized domain types (what we store in SQLite)
@@ -173,7 +173,8 @@ export function normalizeAccount(account: PierreAccount): NormalizedAccount {
  * Classify the direction of a transaction and normalize its sign.
  *
  * Rules:
- * - Transfer categories → TRANSFER (sign untouched, excluded from totals)
+ * - Transfer categories → TRANSFER (sign untouched, excluded from totals), except a card charge in a
+ *   transfer category (Pix paid with credit), which is made negative like any card purchase
  * - Bank account: positive amount = INCOME, negative = EXPENSE
  * - Credit card: Pierre reports purchases as positive amounts in a CREDIT
  *   account, but for us a purchase is an expense (money going out).
@@ -188,7 +189,9 @@ export function normalizeTransaction(tx: PierreTransaction): NormalizedTransacti
 
   if (isTransfer) {
     direction = 'TRANSFER';
-    // Keep original sign for transfers — they cancel out
+    // Keep original sign for transfers — they cancel out. On the card a positive amount is a charge
+    // (e.g. a Pix paid with credit), which leaves the card like any purchase, so it becomes negative.
+    if (tx.account_type === 'CREDIT' && tx.amount > 0) amount = -tx.amount;
   } else if (tx.account_type === 'CREDIT') {
     // Credit card: invert sign (purchase positive → expense negative)
     amount = -tx.amount;
@@ -211,6 +214,35 @@ export function normalizeTransaction(tx: PierreTransaction): NormalizedTransacti
     accountType: tx.account_type,
     status: tx.status,
     rawJson: JSON.stringify(tx),
+  };
+}
+
+export interface NormalizedCardBill {
+  id: string;
+  accountId: string;
+  /** YYYY-MM-DD, or null when Pierre does not report it. */
+  dueDate: string | null;
+  closingDate: string | null;
+  /** Statement balance at closing (negative = credit), or null when absent/unparseable. */
+  totalAmount: number | null;
+  currency: string | null;
+  sourceUpdatedAt: string | null;
+  rawJson: string;
+}
+
+const isoDay = (v: string | null | undefined) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v) ? v.substring(0, 10) : null);
+
+export function normalizeBill(bill: PierreBill): NormalizedCardBill {
+  const total = bill.totalAmount === null || bill.totalAmount === undefined || bill.totalAmount === '' ? null : Number(bill.totalAmount);
+  return {
+    id: bill.id,
+    accountId: bill.accountId,
+    dueDate: isoDay(bill.dueDate),
+    closingDate: isoDay(bill.billClosingDate),
+    totalAmount: total === null || Number.isNaN(total) ? null : Math.round(total * 100) / 100,
+    currency: bill.totalAmountCurrencyCode ?? null,
+    sourceUpdatedAt: bill.updatedAt ?? null,
+    rawJson: JSON.stringify(bill),
   };
 }
 

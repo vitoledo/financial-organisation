@@ -17,7 +17,7 @@ describe('runMigrations', () => {
     runMigrations(db);
 
     const version = db.pragma('user_version', { simple: true });
-    expect(version).toBe(3);
+    expect(version).toBe(4);
 
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -28,6 +28,7 @@ describe('runMigrations', () => {
     expect(tableNames).toContain('transactions');
     expect(tableNames).toContain('installments');
     expect(tableNames).toContain('investments');
+    expect(tableNames).toContain('card_bills');
   });
 
   it('migrates from version 1 schema to the current schema', () => {
@@ -42,7 +43,7 @@ describe('runMigrations', () => {
 
     runMigrations(db);
 
-    expect(db.pragma('user_version', { simple: true })).toBe(3);
+    expect(db.pragma('user_version', { simple: true })).toBe(4);
 
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -67,16 +68,27 @@ describe('runMigrations', () => {
 
     runMigrations(db);
 
-    expect(db.pragma('user_version', { simple: true })).toBe(3);
+    expect(db.pragma('user_version', { simple: true })).toBe(4);
 
     const columns = (db.pragma('table_info(accounts)') as Array<{ name: string }>).map((c) => c.name);
     expect(columns).toContain('automatically_invested_balance');
     expect(columns).toContain('reserved_total');
   });
 
+  it('adds the official card bills table when upgrading a v3 database', () => {
+    db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY);`);
+    db.pragma('user_version = 3');
+
+    runMigrations(db);
+
+    expect(db.pragma('user_version', { simple: true })).toBe(4);
+    const columns = (db.pragma('table_info(card_bills)') as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(['id', 'account_id', 'due_date', 'closing_date', 'total_amount']));
+  });
+
   it('is a no-op when the database is already current', () => {
     runMigrations(db);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(db.pragma('user_version', { simple: true })).toBe(3);
+    expect(db.pragma('user_version', { simple: true })).toBe(4);
   });
 });
