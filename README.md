@@ -211,12 +211,27 @@ esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` 
 - **Regras de Classificação**: regras ativas com *Auto aplicar* classificam as transações novas e também as
   pendentes que ninguém tocou ainda. *Exigir revisão* deixa o resultado como *Provável*. Vale a primeira
   regra por *Prioridade* (menor primeiro).
-- **Faturas**: ciclos novos são criados; período, total de compras e pagamentos são recalculados. Status
-  oficial, valor oficial e liquidação preenchidos por você são preservados. Um ciclo *estimado* cujas compras
-  o banco passou para a fatura oficial tem os totais zerados (aviso `SUPERSEDED_ESTIMATED_BILL`) e pode ser
-  apagado à mão; uma fatura real nunca é alterada assim.
+- **Faturas** seguem o calendário do banco. As faturas oficiais do Pierre (`get-bills`, guardadas na tabela
+  `card_bills`) dão a data de fechamento, o vencimento e o saldo de fechamento (*Valor da Fatura Fechada
+  (Oficial)*); o período vai do dia seguinte ao fechamento anterior até o fechamento. O *Status da Fatura* é
+  calculado: saldo oficial zero (ou negativo) → *Paga Integralmente*; com saldo, *Fechada a Vencer* até o
+  vencimento e depois *Paga Integralmente* / *Paga Parcialmente* / *Vencida* pelos pagamentos feitos da conta
+  após o fechamento.
+- **Fatura aberta**: as compras pendentes vão para a fatura aberta do calendário do banco (fecha no mesmo dia
+  do mês do último fechamento oficial), com status *Aberta em Curso* e, em *Valor Estimado da Fatura Aberta*,
+  o valor que o banco informa para a fatura atual (o mesmo do app). *Total de Compras no Ciclo* e *Valor Pago*
+  são somas das transações que o Pierre lista e podem não fechar com o valor do banco (compras ainda
+  pendentes, pagamentos que o banco aplica na fatura anterior). Quando o banco fecha a fatura, **a mesma
+  página** passa a ser a fatura oficial (aviso `ADOPTED_BILL`), sem duplicar.
+- Ciclos novos são criados; período, totais e pagamentos são recalculados; a *Data de Liquidação* preenchida
+  por você é preservada. Sem faturas oficiais (Pierre fora do ar e nada guardado) vale o cálculo da migração.
+  Um ciclo *estimado* que perdeu todas as compras tem os totais zerados (aviso `SUPERSEDED_ESTIMATED_BILL`) e
+  pode ser apagado à mão; uma fatura real nunca é alterada assim.
 - **Contas**: saldo e limites só são atualizados quando o dado da fonte é tão ou mais recente que o
-  *Atualizado em* da página.
+  *Atualizado em* da página. O *Limite Operacional Usado* do cartão é o *Limite personalizado* (seu) menos o
+  disponível; se o banco informar outro limite personalizado, a execução avisa (`LIMIT_DRIFT`).
+- **Pix no crédito** (cobrança no cartão com categoria de transferência) entra como *Saída*, pendente de
+  revisão como transferência enviada a terceiro.
 - Nada é apagado ou arquivado. Opções novas de select e propriedades inexistentes abortam a execução antes
   de gravar (nenhuma mudança de schema). Mais de `NOTION_SYNC_MAX_CREATES` (300) páginas novas numa execução
   exigem `--allow-large`. Uma trava (`data/notion-sync.lock`) impede duas execuções simultâneas.

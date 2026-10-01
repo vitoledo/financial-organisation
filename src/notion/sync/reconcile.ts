@@ -61,6 +61,9 @@ export const BILL_MANAGED_FIELDS = [
   'Origem / Qualidade dos Dados',
   'Total de Compras no Ciclo',
   'Valor Pago',
+  'Status da Fatura',
+  'Valor da Fatura Fechada (Oficial)',
+  'Valor Estimado da Fatura Aberta',
 ];
 
 /** Relation target that may not exist yet: resolved to a page id at apply time. */
@@ -99,7 +102,15 @@ export interface PlannedAccountUpdate {
   fields: string[];
 }
 
+/** An existing bill page taken over by a projected bill (its stable id is rewritten). */
+export interface BillAdoption {
+  stableId: string;
+  fromStableId: string;
+  pageId: string;
+}
+
 export interface SyncPlan {
+  billAdoptions: BillAdoption[];
   billCreates: PlannedCreate[];
   txCreates: PlannedCreate[];
   txUpdates: PlannedUpdate[];
@@ -228,6 +239,13 @@ function reconcileTransactions(
     let ruleName: string | undefined;
     if (isUntouchedPending(page)) {
       const rule = findMatchingRule(rules, row, base.accountPageId);
+      // Still pending and untouched: keep the automatic review reason in step with the source (e.g. a card
+      // charge first read as money coming in).
+      const reason = base.payload['Motivo da Revisão'];
+      if (!rule && base.payload['Status de Revisão'] === 'Pendente Revisão' && reason && !same(canonicalValue(TX_ENV, 'Motivo da Revisão', reason), liveValue(TX_ENV, 'Motivo da Revisão', page))) {
+        payload['Motivo da Revisão'] = reason;
+        fields.push('Motivo da Revisão');
+      }
       if (rule) {
         const outcome = ruleOutcome(rule, base);
         for (const [k, v] of Object.entries(outcome.fields)) {
@@ -250,6 +268,38 @@ function reconcileTransactions(
       plan.txUpdates.push({ stableId: base.stableId, pageId: page.pageId, kind, payload, relations, fields, rule: ruleName });
     }
   }
+}
+
+/**
+ * A projected bill with no page yet may already be on screen under another stable id — typically the open-bill
+ * page created before the bank reported the bill, which then closes under its official id. When every purchase
+ * of the projected bill that has a page points to one and the same bill page, and that page is no longer derived,
+ * the page is taken over (its stable id is rewritten on update) instead of creating a twin and zeroing the old one.
+ * Returns the live state as this plan will leave it.
+ */
+function adoptBills(projection: ProjectionResult, live: LiveState, plan: SyncPlan): LiveState {
+  const projectedIds = new Set(projection.bills.map((b) => b.stableId));
+  const staleByPage = new Map<string, string>();
+  for (const [stableId, pages] of live.bills) if (!projectedIds.has(stableId) && pages.length === 1) staleByPage.set(pages[0].pageId, stableId);
+  const bills = new Map(live.bills);
+  for (const bill of projection.bills) {
+    if ((live.bills.get(bill.stableId) ?? []).length > 0) continue;
+    const linked = new Set<string>();
+    for (const id of bill.purchaseIds) {
+      const txPage = live.transactions.get(id)?.[0];
+      if (txPage) for (const b of liveValue(TX_ENV, 'Fatura Vinculada', txPage) as string[]) linked.add(b);
+    }
+    if (linked.size !== 1) continue;
+    const pageId = [...linked][0];
+    const fromStableId = staleByPage.get(pageId);
+    if (!fromStableId) continue;
+    staleByPage.delete(pageId);
+    bills.set(bill.stableId, bills.get(fromStableId)!);
+    bills.delete(fromStableId);
+    plan.billAdoptions.push({ stableId: bill.stableId, fromStableId, pageId });
+    plan.warnings.push(`ADOPTED_BILL: a página da fatura ${fromStableId} passa a ser ${bill.stableId} (mesmas compras).`);
+  }
+  return { ...live, bills };
 }
 
 function reconcileBills(projection: ProjectionResult, live: LiveState, txPageId: Map<string, string>, plan: SyncPlan): void {
@@ -316,6 +366,10 @@ function reconcileBills(projection: ProjectionResult, live: LiveState, txPageId:
         fields.push(f);
       }
     }
+    if (plan.billAdoptions.some((a) => a.stableId === bill.stableId)) {
+      payload['ID Estável da Fatura'] = bill.stableId;
+      fields.push('ID Estável da Fatura');
+    }
     if (!same([bill.cardPageId], liveValue(BILL_ENV, 'Cartão Vinculado', page))) {
       relations['Cartão Vinculado'] = pageRefs([bill.cardPageId]);
       fields.push('Cartão Vinculado');
@@ -329,6 +383,19 @@ function reconcileBills(projection: ProjectionResult, live: LiveState, txPageId:
       fields.push('Transações de Pagamento');
     }
     if (fields.length > 0) plan.billUpdates.push({ stableId: bill.stableId, pageId: page.pageId, payload, relations, fields });
+  }
+}
+
+/** The customized ("personalizado") limit the bank reports for the card, from the stored Pierre payload. */
+function customizedLimit(rawJson: string | null | undefined): number | null {
+  if (!rawJson) return null;
+  try {
+    const lines = JSON.parse(rawJson)?.creditData?.disaggregatedCreditLimits;
+    if (!Array.isArray(lines)) return null;
+    const v = lines.map((l: any) => Number(l?.customizedLimitAmount)).find((n: number) => Number.isFinite(n) && n > 0);
+    return v === undefined ? null : v;
+  } catch {
+    return null;
   }
 }
 
@@ -358,6 +425,12 @@ function reconcileAccounts(ctx: AccountSourceContext, live: LiveState, plan: Syn
         desired['Limite Usado da Fonte (Bruto)'] = Math.round((row.credit_limit - row.available_credit) * 100) / 100;
       }
       const personal = liveValue(ACCOUNT_ENV, 'Limite personalizado', page);
+      const bankPersonal = customizedLimit(row.raw_json);
+      if (bankPersonal !== null && (typeof personal !== 'number' || Math.abs(personal / 100 - bankPersonal) > 0.005)) {
+        plan.warnings.push(
+          `LIMIT_DRIFT: o banco informa limite personalizado de R$ ${bankPersonal.toFixed(2)} para ${page.name}, mas o Notion tem ${typeof personal === 'number' ? `R$ ${(personal / 100).toFixed(2)}` : 'vazio'}; o limite usado é calculado com o valor do Notion.`,
+        );
+      }
       if (typeof personal === 'number' && row.available_credit !== null) {
         // "Limite personalizado" is canonicalised in minor units (real format).
         const personalValue = personal / 100;
@@ -390,6 +463,7 @@ export function reconcile(
   options: ReconcileOptions,
 ): SyncPlan {
   const plan: SyncPlan = {
+    billAdoptions: [],
     billCreates: [],
     txCreates: [],
     txUpdates: [],
@@ -405,10 +479,11 @@ export function reconcile(
   if (projection.unresolvedAccountIds.length > 0) {
     plan.warnings.push(`UNMAPPED_SOURCE_ACCOUNT: contas do Pierre sem papel no arquivo de mapeamento: ${projection.unresolvedAccountIds.join(', ')}.`);
   }
+  const effective = adoptBills(projection, live, plan);
   // Pages whose source row is not in the local history (manual entries, other sources) are never touched.
-  reconcileTransactions(projection, new Map(rows.map((r) => [r.id, r])), rules, live, options, plan);
-  reconcileBills(projection, live, txPageId, plan);
-  reconcileAccounts(accounts, live, plan);
+  reconcileTransactions(projection, new Map(rows.map((r) => [r.id, r])), rules, effective, options, plan);
+  reconcileBills(projection, effective, txPageId, plan);
+  reconcileAccounts(accounts, effective, plan);
   return plan;
 }
 

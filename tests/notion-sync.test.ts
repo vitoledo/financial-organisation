@@ -462,6 +462,9 @@ function fakePierre(txs: any[]) {
       ],
     }),
     getTransactions: async () => ({ data: txs }),
+    getBills: async () => ({
+      data: [{ id: 'bill-9', accountId: 'card-1', dueDate: '2026-10-16T00:00:00.000Z', billClosingDate: '2026-10-09T00:00:00.000Z', totalAmount: '0.00', totalAmountCurrencyCode: 'BRL', minimumPaymentAmount: '0.00', updatedAt: null }],
+    }),
   } as any;
 }
 
@@ -559,6 +562,28 @@ describe('NotionSyncEngine', () => {
     await withWindow(old, starts).run(opts);
     await withWindow(old, starts).run(opts);
     expect(starts[3]).toBe('2026-06-29');
+  });
+
+  it('stores the official bills on --apply only, and keeps syncing when get-bills fails', async () => {
+    const count = () => (db.prepare('SELECT COUNT(*) n FROM card_bills').get() as any).n;
+    await engine().run({ ...opts, apply: false });
+    expect(count()).toBe(0);
+    const applied = await engine().run(opts);
+    expect(applied.status).toBe('SUCCESS');
+    expect(db.prepare('SELECT id, closing_date, due_date, total_amount FROM card_bills').get()).toEqual({ id: 'bill-9', closing_date: '2026-10-09', due_date: '2026-10-16', total_amount: 0 });
+    const bill = notion.byDs(DS.bills)[0];
+    expect(bill.properties['Data de Fechamento']).toEqual(dt('2026-10-09'));
+    expect(bill.properties['Origem / Qualidade dos Dados']).toEqual(sel('UPSTREAM_OFFICIAL'));
+
+    const broken = fakePierre(txs);
+    broken.getBills = async () => {
+      throw new Error('Pierre API error 500');
+    };
+    const warnings: string[] = [];
+    const report = await new NotionSyncEngine(SETTINGS, { gateway: new NotionSyncGateway(notion as any, DS, { minIntervalMs: 0, sleep: async () => {} }), db, pierre: broken, now: () => new Date('2026-09-29T12:00:00.000Z'), sleep: async () => {} }, { ...quiet, warn: (m: string) => warnings.push(m) }).run(opts);
+    expect(warnings.join()).toMatch(/get-bills falhou/);
+    expect(report.status).toBe('NOTHING_TO_DO'); // the stored official bill still anchors the cycle
+    expect(count()).toBe(1);
   });
 
   it('fails closed before writing when the plan would create an unknown select option', async () => {

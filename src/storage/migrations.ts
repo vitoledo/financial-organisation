@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * Run all pending migrations. Uses a simple user_version pragma to track
@@ -14,6 +14,7 @@ export function runMigrations(db: Database.Database): void {
     if (currentVersion < 1) db.exec(MIGRATION_001);
     if (currentVersion < 2) db.exec(MIGRATION_002);
     if (currentVersion < 3) db.exec(MIGRATION_003);
+    if (currentVersion < 4) db.exec(MIGRATION_004);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }
@@ -136,4 +137,28 @@ const MIGRATION_002 = `
 const MIGRATION_003 = `
   ALTER TABLE accounts ADD COLUMN automatically_invested_balance REAL;
   ALTER TABLE accounts ADD COLUMN reserved_total REAL;
+`;
+
+// ---------------------------------------------------------------------------
+// Migration 004 — Official card bills
+//
+// Pierre's GET /get-bills is the only source of the bank's own closing date,
+// due date and statement balance per bill. Kept locally so the projection stays
+// a pure function of SQLite (and so a run that cannot reach the endpoint still
+// projects the last known official values).
+// ---------------------------------------------------------------------------
+
+const MIGRATION_004 = `
+  CREATE TABLE IF NOT EXISTS card_bills (
+    id                 TEXT PRIMARY KEY,
+    account_id         TEXT NOT NULL,
+    due_date           TEXT,
+    closing_date       TEXT,
+    total_amount       REAL,
+    currency           TEXT,
+    source_updated_at  TEXT,
+    last_synced_at     TEXT,
+    raw_json           TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_card_bills_account ON card_bills(account_id);
 `;
