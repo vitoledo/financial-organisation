@@ -98,56 +98,79 @@ injetar um client mock.
 
 ## Execução autônoma (Docker no home server)
 
-O alvo é rodar 2x/dia, todos os dias, num servidor sempre ligado. Um
-container roda o **supercronic** como PID 1, que dispara `node dist/index.js`
-no horário agendado (`docker/crontab`, hoje às 06:30 e 18:30 BRT). Cada
-execução é um processo novo — conexão SQLite limpa e código de saída honesto.
+O alvo é rodar 2x/dia, todos os dias, num servidor sempre ligado. Um container roda o **supercronic** como
+PID 1, que dispara os jobs do `docker/crontab` (horário de Brasília). Cada execução é um processo novo —
+conexão SQLite limpa e código de saída honesto.
 
-### Pré-requisito que trava tudo
+| Horário | Job | Quando roda |
+|---------|-----|-------------|
+| 06:40 e 18:40 | `node dist/notion/sync/cli.js --apply` — Pierre → SQLite → Notion | sempre |
+| 06:30 e 18:30 | `node dist/index.js` — planilha Google Sheets (legado) | só com `ENABLE_GOOGLE_SHEETS_SYNC=true` |
 
-**Publique a tela de consentimento OAuth em "Production"** no Google Cloud
-Console. Em "Testing", o refresh token expira em 7 dias e a automação quebra
-toda semana.
+O servidor continua necessário: o SQLite em `data/` guarda o histórico completo de que a projeção depende
+(o Pierre só devolve uma janela recente) e é ele que roda o cron.
 
-### Provisionar e subir
-
-O consent do Google precisa de um navegador **uma vez**. Faça num desktop e
-leve o token para o servidor:
+### Subir no servidor (Notion)
 
 ```bash
-# 1. Numa máquina com navegador (desktop). HEADLESS=0 força o fluxo interativo,
-#    já que a imagem roda headless por padrão:
-docker compose run --rm -e HEADLESS=0 app sync --setup-only
-#    → grava data/google-tokens.json e cria a planilha
-#    (fora do Docker, `pnpm setup` faz o mesmo sem precisar do -e)
+# 1. Código novo
+git pull
 
-# 2. Copie ./data/google-tokens.json e ./data/spreadsheet-id.txt para o servidor.
+# 2. .env (ao lado do docker-compose.yml) — além do que já existe:
+#    PIERRE_API_KEY=<chave ativa do Pierre>
+#    NOTION_API_KEY=<token da integração do Notion>
+#    NOTION_DS_TRANSACTIONS / NOTION_DS_CARD_BILLS / NOTION_DS_ACCOUNTS /
+#    NOTION_DS_CATEGORIES / NOTION_DS_RULES / NOTION_DS_SYNC_LOG = IDs das data sources
+#    Remova PIERRE_API_URL se apontar para api.pierre.com.br (esse host não existe mais;
+#    o padrão já é https://www.pierre.finance/tools/api).
 
-# 3. No servidor (dono do bind mount = uid 1000, para o WAL do SQLite escrever;
-#    0700 para o diretório e os arquivos de token/DB ficarem privados):
-mkdir -p data && sudo chown -R 1000:1000 data && chmod 700 data
+# 3. data/account-mapping.json: qual conta do Pierre é a conta corrente e qual é o cartão
+#    {"<id conta>": "CHECKING", "<id cartão>": "CREDIT", "defaultDueDay": 16}
+
+# 4. Dono do bind mount = uid 1000 (o WAL do SQLite precisa escrever), 0700 para ficar privado
+sudo chown -R 1000:1000 data && chmod 700 data
+
+# 5. Simula uma vez (não grava nada) e confere o resumo; depois sobe o agendador
+docker compose build
+docker compose run --rm app notion-sync
 docker compose up -d
 ```
 
-> Combine com disco criptografado no host (LUKS/BitLocker): o token do Google e
-> o banco SQLite ficam em texto puro no bind mount.
+O SQLite que já está no servidor serve como está: a primeira execução busca no Pierre desde a transação
+pendente mais antiga e converge para o que já está no Notion, sem duplicar nada.
 
-No servidor (headless), se faltar token o programa **falha rápido** com
-instruções, em vez de travar esperando um navegador que não existe.
+> Combine com disco criptografado no host (LUKS/BitLocker): o banco SQLite (e o token do Google, se usar a
+> planilha) ficam em texto puro no bind mount.
+
+### Planilha Google Sheets (opcional, legado)
+
+Para continuar atualizando a planilha, coloque `ENABLE_GOOGLE_SHEETS_SYNC=true` no `.env` e faça o consent
+do Google **uma vez** num desktop (publique antes a tela de consentimento OAuth em **"Production"** no
+Google Cloud Console — em "Testing" o refresh token expira em 7 dias):
+
+```bash
+docker compose run --rm -e HEADLESS=0 app sync --setup-only   # num desktop; grava data/google-tokens.json
+# copie data/google-tokens.json e data/spreadsheet-id.txt para o servidor
+```
+
+No servidor (headless), se faltar token o job da planilha **falha rápido** com instruções.
 
 ### Observabilidade
 
-- **Heartbeat:** cada run escreve `data/last-run.json` (sucesso ou falha).
-- **Healthcheck:** o container fica *unhealthy* se o último run falhou ou está
-  mais velho que `STALE_HOURS` (30h, ~1 run perdido de margem). O Docker só marca — para agir,
-  use um alerta externo ou um sidecar de autoheal.
+- **Heartbeat:** cada execução com `--apply` da sincronização do Notion escreve `data/last-notion-sync.json`
+  (a planilha, quando ligada, escreve `data/last-run.json`).
+- **Healthcheck:** o container fica *unhealthy* se a última sincronização do Notion falhou, gravou só em parte
+  (`PARTIAL`) ou está mais velha que `STALE_HOURS` (30h, ~1 run perdido de margem); a planilha só conta com
+  `ENABLE_GOOGLE_SHEETS_SYNC=true`. O Docker só marca — para agir, use um alerta externo ou um sidecar de
+  autoheal.
+- **No Notion:** cada execução vira uma linha no **Log de Sincronização**.
 - **Logs:** vão para o stdout (rotacionado pelo Docker: `max-size` / `max-file`).
 
 ```bash
-docker compose logs -f            # acompanhar
+docker compose logs -f                                  # acompanhar
 docker inspect --format '{{.State.Health.Status}}' financial-organisation
-cat data/last-run.json            # último resultado, legível por máquina
-docker compose run --rm app sync  # sync manual sob demanda
+cat data/last-notion-sync.json                          # último resultado, legível por máquina
+docker compose run --rm app notion-sync --apply         # sincronização manual sob demanda
 ```
 
 > **Importante:** mantenha `data/` num filesystem **local**. O WAL do SQLite
@@ -171,7 +194,9 @@ pnpm notion:sync --skip-pierre   # projeta só o histórico local do SQLite (sem
 docker compose run --rm app notion-sync --apply   # no servidor
 ```
 
-No servidor ela roda sozinha às 06:40 e 18:40 (`docker/crontab`), dez minutos depois da planilha.
+No servidor ela roda sozinha às 06:40 e 18:40 (`docker/crontab`). A janela buscada no Pierre começa na
+transação pendente mais antiga do SQLite (limitada a 3 meses), para pegar compras que o banco efetiva semanas
+depois com outra data e a fatura oficial.
 
 **Como decide o que gravar.** Cada execução recalcula, a partir de todo o histórico do SQLite, o estado
 esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` no contrato
@@ -187,7 +212,9 @@ esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` 
   pendentes que ninguém tocou ainda. *Exigir revisão* deixa o resultado como *Provável*. Vale a primeira
   regra por *Prioridade* (menor primeiro).
 - **Faturas**: ciclos novos são criados; período, total de compras e pagamentos são recalculados. Status
-  oficial, valor oficial e liquidação preenchidos por você são preservados.
+  oficial, valor oficial e liquidação preenchidos por você são preservados. Um ciclo *estimado* cujas compras
+  o banco passou para a fatura oficial tem os totais zerados (aviso `SUPERSEDED_ESTIMATED_BILL`) e pode ser
+  apagado à mão; uma fatura real nunca é alterada assim.
 - **Contas**: saldo e limites só são atualizados quando o dado da fonte é tão ou mais recente que o
   *Atualizado em* da página.
 - Nada é apagado ou arquivado. Opções novas de select e propriedades inexistentes abortam a execução antes
@@ -198,8 +225,9 @@ esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` 
 
 **Configuração** (além das variáveis do Pierre): `NOTION_API_KEY`, `NOTION_DS_TRANSACTIONS`,
 `NOTION_DS_CARD_BILLS`, `NOTION_DS_ACCOUNTS`, `NOTION_DS_CATEGORIES`, `NOTION_DS_RULES`,
-`NOTION_DS_SYNC_LOG`, `COUNTERPARTY_HMAC_KEY` (a mesma da migração) e `data/account-mapping.json`
-(`ACCOUNT_MAPPING_PATH`), que diz qual conta do Pierre é a conta corrente e qual é o cartão.
+`NOTION_DS_SYNC_LOG` e `data/account-mapping.json` (`ACCOUNT_MAPPING_PATH`), que diz qual conta do Pierre é a
+conta corrente e qual é o cartão. `COUNTERPARTY_HMAC_KEY` é opcional: vazia, o campo *HMAC Contraparte* fica
+`[OFUSCADO]` (como na migração); preenchida, as transações passam a receber o pseudônimo.
 
 ---
 
