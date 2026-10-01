@@ -99,7 +99,8 @@ program
       });
       printReport(report);
       if (opts.json) console.log(JSON.stringify(report, null, 2));
-      writeHeartbeat(dataDir, { status: report.status, mode: report.mode, startedAt, finishedAt: new Date().toISOString(), runId: report.runId });
+      // Only --apply runs feed the container healthcheck; a manual simulation must not mask the scheduled state.
+      if (opts.apply) writeHeartbeat(dataDir, { status: report.status, mode: report.mode, startedAt, finishedAt: new Date().toISOString(), runId: report.runId });
       closeDatabase();
       release();
       process.exit(report.status === 'PARTIAL' ? 2 : 0);
@@ -107,7 +108,10 @@ program
       const message = err instanceof Error ? err.message : String(err);
       logger.error(message);
       if (err instanceof NotionSyncError && opts.json) console.log(JSON.stringify(err.report, null, 2));
-      writeHeartbeat(dataDir, { status: 'failure', startedAt, finishedAt: new Date().toISOString(), error: message });
+      // A run refused by the lock leaves the heartbeat to the run that holds it.
+      if (opts.apply && !message.startsWith('FAIL_CLOSED_LOCKED')) {
+        writeHeartbeat(dataDir, { status: 'failure', startedAt, finishedAt: new Date().toISOString(), error: message });
+      }
       try {
         closeDatabase();
       } catch {

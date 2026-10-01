@@ -22,8 +22,9 @@ services:
       STALE_HOURS: "30"  # limite de "atraso" do heartbeat p/ o healthcheck
                          # (roda a cada 12h → 30h tolera 1 run perdido + margem)
     volumes:
-      # Guarda google-tokens.json, financial.db (+ -wal/-shm), spreadsheet-id.txt
-      # e last-run.json. Precisa ser um filesystem LOCAL (não NFS/SMB): o WAL do
+      # Guarda financial.db (+ -wal/-shm), account-mapping.json, last-notion-sync.json
+      # e, se a planilha estiver ligada, google-tokens.json, spreadsheet-id.txt e
+      # last-run.json. Precisa ser um filesystem LOCAL (não NFS/SMB): o WAL do
       # SQLite corrompe em compartilhamentos de rede.
       - ./data:/app/data
     logging:

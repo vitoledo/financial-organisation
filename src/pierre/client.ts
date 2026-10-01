@@ -6,7 +6,8 @@ import {
   PierreManualUpdateResponse,
 } from './types';
 
-const DEFAULT_BASE_URL = 'https://api.pierre.com.br';
+// The old api.pierre.com.br host no longer resolves; this is the API host Pierre serves today.
+export const DEFAULT_BASE_URL = 'https://www.pierre.finance/tools/api';
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_ERROR_BODY_CHARS = 500;

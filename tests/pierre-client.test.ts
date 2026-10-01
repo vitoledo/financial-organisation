@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PierreClient } from '../src/pierre/client';
+import { DEFAULT_BASE_URL, PierreClient } from '../src/pierre/client';
 
 const noopLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
@@ -44,6 +44,13 @@ describe('PierreClient requests', () => {
     expect(init.headers.Authorization).toBe('Bearer test-key');
     expect(init.headers.Accept).toBe('application/json');
     expect(init.method).toBe('GET');
+  });
+
+  test('defaults to the current Pierre API host', async () => {
+    await new PierreClient({ apiKey: 'test-key', logger: noopLogger }).getAccounts();
+
+    expect(DEFAULT_BASE_URL).toBe('https://www.pierre.finance/tools/api');
+    expect(fetchMock.mock.calls[0][0]).toBe('https://www.pierre.finance/tools/api/get-accounts');
   });
 
   test('strips trailing slashes from the base url', async () => {
