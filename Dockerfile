@@ -66,13 +66,13 @@ RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm install --prod --frozen-lockfile
 
 COPY --from=build /app/dist ./dist
-COPY docker/crontab ./crontab
+COPY docker/render-crontab.sh /usr/local/bin/render-crontab.sh
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/healthcheck.mjs ./docker/healthcheck.mjs
 
 # WAL writes -wal/-shm siblings, so the process needs write on the data
 # directory (not just the db file) → own /app as the non-root node user.
-RUN chmod +x /usr/local/bin/entrypoint.sh \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/render-crontab.sh \
  && mkdir -p /app/data \
  && chown -R node:node /app
 

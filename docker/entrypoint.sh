@@ -23,4 +23,10 @@ fi
 # which does NOT search PATH. Invoked as bare `supercronic`, argv[0] has no
 # directory, the re-exec fails with ENOENT, and the container dies on boot with
 # "Failed to fork exec: no such file or directory".
-exec /usr/local/bin/supercronic /app/crontab
+#
+# The crontab is rendered from the environment (NOTION_SYNC_SCHEDULE / SHEETS_SYNC_SCHEDULE) into /tmp, and
+# checked by supercronic itself, so a bad schedule stops the container with a clear message instead of
+# silently never running.
+/usr/local/bin/render-crontab.sh > /tmp/crontab
+/usr/local/bin/supercronic -test /tmp/crontab
+exec /usr/local/bin/supercronic /tmp/crontab

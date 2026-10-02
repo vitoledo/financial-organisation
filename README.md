@@ -98,14 +98,19 @@ injetar um client mock.
 
 ## Execução autônoma (Docker no home server)
 
-O alvo é rodar 2x/dia, todos os dias, num servidor sempre ligado. Um container roda o **supercronic** como
-PID 1, que dispara os jobs do `docker/crontab` (horário de Brasília). Cada execução é um processo novo —
-conexão SQLite limpa e código de saída honesto.
+O alvo é rodar várias vezes por dia, todos os dias, num servidor sempre ligado. Um container roda o
+**supercronic** como PID 1; ao subir, `docker/render-crontab.sh` monta o crontab a partir do `.env` (horário de
+Brasília) e o supercronic o valida — um horário inválido para o container com a mensagem do erro. Cada execução
+é um processo novo — conexão SQLite limpa e código de saída honesto.
 
-| Horário | Job | Quando roda |
-|---------|-----|-------------|
-| 06:40 e 18:40 | `node dist/notion/sync/cli.js --apply` — Pierre → SQLite → Notion | sempre |
-| 06:30 e 18:30 | `node dist/index.js` — planilha Google Sheets (legado) | só com `ENABLE_GOOGLE_SHEETS_SYNC=true` |
+| Variável no `.env` | Padrão | Job |
+|--------------------|--------|-----|
+| `NOTION_SYNC_SCHEDULE` | `0 0,6,12,18 * * *` (00h, 06h, 12h e 18h) | `node dist/notion/sync/cli.js --apply` — Pierre → SQLite → Notion |
+| `SHEETS_SYNC_SCHEDULE` | `30 6,18 * * *` | `node dist/index.js` — planilha Google Sheets (legado), só com `ENABLE_GOOGLE_SHEETS_SYNC=true` |
+
+O valor é uma expressão cron de 5 campos (`minuto hora dia mês dia-da-semana`), ou `@hourly` / `@daily`. Ex.:
+`NOTION_SYNC_SCHEDULE=40 6,18 * * *` volta para 2x/dia. Depois de mudar, recrie o container
+(`docker compose up -d`) — o `.env` só é lido na criação.
 
 O servidor continua necessário: o SQLite em `data/` guarda o histórico completo de que a projeção depende
 (o Pierre só devolve uma janela recente) e é ele que roda o cron.
@@ -194,7 +199,7 @@ pnpm notion:sync --skip-pierre   # projeta só o histórico local do SQLite (sem
 docker compose run --rm app notion-sync --apply   # no servidor
 ```
 
-No servidor ela roda sozinha às 06:40 e 18:40 (`docker/crontab`). A janela buscada no Pierre começa na
+No servidor ela roda sozinha às 00h, 06h, 12h e 18h (`NOTION_SYNC_SCHEDULE`). A janela buscada no Pierre começa na
 transação pendente mais antiga do SQLite (limitada a 3 meses), para pegar compras que o banco efetiva semanas
 depois com outra data e a fatura oficial.
 
@@ -265,7 +270,7 @@ src/
 ├── storage/            SQLite: conexão, migrations, repository
 ├── sheets/             Google Sheets: auth, client, setup, builders, renderer
 └── sync/engine.ts      orquestra os 8 passos
-docker/                 crontab, entrypoint, healthcheck
+docker/                 render-crontab.sh (agenda via .env), entrypoint, healthcheck
 tests/                  vitest (lógica de negócio + builders)
 ```
 
