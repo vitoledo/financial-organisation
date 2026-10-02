@@ -20,7 +20,8 @@ services:
       HEADLESS: "1"      # nunca abrir navegador no servidor
       LOG_TO_FILE: "0"   # só stdout; o Docker rotaciona os logs
       STALE_HOURS: "30"  # limite de "atraso" do heartbeat p/ o healthcheck
-                         # (roda a cada 12h → 30h tolera 1 run perdido + margem)
+                         # (30h serve para qualquer agenda de 2x/dia ou mais; a
+                         # agenda vem de NOTION_SYNC_SCHEDULE no .env)
     volumes:
       # Guarda financial.db (+ -wal/-shm), account-mapping.json, last-notion-sync.json
       # e, se a planilha estiver ligada, google-tokens.json, spreadsheet-id.txt e
