@@ -133,7 +133,7 @@ export class Repository {
   ): 'added' | 'updated' | 'unchanged' {
     const existing = this.db
       .prepare(
-        'SELECT id, amount, direction, category_pierre, category_mapped, category_group, category_variability, status, date, description FROM transactions WHERE id = ?',
+        'SELECT id, amount, direction, category_pierre, category_mapped, category_group, category_variability, status, date, description, removed_at FROM transactions WHERE id = ?',
       )
       .get(tx.id) as
       | {
@@ -147,6 +147,7 @@ export class Repository {
           status: string | null;
           date: string;
           description: string;
+          removed_at: string | null;
         }
       | undefined;
 
@@ -187,7 +188,9 @@ export class Repository {
       existing.category_pierre !== tx.categoryPierre ||
       existing.status !== tx.status ||
       existing.date !== tx.date ||
-      existing.description !== tx.description;
+      existing.description !== tx.description ||
+      // Listed again by the source: it was not removed after all.
+      existing.removed_at !== null;
 
     if (hasChanged) {
       this.db.prepare(`
@@ -195,7 +198,7 @@ export class Repository {
           date = ?, description = ?,
           amount = ?, original_amount = ?, direction = ?,
           category_pierre = ?, category_mapped = ?, category_group = ?, category_variability = ?,
-          status = ?, raw_json = ?, updated_at = datetime('now')
+          status = ?, raw_json = ?, removed_at = NULL, updated_at = datetime('now')
         WHERE id = ?
       `).run(
         tx.date, tx.description,
@@ -207,6 +210,16 @@ export class Repository {
     }
 
     return 'unchanged';
+  }
+
+  /** Flags rows the source no longer lists; they stay for the record but leave every total. */
+  markRemovedAtSource(ids: string[]): number {
+    const stmt = this.db.prepare(`UPDATE transactions SET removed_at = datetime('now') WHERE id = ? AND removed_at IS NULL`);
+    let changed = 0;
+    this.db.transaction(() => {
+      for (const id of ids) changed += stmt.run(id).changes;
+    })();
+    return changed;
   }
 
   /**
@@ -235,7 +248,7 @@ export class Repository {
    */
   getAllTransactions(): TransactionRow[] {
     return this.db.prepare(`
-      SELECT * FROM transactions ORDER BY date DESC
+      SELECT * FROM transactions WHERE removed_at IS NULL ORDER BY date DESC
     `).all() as TransactionRow[];
   }
 
@@ -250,7 +263,7 @@ export class Repository {
 
     return this.db.prepare(`
       SELECT * FROM transactions
-      WHERE date >= ? AND date < ?
+      WHERE date >= ? AND date < ? AND removed_at IS NULL
       ORDER BY date DESC
     `).all(startDate, endDate) as TransactionRow[];
   }
@@ -279,7 +292,7 @@ export class Repository {
         COUNT(*) as count
       FROM transactions
       WHERE date >= ? AND date < ?
-        AND direction = 'EXPENSE'
+        AND direction = 'EXPENSE' AND removed_at IS NULL
       GROUP BY category_mapped
       ORDER BY total ASC
     `).all(startDate, endDate) as any;
@@ -295,7 +308,7 @@ export class Repository {
         COALESCE(NULLIF(category_mapped, ''), category_pierre, 'Outros') AS category,
         COALESCE(MAX(NULLIF(category_group, '')), '')                    AS "group"
       FROM transactions
-      WHERE direction = 'EXPENSE'
+      WHERE direction = 'EXPENSE' AND removed_at IS NULL
       GROUP BY category
       ORDER BY SUM(amount) ASC
     `).all() as Array<{ category: string; group: string }>;
@@ -310,6 +323,7 @@ export class Repository {
         CAST(strftime('%Y', date) AS INTEGER) as year,
         CAST(strftime('%m', date) AS INTEGER) as month
       FROM transactions
+      WHERE removed_at IS NULL
       ORDER BY year DESC, month DESC
     `).all() as Array<{ year: number; month: number }>;
     return rows;
@@ -328,7 +342,7 @@ export class Repository {
       SELECT COALESCE(SUM(amount), 0) as total
       FROM transactions
       WHERE date >= ? AND date < ?
-        AND direction = 'INCOME'
+        AND direction = 'INCOME' AND removed_at IS NULL
     `).get(startDate, endDate) as { total: number };
     return row.total;
   }

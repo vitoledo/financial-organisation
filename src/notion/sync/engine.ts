@@ -13,13 +13,20 @@ import { AccountRole, OfficialBill, ProjectionContext, SqliteAccountRow, SqliteT
 /** Everything the projection reads from the local database. */
 export interface SourceRows {
   accounts: SqliteAccountRow[];
+  /** Live rows only: rows the source no longer lists are left out of every projection. */
   transactions: SqliteTransactionRow[];
   bills: OfficialBill[];
+  /** Ids of rows flagged as removed at the source (their Notion pages are marked as cancelled). */
+  removedIds: string[];
 }
 
 const SYNC_LOG_ENV = 'NOTION_DS_SYNC_LOG';
 const PIERRE_SYNC_WAIT_MS = 30_000;
 const PENDING_LOOKBACK_DAYS = 3;
+/** Never reach further back than this to fill a local history gap. */
+const HISTORY_GAP_MAX_MONTHS = 12;
+/** Above this many vanished pending rows at once (and half of the pending rows), the read looks incomplete. */
+const VANISHED_GUARD_MIN = 5;
 
 export interface NotionSyncSettings {
   accountRoles: Record<string, AccountRole>;
@@ -65,6 +72,8 @@ export interface NotionSyncReport {
     billCreates: number;
     txCreates: number;
     txSourceUpdates: number;
+    /** Notion pages marked as cancelled because the source no longer lists them. */
+    txRemovedAtSource: number;
     txReclassified: number;
     billUpdates: number;
     accountUpdates: number;
@@ -91,9 +100,14 @@ export class NotionSyncError extends Error {
 
 export function readSqliteRows(db: Database.Database): SourceRows {
   const accounts = db.prepare('SELECT id, name, type, subtype, closing_balance, credit_limit, available_credit, last_synced_at, raw_json FROM accounts').all() as SqliteAccountRow[];
+  // Databases from before migration 005 (e.g. the frozen migration snapshot) have no removal flag.
+  const hasRemoved = (db.pragma('table_info(transactions)') as Array<{ name: string }>).some((c) => c.name === 'removed_at');
   const transactions = db
-    .prepare('SELECT id, account_id, date, description, amount, direction, category_pierre, category_mapped, account_type, status, raw_json FROM transactions ORDER BY date ASC, id ASC')
+    .prepare(
+      `SELECT id, account_id, date, description, amount, direction, category_pierre, category_mapped, account_type, status, raw_json FROM transactions${hasRemoved ? ' WHERE removed_at IS NULL' : ''} ORDER BY date ASC, id ASC`,
+    )
     .all() as SqliteTransactionRow[];
+  const removedIds = hasRemoved ? (db.prepare('SELECT id FROM transactions WHERE removed_at IS NOT NULL ORDER BY id').all() as Array<{ id: string }>).map((r) => r.id) : [];
   // A database from before migration 004 (e.g. the frozen migration snapshot) has no official bills.
   const hasBills = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'card_bills'").get() !== undefined;
   const bills = hasBills
@@ -101,7 +115,7 @@ export function readSqliteRows(db: Database.Database): SourceRows {
         .prepare('SELECT id, account_id AS accountId, due_date AS dueDate, closing_date AS closingDate, total_amount AS totalAmount FROM card_bills ORDER BY closing_date ASC, id ASC')
         .all() as OfficialBill[])
     : [];
-  return { accounts, transactions, bills };
+  return { accounts, transactions, bills, removedIds };
 }
 
 const toOfficial = (b: NormalizedCardBill): OfficialBill => ({ id: b.id, accountId: b.accountId, dueDate: b.dueDate, closingDate: b.closingDate, totalAmount: b.totalAmount });
@@ -132,6 +146,7 @@ function mergeInMemory(
   bills: NormalizedCardBill[] | null,
   mappings: Map<string, { categoryMapped: string }>,
   nowSql: string,
+  vanished: string[] = [],
 ): SourceRows {
   const acc = new Map(current.accounts.map((a) => [a.id, a]));
   for (const a of accounts) {
@@ -161,12 +176,21 @@ function mergeInMemory(
       account_type: t.accountType, status: t.status, raw_json: t.rawJson,
     });
   }
+  for (const id of vanished) tx.delete(id);
+  const fetchedIds = new Set(txs.map((t) => t.id));
   return {
     accounts: Array.from(acc.values()),
     transactions: Array.from(tx.values()).sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     bills: Array.from(billById.values()),
+    removedIds: Array.from(new Set([...current.removedIds.filter((id) => !fetchedIds.has(id)), ...vanished])).sort(),
   };
 }
+
+const dayShift = (iso: string, days: number) => {
+  const d = new Date(`${iso.substring(0, 10)}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().substring(0, 10);
+};
 
 // ---------------------------------------------------------------------------
 // Schema preflight: every property written must exist with the contract type, and every select value must
@@ -260,10 +284,60 @@ export class NotionSyncEngine {
     const projection = projectNotionState(rows.accounts, rows.transactions, ctx);
     return reconcile(projection, rows.transactions, state.rules, state.live, this.accountContext(rows.accounts, ctx), {
       hmacKeyAvailable: Boolean(this.settings.hmacKey && this.settings.hmacKey.trim()),
+      removedAtSource: rows.removedIds,
+      today: ctx.today,
     });
   }
 
-  private async fetchPierre(options: NotionSyncOptions, repo: Repository) {
+  /**
+   * Notion pages from Pierre whose source row is missing locally (a database restored from an older backup, or one
+   * that started later than the migration): the oldest of them, so the Pierre read reaches back and fills the gap.
+   */
+  private historyGapStart(rows: SourceRows, state: LoadedNotionState, warnings: string[]): string | null {
+    const known = new Set([...rows.transactions.map((t) => t.id), ...rows.removedIds]);
+    const days: string[] = [];
+    for (const [id, pages] of state.live.transactions) {
+      if (known.has(id) || pages.length === 0) continue;
+      const page = pages[0];
+      if (page.canonical['Fonte'] !== 'Pierre') continue;
+      const day = (page.canonical['Data'] as { start?: string } | null)?.start?.substring(0, 10);
+      if (day && /^\d{4}-\d{2}-\d{2}$/.test(day)) days.push(day);
+    }
+    if (days.length === 0) return null;
+    const floor = new Date(this.now());
+    floor.setUTCMonth(floor.getUTCMonth() - HISTORY_GAP_MAX_MONTHS);
+    const oldest = days.sort()[0];
+    const start = oldest < floor.toISOString().substring(0, 10) ? floor.toISOString().substring(0, 10) : oldest;
+    warnings.push(`HISTORY_GAP: ${days.length} transações do Notion (Fonte Pierre) sem linha no SQLite local; buscando no Pierre desde ${start} para completar o histórico.`);
+    return start;
+  }
+
+  /**
+   * Pending rows inside the window the source just returned in full that are no longer listed: the bank cancelled
+   * them or posted them under a new id. Window edges are skipped (time-zone slack), posted rows are never touched,
+   * and a read that looks incomplete (empty, or too many at once) removes nothing.
+   */
+  private vanishedPending(rows: SourceRows, fetched: { txs: NormalizedTransaction[]; accounts: NormalizedAccount[]; window: { startDate: string; endDate: string } }, warnings: string[]): string[] {
+    const fetchedIds = new Set(fetched.txs.map((t) => t.id));
+    const accountIds = new Set(fetched.accounts.map((a) => a.id));
+    const lo = dayShift(fetched.window.startDate, 2);
+    const hi = dayShift(fetched.window.endDate, -1);
+    const pendingInWindow = rows.transactions.filter((t) => {
+      const day = t.date.substring(0, 10);
+      return t.status === 'PENDING' && accountIds.has(t.account_id) && day >= lo && day <= hi;
+    });
+    const vanished = pendingInWindow.filter((t) => !fetchedIds.has(t.id));
+    if (vanished.length === 0) return [];
+    if (fetched.txs.length === 0 || vanished.length > Math.max(VANISHED_GUARD_MIN, Math.floor(pendingInWindow.length / 2))) {
+      warnings.push(`SUSPICIOUS_SOURCE_GAP: ${vanished.length} de ${pendingInWindow.length} lançamentos pendentes não vieram do Pierre; a leitura parece incompleta e nada foi removido.`);
+      return [];
+    }
+    const list = vanished.map((t) => `${t.date.substring(0, 10)} R$ ${Math.abs(Number(t.amount)).toFixed(2)} ${t.description.substring(0, 30)}`).join('; ');
+    warnings.push(`REMOVED_AT_SOURCE: ${vanished.length} lançamento(s) pendente(s) não aparecem mais no Pierre (cancelados ou efetivados com outro ID): ${list}.`);
+    return vanished.map((t) => t.id);
+  }
+
+  private async fetchPierre(options: NotionSyncOptions, repo: Repository, historyStart: string | null) {
     const pierre = this.deps.pierre!;
     if (!options.skipUpdate) {
       try {
@@ -279,7 +353,10 @@ export class NotionSyncEngine {
     const window = calculateDateRange(repo.getLastSuccessfulSync()?.completed_at ?? null, options.fullSync, this.now());
     // Pending rows change date, status and bill when the bank posts them (often weeks later), and the posted
     // copies can arrive back-dated: re-read from the oldest pending row, bounded by the full-sync window.
-    const oldestPending = (this.deps.db.prepare("SELECT MIN(date) AS d FROM transactions WHERE status = 'PENDING'").get() as { d: string | null }).d;
+    const hasRemoved = (this.deps.db.pragma('table_info(transactions)') as Array<{ name: string }>).some((c) => c.name === 'removed_at');
+    const oldestPending = (
+      this.deps.db.prepare(`SELECT MIN(date) AS d FROM transactions WHERE status = 'PENDING'${hasRemoved ? ' AND removed_at IS NULL' : ''}`).get() as { d: string | null }
+    ).d;
     if (oldestPending) {
       const start = new Date(oldestPending);
       start.setUTCDate(start.getUTCDate() - PENDING_LOOKBACK_DAYS);
@@ -287,6 +364,7 @@ export class NotionSyncEngine {
       const candidate = start.toISOString().substring(0, 10) < floor ? floor : start.toISOString().substring(0, 10);
       if (candidate < window.startDate) window.startDate = candidate;
     }
+    if (historyStart && historyStart < window.startDate) window.startDate = historyStart;
     const rawTxs = (await pierre.getTransactions(window.startDate, window.endDate)).data;
     const relevantIds = new Set(relevant.map((a) => a.id));
     const txs = rawTxs.filter((t) => relevantIds.has(t.account_id)).map(normalizeTransaction);
@@ -306,39 +384,42 @@ export class NotionSyncEngine {
     const repo = new Repository(this.deps.db);
     const report: NotionSyncReport = {
       runId, mode: options.apply ? 'APPLY' : 'DRY_RUN', status: 'SUCCESS', pierre: null,
-      plan: { billCreates: 0, txCreates: 0, txSourceUpdates: 0, txReclassified: 0, billUpdates: 0, accountUpdates: 0, unchangedTransactions: 0, rulesApplied: {} },
+      plan: { billCreates: 0, txCreates: 0, txSourceUpdates: 0, txRemovedAtSource: 0, txReclassified: 0, billUpdates: 0, accountUpdates: 0, unchangedTransactions: 0, rulesApplied: {} },
       applied: { writes: 0, errors: [] }, residual: null, warnings: [], freshness: null, pendingReview: null, logPageId: null,
     };
 
-    // 1. Pierre → SQLite (dry-run merges in memory and writes nothing).
+    // 1. Notion state (read first: it tells how far back the local history must reach).
+    this.logger.info('[1/5] Lendo o estado atual do Notion...');
+    const gw = this.deps.gateway;
+    let state = await gw.loadState();
+
+    // 2. Pierre → SQLite (dry-run merges in memory and writes nothing).
     let rows = readSqliteRows(this.deps.db);
     let sqliteSyncId: number | null = null;
     if (this.deps.pierre && !options.skipPierre) {
-      this.logger.info('[1/5] Buscando dados no Pierre...');
-      const fetched = await this.fetchPierre(options, repo);
+      this.logger.info('[2/5] Buscando dados no Pierre...');
+      const fetched = await this.fetchPierre(options, repo, this.historyGapStart(rows, state, report.warnings));
       report.pierre = { accounts: fetched.accounts.length, transactionsReceived: fetched.received, window: fetched.window };
+      const vanished = this.vanishedPending(rows, fetched, report.warnings);
       const mappings = learnedCategoryMappings(this.deps.db);
       if (options.apply) {
         sqliteSyncId = repo.startSync();
         for (const a of fetched.accounts) repo.upsertAccount(a);
         if (fetched.bills) repo.upsertCardBills(fetched.bills);
         const stats = repo.upsertTransactions(fetched.txs, mappings);
+        const removed = repo.markRemovedAtSource(vanished);
         repo.completeSync(sqliteSyncId, stats);
         rows = readSqliteRows(this.deps.db);
-        this.logger.info(`  SQLite: ${stats.added} novas, ${stats.updated} atualizadas, ${stats.unchanged} sem alteração.`);
+        this.logger.info(`  SQLite: ${stats.added} novas, ${stats.updated} atualizadas, ${stats.unchanged} sem alteração${removed ? `, ${removed} removidas na fonte` : ''}.`);
       } else {
         const nowSql = this.now().toISOString().replace('T', ' ').substring(0, 19);
-        rows = mergeInMemory(rows, fetched.accounts, fetched.txs, fetched.bills, mappings, nowSql);
+        rows = mergeInMemory(rows, fetched.accounts, fetched.txs, fetched.bills, mappings, nowSql, vanished);
       }
     } else {
-      this.logger.info('[1/5] Pierre ignorado: usando o histórico local do SQLite como fonte.');
+      this.logger.info('[2/5] Pierre ignorado: usando o histórico local do SQLite como fonte.');
     }
     report.freshness = rows.transactions.length > 0 ? rows.transactions[rows.transactions.length - 1].date.substring(0, 10) : null;
 
-    // 2. Notion state + live schemas.
-    this.logger.info('[2/5] Lendo o estado atual do Notion...');
-    const gw = this.deps.gateway;
-    let state = await gw.loadState();
     const schemas: Record<string, Record<string, any>> = {
       [TX_ENV]: await gw.retrieveSchema(gw.ds.transactions),
       [BILL_ENV]: await gw.retrieveSchema(gw.ds.bills),
@@ -354,6 +435,7 @@ export class NotionSyncEngine {
       billCreates: plan.billCreates.length,
       txCreates: plan.txCreates.length,
       txSourceUpdates: plan.txUpdates.filter((u) => u.kind === 'SOURCE').length,
+      txRemovedAtSource: plan.txUpdates.filter((u) => u.kind === 'REMOVED').length,
       txReclassified: plan.stats.reclassified,
       billUpdates: plan.billUpdates.length,
       accountUpdates: plan.accountUpdates.length,
@@ -459,7 +541,7 @@ export class NotionSyncEngine {
     const after = this.plan(rows, state);
     report.residual = {
       txCreates: after.txCreates.length,
-      txUpdates: after.txUpdates.filter((u) => u.kind === 'SOURCE').length,
+      txUpdates: after.txUpdates.filter((u) => u.kind !== 'RECLASSIFY').length,
       billCreates: after.billCreates.length,
       billUpdates: after.billUpdates.length,
     };
@@ -508,7 +590,7 @@ export class NotionSyncEngine {
         'Duração (s)': Math.round((finished.getTime() - started.getTime()) / 100) / 10,
         'Duração (ms)': finished.getTime() - started.getTime(),
         'Transações novas': report.plan.txCreates,
-        'Transações atualizadas': report.plan.txSourceUpdates + report.plan.txReclassified,
+        'Transações atualizadas': report.plan.txSourceUpdates + report.plan.txReclassified + report.plan.txRemovedAtSource,
         'Transações Inalteradas': report.plan.unchangedTransactions,
         'Erros Encontrados': report.applied.errors.length,
         'Pendências de revisão': report.pendingReview ?? 0,

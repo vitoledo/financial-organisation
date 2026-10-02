@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /**
  * Run all pending migrations. Uses a simple user_version pragma to track
@@ -15,6 +15,7 @@ export function runMigrations(db: Database.Database): void {
     if (currentVersion < 2) db.exec(MIGRATION_002);
     if (currentVersion < 3) db.exec(MIGRATION_003);
     if (currentVersion < 4) db.exec(MIGRATION_004);
+    if (currentVersion < 5) db.exec(MIGRATION_005);
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   })();
 }
@@ -161,4 +162,16 @@ const MIGRATION_004 = `
     raw_json           TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_card_bills_account ON card_bills(account_id);
+`;
+
+// ---------------------------------------------------------------------------
+// Migration 005 — Transactions removed at the source
+//
+// A pending transaction can vanish from Pierre: the bank cancels it, or posts it
+// under a new id (seen with card payment legs). The row stays for the record but
+// is flagged, so it stops feeding totals, bills and the Notion projection.
+// ---------------------------------------------------------------------------
+
+const MIGRATION_005 = `
+  ALTER TABLE transactions ADD COLUMN removed_at TEXT;
 `;

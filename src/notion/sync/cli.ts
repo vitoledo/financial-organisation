@@ -40,7 +40,10 @@ function printReport(r: NotionSyncReport): void {
   }
   logger.info(`Lançamentos até: ${r.freshness ?? '—'}`);
   const p = r.plan;
-  logger.info(`Transações: ${p.txCreates} novas · ${p.txSourceUpdates} atualizadas pela fonte · ${p.txReclassified} classificadas por regra · ${p.unchangedTransactions} sem alteração`);
+  logger.info(
+    `Transações: ${p.txCreates} novas · ${p.txSourceUpdates} atualizadas pela fonte · ${p.txReclassified} classificadas por regra · ${p.unchangedTransactions} sem alteração` +
+      (p.txRemovedAtSource ? ` · ${p.txRemovedAtSource} canceladas (removidas na fonte)` : ''),
+  );
   logger.info(`Faturas: ${p.billCreates} novas · ${p.billUpdates} atualizadas   Contas: ${p.accountUpdates} atualizadas`);
   for (const [rule, n] of Object.entries(p.rulesApplied)) logger.info(`  regra "${rule}": ${n}`);
   if (r.mode === 'APPLY') {
