@@ -17,7 +17,7 @@ describe('runMigrations', () => {
     runMigrations(db);
 
     const version = db.pragma('user_version', { simple: true });
-    expect(version).toBe(4);
+    expect(version).toBe(5);
 
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -43,7 +43,7 @@ describe('runMigrations', () => {
 
     runMigrations(db);
 
-    expect(db.pragma('user_version', { simple: true })).toBe(4);
+    expect(db.pragma('user_version', { simple: true })).toBe(5);
 
     const tables = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -63,12 +63,13 @@ describe('runMigrations', () => {
         available_credit REAL, last_synced_at TEXT, raw_json TEXT
       );
       CREATE TABLE investments (id TEXT PRIMARY KEY);
+      CREATE TABLE transactions (id TEXT PRIMARY KEY);
     `);
     db.pragma('user_version = 2');
 
     runMigrations(db);
 
-    expect(db.pragma('user_version', { simple: true })).toBe(4);
+    expect(db.pragma('user_version', { simple: true })).toBe(5);
 
     const columns = (db.pragma('table_info(accounts)') as Array<{ name: string }>).map((c) => c.name);
     expect(columns).toContain('automatically_invested_balance');
@@ -76,19 +77,30 @@ describe('runMigrations', () => {
   });
 
   it('adds the official card bills table when upgrading a v3 database', () => {
-    db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY);`);
+    db.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY); CREATE TABLE transactions (id TEXT PRIMARY KEY);`);
     db.pragma('user_version = 3');
 
     runMigrations(db);
 
-    expect(db.pragma('user_version', { simple: true })).toBe(4);
+    expect(db.pragma('user_version', { simple: true })).toBe(5);
     const columns = (db.pragma('table_info(card_bills)') as Array<{ name: string }>).map((c) => c.name);
     expect(columns).toEqual(expect.arrayContaining(['id', 'account_id', 'due_date', 'closing_date', 'total_amount']));
+  });
+
+  it('adds the removed-at-source flag when upgrading a v4 database', () => {
+    db.exec(`CREATE TABLE transactions (id TEXT PRIMARY KEY);`);
+    db.pragma('user_version = 4');
+
+    runMigrations(db);
+
+    expect(db.pragma('user_version', { simple: true })).toBe(5);
+    const columns = (db.pragma('table_info(transactions)') as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toContain('removed_at');
   });
 
   it('is a no-op when the database is already current', () => {
     runMigrations(db);
     expect(() => runMigrations(db)).not.toThrow();
-    expect(db.pragma('user_version', { simple: true })).toBe(4);
+    expect(db.pragma('user_version', { simple: true })).toBe(5);
   });
 });

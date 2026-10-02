@@ -79,7 +79,7 @@ export interface PlannedCreate {
 export interface PlannedUpdate {
   stableId: string;
   pageId: string;
-  kind: 'SOURCE' | 'RECLASSIFY';
+  kind: 'SOURCE' | 'RECLASSIFY' | 'REMOVED';
   payload: Record<string, any>;
   relations: Record<string, RefTarget[]>;
   fields: string[];
@@ -142,6 +142,40 @@ export interface AccountSourceContext {
 export interface ReconcileOptions {
   /** Without the HMAC key the projection holds "[OFUSCADO]", which must never overwrite a real pseudonym. */
   hmacKeyAvailable: boolean;
+  /** Source ids the source no longer lists (flagged in SQLite); their pages are marked as cancelled once. */
+  removedAtSource?: string[];
+  /** YYYY-MM-DD, for the review reason of a cancelled page. */
+  today?: string;
+}
+
+export const removedAtSourceReason = (today?: string) =>
+  `Removida na fonte${today ? ` em ${today.split('-').reverse().join('/')}` : ''}: o Pierre não lista mais este lançamento ` +
+  '(em geral o banco o efetivou com outro ID, que já está nesta base). Não entra em totais nem em faturas; pode apagar esta página.';
+
+/**
+ * A page whose source row was removed at the source becomes "Cancelado" with a neutral budget effect, leaves its
+ * bill and goes back to review with the reason. Done once: a page already "Cancelado" is left as the user keeps it.
+ */
+function flagRemovedAtSource(live: LiveState, options: ReconcileOptions, plan: SyncPlan): void {
+  for (const id of options.removedAtSource ?? []) {
+    const pages = live.transactions.get(id) ?? [];
+    if (pages.length !== 1) continue;
+    const page = pages[0];
+    if (liveValue(TX_ENV, 'Status', page) === 'Cancelado') continue;
+    const payload: Record<string, any> = {
+      Status: 'Cancelado',
+      'Efeito Orçamentário': 'Neutro',
+      'Status de Revisão': 'Pendente Revisão',
+      'Motivo da Revisão': removedAtSourceReason(options.today),
+    };
+    const relations: Record<string, RefTarget[]> = {};
+    const fields = Object.keys(payload);
+    if ((liveValue(TX_ENV, 'Fatura Vinculada', page) as string[]).length > 0) {
+      relations['Fatura Vinculada'] = [];
+      fields.push('Fatura Vinculada');
+    }
+    plan.txUpdates.push({ stableId: id, pageId: page.pageId, kind: 'REMOVED', payload, relations, fields });
+  }
 }
 
 function canonicalValue(envKey: string, physical: string, value: any): any {
@@ -482,6 +516,7 @@ export function reconcile(
   const effective = adoptBills(projection, live, plan);
   // Pages whose source row is not in the local history (manual entries, other sources) are never touched.
   reconcileTransactions(projection, new Map(rows.map((r) => [r.id, r])), rules, effective, options, plan);
+  flagRemovedAtSource(effective, options, plan);
   reconcileBills(projection, effective, txPageId, plan);
   reconcileAccounts(accounts, effective, plan);
   return plan;

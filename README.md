@@ -232,6 +232,15 @@ esperado dos campos que pertencem ao pipeline (autoridade `UPSTREAM`/`DERIVADO` 
   disponível; se o banco informar outro limite personalizado, a execução avisa (`LIMIT_DRIFT`).
 - **Pix no crédito** (cobrança no cartão com categoria de transferência) entra como *Saída*, pendente de
   revisão como transferência enviada a terceiro.
+- **Removidas na fonte**: um lançamento *pendente* que o Pierre deixa de listar (o banco cancelou, ou efetivou
+  com outro ID — acontece com os pagamentos de fatura no cartão) é marcado no SQLite (`removed_at`) e sai de
+  totais e faturas; a página no Notion vira *Status = Cancelado*, *Efeito = Neutro*, sai da fatura e volta para
+  revisão com o motivo (aviso `REMOVED_AT_SOURCE`) — pode ser apagada à mão. Lançamentos efetivados nunca são
+  removidos, e uma leitura que parece incompleta (vazia ou com muitos sumiços) não remove nada
+  (`SUSPICIOUS_SOURCE_GAP`). Se o Pierre voltar a listar o lançamento, ele volta.
+- **Histórico incompleto no SQLite** (banco restaurado de backup antigo, ou que começou depois da migração): se o
+  Notion tem transações do Pierre que o SQLite não tem, a leitura do Pierre recua até a mais antiga delas (no
+  máximo 12 meses) e completa o histórico (aviso `HISTORY_GAP`).
 - Nada é apagado ou arquivado. Opções novas de select e propriedades inexistentes abortam a execução antes
   de gravar (nenhuma mudança de schema). Mais de `NOTION_SYNC_MAX_CREATES` (300) páginas novas numa execução
   exigem `--allow-large`. Uma trava (`data/notion-sync.lock`) impede duas execuções simultâneas.

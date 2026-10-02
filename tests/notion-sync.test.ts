@@ -614,3 +614,107 @@ describe('Repository.upsertTransaction (status/date/description changes)', () =>
     expect(repo.upsertTransaction({ ...base, status: 'POSTED' })).toBe('unchanged');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rows the source stops listing, and local history gaps
+// ---------------------------------------------------------------------------
+
+describe('NotionSyncEngine — removed at source and history gaps', () => {
+  let notion: FakeNotion;
+  let db: Database.Database;
+  let starts: string[];
+  const opts = { apply: true, skipPierre: false, skipUpdate: true, fullSync: false, allowLarge: false };
+  const engine = (pierreTxs: any[]) => {
+    const pierre = fakePierre(pierreTxs);
+    pierre.getTransactions = async (start: string) => (starts.push(start), { data: pierreTxs });
+    return new NotionSyncEngine(
+      SETTINGS,
+      { gateway: new NotionSyncGateway(notion as any, DS, { minIntervalMs: 0, sleep: async () => {} }), db, pierre, now: () => new Date('2026-09-29T12:00:00.000Z'), sleep: async () => {} },
+      quiet,
+    );
+  };
+  const page = (sourceId: string) => notion.byDs(DS.transactions).find((p) => p.properties['ID da fonte'].rich_text[0].text.content === sourceId)!;
+  const removedAt = (id: string) => (db.prepare('SELECT removed_at FROM transactions WHERE id = ?').get(id) as any).removed_at;
+
+  // A card payment leg first seen pending, that the bank later posts under a new id, and a pending purchase on the
+  // open bill that the bank cancels.
+  const mercado = pierreTx({ id: 't-mercado' });
+  const pendingLeg = pierreTx({ id: 'leg-pending', account_id: 'card-1', account_type: 'CREDIT', account_subtype: 'CREDIT_CARD', amount: -48.71, type: 'CREDIT', category: 'Pagamento de cartão de crédito', description: 'Pagamento recebido', status: 'PENDING', date: '2026-09-21T02:13:10.030Z' });
+  const postedLeg = { ...pendingLeg, id: 'leg-posted', status: 'POSTED', date: '2026-09-21T02:13:10.100Z' };
+  const pendingBuy = pierreTx({ id: 'buy-pending', account_id: 'card-1', account_type: 'CREDIT', account_subtype: 'CREDIT_CARD', amount: 25, category: 'Compras', description: 'Loja X', status: 'PENDING', date: '2026-09-22T12:00:00.000Z' });
+  const first = [mercado, pendingLeg, pendingBuy];
+
+  beforeEach(() => {
+    notion = new FakeNotion();
+    seedWorkspace(notion);
+    db = new Database(':memory:');
+    runMigrations(db);
+    starts = [];
+  });
+
+  it('cancels the pages of pending rows the source stopped listing, once, and keeps them out of bills', async () => {
+    expect((await engine(first).run(opts)).status).toBe('SUCCESS');
+    expect(page('buy-pending').properties['Fatura Vinculada'].relation).toHaveLength(1);
+    const openBill = () => notion.byDs(DS.bills).find((b) => b.properties['Lançamentos do Ciclo'] === undefined && b.properties['ID Estável da Fatura'].rich_text[0].text.content.startsWith('nubank:cartao:'))!;
+    expect(openBill().properties['Total de Compras no Ciclo']).toEqual(num(25));
+
+    const second = await engine([mercado, postedLeg]).run(opts);
+    expect(second.status).toBe('SUCCESS');
+    expect(second.plan.txCreates).toBe(1); // the posted leg, under its new id
+    expect(second.plan.txRemovedAtSource).toBe(2);
+    expect(second.warnings.join()).toMatch(/REMOVED_AT_SOURCE: 2 lançamento\(s\) pendente\(s\)/);
+    expect(removedAt('leg-pending')).not.toBeNull();
+    expect(removedAt('buy-pending')).not.toBeNull();
+    expect(removedAt('t-mercado')).toBeNull();
+    for (const id of ['leg-pending', 'buy-pending']) {
+      const p = page(id).properties;
+      expect(p['Status']).toEqual(sel('Cancelado'));
+      expect(p['Efeito Orçamentário']).toEqual(sel('Neutro'));
+      expect(p['Status de Revisão']).toEqual(sel('Pendente Revisão'));
+      expect(p['Motivo da Revisão'].rich_text[0].text.content).toMatch(/^Removida na fonte em 29\/09\/2026/);
+    }
+    expect(page('buy-pending').properties['Fatura Vinculada'].relation).toEqual([]);
+    expect(openBill().properties['Total de Compras no Ciclo']).toEqual(num(0));
+    expect(second.residual).toEqual({ txCreates: 0, txUpdates: 0, billCreates: 0, billUpdates: 0 });
+
+    const third = await engine([mercado, postedLeg]).run(opts);
+    expect(third.status).toBe('NOTHING_TO_DO');
+  });
+
+  it('only simulates the removal in a dry-run', async () => {
+    await engine(first).run(opts);
+    const report = await engine([mercado, postedLeg, pendingBuy]).run({ ...opts, apply: false });
+    expect(report.plan.txRemovedAtSource).toBe(1);
+    expect(removedAt('leg-pending')).toBeNull();
+    expect(page('leg-pending').properties['Status']).toEqual(sel('Pendente'));
+  });
+
+  it('removes nothing when the source read looks incomplete', async () => {
+    await engine(first).run(opts);
+    const report = await engine([]).run(opts);
+    expect(report.warnings.join()).toMatch(/SUSPICIOUS_SOURCE_GAP: 2 de 2/);
+    expect(report.plan.txRemovedAtSource).toBe(0);
+    expect(removedAt('leg-pending')).toBeNull();
+  });
+
+  it('brings a row back when the source lists it again', async () => {
+    await engine(first).run(opts);
+    await engine([mercado, postedLeg, pendingBuy]).run(opts);
+    expect(removedAt('leg-pending')).not.toBeNull();
+    await engine(first).run(opts);
+    expect(removedAt('leg-pending')).toBeNull();
+    expect(page('leg-pending').properties['Status']).toEqual(sel('Pendente'));
+  });
+
+  it('reads Pierre back to the oldest Notion page missing from the local history (at most 12 months)', async () => {
+    notion.seed(DS.transactions, 'page-may', { Lançamento: t('Antiga'), Fonte: sel('Pierre'), 'ID da fonte': rt('may-1'), Data: dt('2026-05-03'), Valor: num(10) });
+    notion.seed(DS.transactions, 'page-manual', { Lançamento: t('Manual'), Fonte: sel('Manual'), 'ID da fonte': rt('manual-1'), Data: dt('2026-01-01'), Valor: num(5) });
+    const gap = await engine(first).run({ ...opts, apply: false });
+    expect(starts[0]).toBe('2026-05-03');
+    expect(gap.warnings.join()).toMatch(/HISTORY_GAP: 1 transações do Notion \(Fonte Pierre\) sem linha no SQLite local; buscando no Pierre desde 2026-05-03/);
+
+    notion.seed(DS.transactions, 'page-ancient', { Lançamento: t('Muito antiga'), Fonte: sel('Pierre'), 'ID da fonte': rt('old-1'), Data: dt('2024-02-01'), Valor: num(1) });
+    await engine(first).run({ ...opts, apply: false });
+    expect(starts[1]).toBe('2025-09-29');
+  });
+});
