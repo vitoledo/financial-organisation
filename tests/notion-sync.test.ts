@@ -717,4 +717,22 @@ describe('NotionSyncEngine — removed at source and history gaps', () => {
     await engine(first).run({ ...opts, apply: false });
     expect(starts[1]).toBe('2025-09-29');
   });
+
+  it('queries Pierre with endDate shifted by +1 day to prevent excluding current-day transactions', async () => {
+    let capturedEnd: string | undefined;
+    const pierre = fakePierre(first);
+    pierre.getTransactions = async (_start: string, end?: string) => {
+      capturedEnd = end;
+      return { data: first };
+    };
+    const e = new NotionSyncEngine(
+      SETTINGS,
+      { gateway: new NotionSyncGateway(notion as any, DS, { minIntervalMs: 0, sleep: async () => {} }), db, pierre, now: () => new Date('2026-10-06T18:00:00.000Z'), sleep: async () => {} },
+      quiet,
+    );
+    await e.run({ ...opts, apply: false });
+    // window.endDate is 2026-10-06; queryEndDate must be 2026-10-07 so Pierre's exclusive filter doesn't drop 2026-10-06 txs
+    expect(capturedEnd).toBe('2026-10-07');
+  });
 });
+

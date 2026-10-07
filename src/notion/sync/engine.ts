@@ -365,7 +365,11 @@ export class NotionSyncEngine {
       if (candidate < window.startDate) window.startDate = candidate;
     }
     if (historyStart && historyStart < window.startDate) window.startDate = historyStart;
-    const rawTxs = (await pierre.getTransactions(window.startDate, window.endDate)).data;
+    // In Pierre's API, passing endDate as YYYY-MM-DD acts exclusively (< YYYY-MM-DD 00:00:00)
+    // because ISO timestamps like 'YYYY-MM-DDT12:00:00Z' are strictly greater than 'YYYY-MM-DD'.
+    // To include transactions made today during daytime cron runs, we query Pierre with tomorrow.
+    const queryEndDate = dayShift(window.endDate, 1);
+    const rawTxs = (await pierre.getTransactions(window.startDate, queryEndDate)).data;
     const relevantIds = new Set(relevant.map((a) => a.id));
     const txs = rawTxs.filter((t) => relevantIds.has(t.account_id)).map(normalizeTransaction);
     // Official bills are an enrichment: without them the cycles fall back to the last ones stored locally.
