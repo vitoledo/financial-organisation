@@ -318,7 +318,13 @@ export class SyncEngine {
       );
       this.logger.info(`  Período: ${startDate} → ${endDate}`);
 
-      const txResponse = await pierreClient.getTransactions(startDate, endDate);
+      // In Pierre's API, passing endDate as YYYY-MM-DD acts exclusively (< YYYY-MM-DD 00:00:00)
+      // because ISO timestamps like 'YYYY-MM-DDT12:00:00Z' are strictly greater than 'YYYY-MM-DD'.
+      // To include transactions made today during daytime cron runs, we query Pierre with tomorrow.
+      const nextDay = new Date(`${endDate}T00:00:00.000Z`);
+      nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+      const queryEndDate = nextDay.toISOString().substring(0, 10);
+      const txResponse = await pierreClient.getTransactions(startDate, queryEndDate);
       const rawTransactions = txResponse.data;
       this.logger.info(`  ${rawTransactions.length} transações recebidas da API.`);
 
